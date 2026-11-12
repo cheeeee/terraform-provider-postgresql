@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"reflect"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -166,7 +165,9 @@ func createSchema(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
 
 	queries := []string{}
 	switch {
-	case err == sql.ErrNoRows:
+	// With if_not_exists = false an existing schema is not adopted: CREATE SCHEMA
+	// is sent without IF NOT EXISTS and PostgreSQL refuses it ("already exists").
+	case err == sql.ErrNoRows, err == nil && !d.Get(schemaIfNotExists).(bool):
 		b := bytes.NewBufferString("CREATE SCHEMA ")
 		if db.featureSupported(featureSchemaCreateIfNotExist) {
 			if v := d.Get(schemaIfNotExists); v.(bool) {
@@ -331,8 +332,7 @@ func resourcePostgreSQLSchemaReadImpl(db *DBConnection, d *schema.ResourceData) 
 	case err != nil:
 		return fmt.Errorf("error reading schema: %w", err)
 	default:
-		type RoleKey string
-		schemaPolicies := make(map[RoleKey]acl.Schema, len(schemaACLs))
+		actualPolicies := make(map[string]acl.Schema, len(schemaACLs))
 		for _, aclStr := range schemaACLs {
 			aclItem, err := acl.Parse(aclStr)
 			if err != nil {
@@ -344,14 +344,11 @@ func resourcePostgreSQLSchemaReadImpl(db *DBConnection, d *schema.ResourceData) 
 				return fmt.Errorf("invalid perms for schema: %w", err)
 			}
 
-			roleKey := RoleKey(strings.ToLower(schemaACL.Role))
-			var mergedPolicy acl.Schema
-			if existingRolePolicy, ok := schemaPolicies[roleKey]; ok {
-				mergedPolicy = existingRolePolicy.Merge(schemaACL)
-			} else {
-				mergedPolicy = schemaACL
-			}
-			schemaPolicies[roleKey] = mergedPolicy
+			actualPolicies[schemaACL.Role] = actualPolicies[schemaACL.Role].Merge(schemaACL)
+		}
+
+		if err := d.Set(schemaPolicyAttr, readSchemaPolicies(d, schemaOwner, actualPolicies)); err != nil {
+			return fmt.Errorf("error setting schema policies: %w", err)
 		}
 
 		d.Set(schemaNameAttr, schemaName)
@@ -457,16 +454,22 @@ func setSchemaPolicy(txn *sql.Tx, d *schema.ResourceData) error {
 	owner := d.Get(schemaOwnerAttr).(string)
 
 	oraw, nraw := d.GetChange(schemaPolicyAttr)
-	oldList := oraw.(*schema.Set).List()
-	newList := nraw.(*schema.Set).List()
-	queries := make([]string, 0, len(oldList)+len(newList))
-	dropped, added, updated, _ := schemaChangedPolicies(oldList, newList)
+	oldPolicies := mergeSchemaPolicies(oraw.(*schema.Set).List())
+	newPolicies := mergeSchemaPolicies(nraw.(*schema.Set).List())
+	queries := make([]string, 0, len(oldPolicies)+len(newPolicies))
 
-	for _, p := range dropped {
-		pMap := p.(map[string]any)
-		rolePolicy := schemaPolicyToACL(pMap)
+	for key, rolePolicy := range oldPolicies {
+		if newPolicy, ok := newPolicies[key]; ok {
+			if newPolicy.Privileges == rolePolicy.Privileges && newPolicy.GrantOptions == rolePolicy.GrantOptions {
+				continue
+			}
+			// Updated: remove the old privileges completely, then grant the new ones.
+			queries = append(queries, revokeAllSchemaPolicy(rolePolicy, schemaName)...)
+			queries = append(queries, newPolicy.Grants(schemaName)...)
+			continue
+		}
 
-		// The PUBLIC role can not be DROP'ed, therefore we do not need
+		// Dropped. The PUBLIC role can not be DROP'ed, therefore we do not need
 		// to prevent revoking against it not existing.
 		if rolePolicy.Role != "" {
 			var foundUser bool
@@ -475,35 +478,16 @@ func setSchemaPolicy(txn *sql.Tx, d *schema.ResourceData) error {
 			case err == sql.ErrNoRows:
 				// Don't execute this role's REVOKEs because the role
 				// was dropped first and therefore doesn't exist.
+				continue
 			case err != nil:
 				return fmt.Errorf("error reading schema: %w", err)
-			default:
-				queries = append(queries, revokeAllSchemaPolicy(rolePolicy, schemaName)...)
 			}
 		}
+		queries = append(queries, revokeAllSchemaPolicy(rolePolicy, schemaName)...)
 	}
 
-	for _, p := range added {
-		pMap := p.(map[string]any)
-		rolePolicy := schemaPolicyToACL(pMap)
-		queries = append(queries, rolePolicy.Grants(schemaName)...)
-	}
-
-	for _, p := range updated {
-		policies := p.([]any)
-		if len(policies) != 2 {
-			panic("expected 2 policies, old and new")
-		}
-
-		{
-			oldPolicies := policies[0].(map[string]any)
-			rolePolicy := schemaPolicyToACL(oldPolicies)
-			queries = append(queries, revokeAllSchemaPolicy(rolePolicy, schemaName)...)
-		}
-
-		{
-			newPolicies := policies[1].(map[string]any)
-			rolePolicy := schemaPolicyToACL(newPolicies)
+	for key, rolePolicy := range newPolicies {
+		if _, ok := oldPolicies[key]; !ok {
 			queries = append(queries, rolePolicy.Grants(schemaName)...)
 		}
 	}
@@ -531,61 +515,62 @@ func revokeAllSchemaPolicy(rolePolicy acl.Schema, schemaName string) []string {
 	return rolePolicy.Revokes(schemaName)
 }
 
-// schemaChangedPolicies walks old and new to create a set of queries that can
-// be executed to enact each type of state change (roles that have been dropped
-// from the policy, added to a policy, have updated privileges, or are
-// unchanged).
-func schemaChangedPolicies(old, new []any) (dropped, added, update, unchanged map[string]interface{}) {
-	type RoleKey string
-	oldLookupMap := make(map[RoleKey]any, len(old))
-	for idx := range old {
-		v := old[idx]
-		schemaPolicy := v.(map[string]any)
-		if roleRaw, ok := schemaPolicy[schemaPolicyRoleAttr]; ok {
-			role := roleRaw.(string)
-			roleKey := strings.ToLower(role)
-			oldLookupMap[RoleKey(roleKey)] = schemaPolicy
-		}
+// readSchemaPolicies returns the policy blocks to store in the state: the inverse
+// of what Create and Update apply. Only the roles (and PUBLIC, the empty role) which
+// already have a policy block are looked at, so that privileges given to other roles
+// (or by postgresql_grant) never appear as drift, and so is the owner, whose
+// privileges are implicit (a new schema has a NULL nspacl). For each role, the blocks
+// of the state are kept as long as their cumulated privileges are the ones of the
+// catalog; otherwise they are replaced by one block which describes the catalog.
+func readSchemaPolicies(d *schema.ResourceData, owner string, actual map[string]acl.Schema) []any {
+	current, ok := d.Get(schemaPolicyAttr).(*schema.Set)
+	if !ok {
+		return nil
 	}
 
-	newLookupMap := make(map[RoleKey]any, len(new))
-	for idx := range new {
-		v := new[idx]
-		schemaPolicy := v.(map[string]any)
-		if roleRaw, ok := schemaPolicy[schemaPolicyRoleAttr]; ok {
-			role := roleRaw.(string)
-			roleKey := strings.ToLower(role)
-			newLookupMap[RoleKey(roleKey)] = schemaPolicy
+	roles := []string{}
+	blocks := map[string][]any{}
+	declared := map[string]acl.Schema{}
+	for _, raw := range current.List() {
+		block := raw.(map[string]any)
+		rolePolicy := schemaPolicyToACL(block)
+		role := rolePolicy.Role
+		if _, seen := declared[role]; !seen {
+			roles = append(roles, role)
 		}
+		declared[role] = declared[role].Merge(rolePolicy)
+		blocks[role] = append(blocks[role], block)
 	}
 
-	droppedRoles := make(map[string]any, len(old))
-	for kOld, vOld := range oldLookupMap {
-		if _, ok := newLookupMap[kOld]; !ok {
-			droppedRoles[string(kOld)] = vOld
+	result := make([]any, 0, len(current.List()))
+	for _, role := range roles {
+		have := actual[role]
+		if role == owner || (declared[role].Privileges == have.Privileges && declared[role].GrantOptions == have.GrantOptions) {
+			result = append(result, blocks[role]...)
+			continue
 		}
+		result = append(result, map[string]any{
+			schemaPolicyRoleAttr:            role,
+			schemaPolicyCreateAttr:          have.GetPrivilege(acl.Create) && !have.GetGrantOption(acl.Create),
+			schemaPolicyCreateWithGrantAttr: have.GetGrantOption(acl.Create),
+			schemaPolicyUsageAttr:           have.GetPrivilege(acl.Usage) && !have.GetGrantOption(acl.Usage),
+			schemaPolicyUsageWithGrantAttr:  have.GetGrantOption(acl.Usage),
+		})
 	}
 
-	addedRoles := make(map[string]any, len(new))
-	for kNew, vNew := range newLookupMap {
-		if _, ok := oldLookupMap[kNew]; !ok {
-			addedRoles[string(kNew)] = vNew
-		}
-	}
+	return result
+}
 
-	updatedRoles := make(map[string]any, len(new))
-	unchangedRoles := make(map[string]any, len(new))
-	for kOld, vOld := range oldLookupMap {
-		if vNew, ok := newLookupMap[kOld]; ok {
-			if reflect.DeepEqual(vOld, vNew) {
-				unchangedRoles[string(kOld)] = vOld
-			} else {
-				updatedRoles[string(kOld)] = []any{vOld, vNew}
-			}
-		}
+// mergeSchemaPolicies cumulates the policy blocks of each role (see the NOTE on
+// policy in the documentation), keyed by lowercase role like Create does.
+func mergeSchemaPolicies(policies []any) map[string]acl.Schema {
+	merged := make(map[string]acl.Schema, len(policies))
+	for _, v := range policies {
+		rolePolicy := schemaPolicyToACL(v.(map[string]any))
+		key := strings.ToLower(rolePolicy.Role)
+		merged[key] = merged[key].Merge(rolePolicy)
 	}
-
-	return droppedRoles, addedRoles, updatedRoles, unchangedRoles
+	return merged
 }
 
 func schemaPolicyToACL(policyMap map[string]any) acl.Schema {

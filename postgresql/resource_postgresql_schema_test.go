@@ -4,10 +4,12 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlSchema_Basic(t *testing.T) {
@@ -549,6 +551,307 @@ resource "postgresql_schema" "test_policy" {
 	})
 }
 
+func TestAccPostgresqlSchema_IfNotExistsFalse(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, roleName := getTestDBNames(dbSuffix)
+
+	config := func(ifNotExists string) string {
+		return fmt.Sprintf(`
+resource "postgresql_schema" "test_exists" {
+  name          = "dev_schema"
+  database      = "%s"
+  owner         = "%s"
+  if_not_exists = %s
+}
+`, dbName, roleName, ifNotExists)
+	}
+
+	// dev_schema already exists in the database (see setupTestDatabase).
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config:      config("false"),
+				ExpectError: regexp.MustCompile(`schema "dev_schema" already exists`),
+			},
+			{
+				Config: config("true"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlSchemaExists("postgresql_schema.test_exists", "dev_schema"),
+					testAccCheckSchemaOwner(dbName, "dev_schema", roleName),
+				),
+			},
+		},
+	})
+}
+
+type schemaDriftCase struct {
+	name     string
+	role     string // "" is PUBLIC
+	flag     string // the policy attribute set by the configuration
+	priv     string
+	expected string // state of the privilege after the apply
+	drift    func(schema, grantee string) string
+}
+
+func TestAccPostgresqlSchema_PolicyDrift(t *testing.T) {
+	skipIfNotAcc(t)
+
+	flags := []schemaDriftCase{
+		{flag: "create", priv: "CREATE", expected: "granted", drift: func(s, g string) string { return fmt.Sprintf("REVOKE CREATE ON SCHEMA %s FROM %s", s, g) }},
+		{flag: "usage", priv: "USAGE", expected: "granted", drift: func(s, g string) string { return fmt.Sprintf("REVOKE USAGE ON SCHEMA %s FROM %s", s, g) }},
+		{flag: "create_with_grant", priv: "CREATE", expected: "grantable", drift: func(s, g string) string {
+			return fmt.Sprintf("REVOKE GRANT OPTION FOR CREATE ON SCHEMA %s FROM %s", s, g)
+		}},
+		{flag: "usage_with_grant", priv: "USAGE", expected: "grantable", drift: func(s, g string) string {
+			return fmt.Sprintf("REVOKE GRANT OPTION FOR USAGE ON SCHEMA %s FROM %s", s, g)
+		}},
+	}
+
+	for _, who := range []string{"role", "public"} {
+		for _, c := range flags {
+			// PostgreSQL refuses grant options on PUBLIC.
+			if who == "public" && strings.HasSuffix(c.flag, "_with_grant") {
+				continue
+			}
+			c.name = who + "_" + c.flag
+			if who == "role" {
+				c.role = "role"
+			}
+			t.Run(c.name, func(t *testing.T) { testAccSchemaPolicyDrift(t, c) })
+		}
+	}
+}
+
+func testAccSchemaPolicyDrift(t *testing.T, c schemaDriftCase) {
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, roleName := getTestDBNames(dbSuffix)
+
+	grantee, role := "PUBLIC", ""
+	if c.role != "" {
+		grantee, role = pq.QuoteIdentifier(roleName), roleName
+	}
+	testConfig := getTestConfig(t)
+	dsn := testConfig.connStr(dbName)
+
+	// An extra privilege (the other one than the declared one) granted outside of
+	// Terraform is drift too.
+	otherPriv := "CREATE"
+	if c.priv == "CREATE" {
+		otherPriv = "USAGE"
+	}
+
+	// The owner is the connected user, which is not the declared role.
+	config := fmt.Sprintf(`
+resource "postgresql_schema" "test_drift" {
+  name     = "tf_drift"
+  database = "%s"
+
+  policy {
+    %s = true
+    role = "%s"
+  }
+}
+`, dbName, c.flag, role)
+
+	declared := func(s *terraform.State) error {
+		return testAccCheckSchemaPrivilege(dbName, "tf_drift", role, c.priv, c.expected)(s)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check:  declared,
+			},
+			{
+				// The declared privilege is revoked outside of Terraform.
+				PreConfig: func() {
+					dbExecute(t, dsn, c.drift("tf_drift", grantee))
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config,
+				Check:  declared,
+			},
+			{
+				// A privilege which is not declared is granted outside of Terraform.
+				PreConfig: func() {
+					dbExecute(t, dsn, fmt.Sprintf("GRANT %s ON SCHEMA tf_drift TO %s", otherPriv, grantee))
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					declared,
+					testAccCheckSchemaPrivilege(dbName, "tf_drift", role, otherPriv, "absent"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlSchema_PolicyUndeclaredRole(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, roleName := getTestDBNames(dbSuffix)
+	testConfig := getTestConfig(t)
+	// The owner is the connected user: it can grant on the schema.
+	ownerName := testConfig.Username
+	declaredRole := roleName + "_declared"
+	defer createTestRole(t, declaredRole)()
+	undeclaredRole := roleName + "_undeclared"
+	defer createTestRole(t, undeclaredRole)()
+	dsn := testConfig.connStr(dbName)
+
+	// The owner is declared with a partial policy: its other privileges are implicit.
+	config := fmt.Sprintf(`
+resource "postgresql_schema" "test_undeclared" {
+  name     = "tf_undeclared"
+  database = "%[1]s"
+
+  policy {
+    usage = true
+    role  = "%[2]s"
+  }
+
+  policy {
+    usage = true
+    role  = "%[3]s"
+  }
+}
+`, dbName, declaredRole, ownerName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+			},
+			{
+				// Privileges of roles which have no policy block (as postgresql_grant gives).
+				PreConfig: func() {
+					dbExecute(t, dsn, fmt.Sprintf("GRANT CREATE, USAGE ON SCHEMA tf_undeclared TO %s WITH GRANT OPTION", pq.QuoteIdentifier(undeclaredRole)))
+					dbExecute(t, dsn, "GRANT USAGE ON SCHEMA tf_undeclared TO PUBLIC")
+				},
+				Config:   config,
+				PlanOnly: true,
+			},
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSchemaPrivilege(dbName, "tf_undeclared", undeclaredRole, "CREATE", "grantable"),
+					testAccCheckSchemaPrivilege(dbName, "tf_undeclared", "", "USAGE", "granted"),
+					testAccCheckSchemaPrivilege(dbName, "tf_undeclared", declaredRole, "USAGE", "granted"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlSchema_PolicyDropPublic(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, roleName := getTestDBNames(dbSuffix)
+
+	// A policy removed from the configuration is revoked, PUBLIC included.
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+resource "postgresql_schema" "test_public" {
+  name     = "tf_public"
+  database = "%s"
+
+  policy {
+    usage = true
+  }
+
+  policy {
+    usage = true
+    role  = "%s"
+  }
+}
+`, dbName, roleName),
+				Check: testAccCheckSchemaPrivilege(dbName, "tf_public", "", "USAGE", "granted"),
+			},
+			{
+				Config: fmt.Sprintf(`
+resource "postgresql_schema" "test_public" {
+  name     = "tf_public"
+  database = "%s"
+
+  policy {
+    usage = true
+    role  = "%s"
+  }
+}
+`, dbName, roleName),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSchemaPrivilege(dbName, "tf_public", "", "USAGE", "absent"),
+					testAccCheckSchemaPrivilege(dbName, "tf_public", roleName, "USAGE", "granted"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlSchema_Import(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, roleName := getTestDBNames(dbSuffix)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlSchemaPolicyConfig(dbName, roleName, "usage_with_grant = true"),
+			},
+			{
+				ResourceName:      "postgresql_schema.test_policy",
+				ImportState:       true,
+				ImportStateVerify: true,
+				// The policy is only read for the roles which have a policy block
+				// in the state, and the two flags have no catalog equivalent.
+				ImportStateVerifyIgnore: []string{schemaPolicyAttr, schemaIfNotExists, schemaDropCascade},
+			},
+		},
+	})
+}
+
 func testAccPostgresqlSchemaPolicyConfig(database, roleName, policy string) string {
 	return fmt.Sprintf(`
 resource "postgresql_schema" "test_policy" {
@@ -576,8 +879,8 @@ func testAccCheckSchemaPrivilege(database, schemaName, role, privilege, expected
 		query := `SELECT a.is_grantable
   FROM pg_catalog.pg_namespace n
   CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) a
-  JOIN pg_catalog.pg_roles r ON r.oid = a.grantee
-  WHERE n.nspname = $1 AND r.rolname = $2 AND a.privilege_type = $3`
+  LEFT JOIN pg_catalog.pg_roles r ON r.oid = a.grantee
+  WHERE n.nspname = $1 AND COALESCE(r.rolname, '') = $2 AND a.privilege_type = $3`
 
 		actual := "absent"
 		var grantable bool
@@ -660,14 +963,15 @@ func testAccCheckPostgresqlSchemaDestroy(s *terraform.State) error {
 		}
 		defer deferredRollback(txn)
 
-		exists, err := checkSchemaExists(txn, getExtensionNameFromID(rs.Primary.ID))
+		schemaName := rs.Primary.Attributes[schemaNameAttr]
+		exists, err := checkSchemaExists(txn, schemaName)
 
 		if err != nil {
 			return fmt.Errorf("error checking schema %s", err)
 		}
 
 		if exists {
-			return fmt.Errorf("Schema still exists after destroy")
+			return fmt.Errorf("schema %s still exists in database %s after destroy", schemaName, database)
 		}
 	}
 
