@@ -2941,3 +2941,41 @@ resource "postgresql_grant" "test" {
 		})
 	}
 }
+
+// TestAccPostgresqlGrantMaintainBefore17 checks that the privilege MAINTAIN, which tables have since PostgreSQL 17,
+// is refused with a clear error by the older versions (the test is skipped from version 17, where
+// TestAccPostgresqlGrantPrivilegeMatrix grants it).
+func TestAccPostgresqlGrantMaintainBefore17(t *testing.T) {
+	skipIfNotAcc(t)
+
+	for _, objects := range []string{"", `objects = ["t"]`} {
+		resource.Test(t, resource.TestCase{
+			PreCheck: func() {
+				testAccPreCheck(t)
+				db, err := testAccProvider.Meta().(*Client).Connect()
+				if err != nil {
+					t.Fatalf("could not connect to database: %v", err)
+				}
+				if db.featureSupported(featureMaintainPrivilege) {
+					t.Skipf("MAINTAIN exists in PostgreSQL %s", db.version)
+				}
+			},
+			Providers: testAccProviders,
+			Steps: []resource.TestStep{
+				{
+					Config: fmt.Sprintf(`
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "public"
+  schema      = "public"
+  object_type = "table"
+  privileges  = ["SELECT", "MAINTAIN"]
+  %s
+}
+`, objects),
+					ExpectError: regexp.MustCompile("MAINTAIN is not an allowed privilege for object type table"),
+				},
+			},
+		})
+	}
+}
