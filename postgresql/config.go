@@ -63,6 +63,11 @@ const (
 	featureDBLocaleProvider
 	featureDBICURules
 	featureDBBuiltinLocale
+	featurePubColumnList
+	featurePubRowFilter
+	featurePubSchema
+	featurePubGeneratedColumns
+	featurePubAllSequences
 )
 
 var (
@@ -168,6 +173,13 @@ var (
 		// CREATE DATABASE has BUILTIN_LOCALE support (PG 17+), where pg_database.datlocale
 		// replaces pg_database.daticulocale
 		featureDBBuiltinLocale: semver.MustParseRange(">=17.0.0"),
+		// Publications: column lists, row filters and FOR TABLES IN SCHEMA (PG 15+),
+		// publish_generated_columns (PG 18+), FOR ALL SEQUENCES and ALL TABLES EXCEPT (PG 19+)
+		featurePubColumnList:       semver.MustParseRange(">=15.0.0"),
+		featurePubRowFilter:        semver.MustParseRange(">=15.0.0"),
+		featurePubSchema:           semver.MustParseRange(">=15.0.0"),
+		featurePubGeneratedColumns: semver.MustParseRange(">=18.0.0"),
+		featurePubAllSequences:     semver.MustParseRange(">=19.0.0"),
 	}
 )
 
