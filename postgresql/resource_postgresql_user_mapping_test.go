@@ -262,6 +262,31 @@ resource "postgresql_user_mapping" "public" {
 					testAccCheckUserMappingCatalog("public", "myserver_public", map[string]string{"user": "admin", "password": "pass"}),
 				),
 			},
+			{
+				// The options of the public mapping are changed on update
+				Config: `
+resource "postgresql_extension" "ext_postgres_fdw" {
+  name = "postgres_fdw"
+}
+
+resource "postgresql_server" "myserver" {
+  server_name = "myserver_public"
+  fdw_name    = "postgres_fdw"
+
+  depends_on = [postgresql_extension.ext_postgres_fdw]
+}
+
+resource "postgresql_user_mapping" "public" {
+  server_name = postgresql_server.myserver.server_name
+  user_name   = "public"
+  options = {
+    user     = "admin"
+    password = "changed"
+  }
+}
+`,
+				Check: testAccCheckUserMappingCatalog("public", "myserver_public", map[string]string{"user": "admin", "password": "changed"}),
+			},
 		},
 	})
 }
