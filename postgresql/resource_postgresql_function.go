@@ -226,14 +226,14 @@ func resourcePostgreSQLFunction() *schema.Resource {
 				Type:         schema.TypeFloat,
 				Optional:     true,
 				Computed:     true,
-				ValidateFunc: validation.FloatAtLeast(0),
+				ValidateFunc: validateFunctionPositive,
 				Description:  "Estimated execution cost of the function, in cost units (COST). PostgreSQL chooses 100 (1 for C and internal functions) if it is not specified.",
 			},
 			funcRowsAttr: {
 				Type:         schema.TypeFloat,
 				Optional:     true,
 				Computed:     true,
-				ValidateFunc: validation.FloatAtLeast(0),
+				ValidateFunc: validateFunctionPositive,
 				Description:  "Estimated number of rows returned by a function which returns a set (ROWS). PostgreSQL chooses 1000 if it is not specified.",
 			},
 			funcSupportAttr: {
@@ -278,6 +278,15 @@ func resourcePostgreSQLFunction() *schema.Resource {
 			},
 		},
 	}
+}
+
+// validateFunctionPositive refuses the values which PostgreSQL refuses for COST and ROWS ("must be
+// positive"). Zero is refused too: the provider uses 0 for "not set", so a 0 would never reach the catalog.
+func validateFunctionPositive(v any, k string) ([]string, []error) {
+	if f := v.(float64); f <= 0 {
+		return nil, []error{fmt.Errorf("%s must be positive, got %v", k, f)}
+	}
+	return nil, nil
 }
 
 func resourcePostgreSQLFunctionCreate(db *DBConnection, d *schema.ResourceData) error {
