@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -56,6 +57,9 @@ func resourcePostgreSQLGrantRole() *schema.Resource {
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRoleRead),
 		Update: PGResourceFunc(resourcePostgreSQLGrantRoleUpdate),
 		Delete: PGResourceFunc(resourcePostgreSQLGrantRoleDelete),
+		Importer: &schema.ResourceImporter{
+			StateContext: resourcePostgreSQLGrantRoleImport,
+		},
 
 		Schema: map[string]*schema.Schema{
 			"role": {
@@ -389,6 +393,68 @@ func revokeRole(txn *sql.Tx, d *schema.ResourceData) error {
 	return nil
 }
 
+// generateGrantRoleID returns the ID of the membership: <role>_<grant_role>. The options
+// are not part of it because they are changed in place, the ID must not change with them.
+// Before, the ID ended with _<with_admin_option>: such an ID is rewritten by the next refresh.
 func generateGrantRoleID(d *schema.ResourceData) string {
-	return strings.Join([]string{d.Get("role").(string), d.Get("grant_role").(string), strconv.FormatBool(d.Get("with_admin_option").(bool))}, "_")
+	return grantRoleID(d.Get("role").(string), d.Get("grant_role").(string))
+}
+
+func grantRoleID(role, grantRole string) string {
+	return role + "_" + grantRole
+}
+
+// grantRoleImportCandidates returns the (role, grant_role) pairs which an import ID can
+// stand for: the names can contain underscores, so every split is a candidate, with or
+// without the _true / _false suffix of the IDs of the former versions.
+func grantRoleImportCandidates(id string) [][2]string {
+	ids := []string{id}
+	for _, suffix := range []string{"_true", "_false"} {
+		if strings.HasSuffix(id, suffix) {
+			ids = append(ids, strings.TrimSuffix(id, suffix))
+		}
+	}
+
+	var candidates [][2]string
+	for _, s := range ids {
+		for i, c := range s {
+			if c == '_' && i > 0 && i < len(s)-1 {
+				candidates = append(candidates, [2]string{s[:i], s[i+1:]})
+			}
+		}
+	}
+	return candidates
+}
+
+// resourcePostgreSQLGrantRoleImport imports a membership from its ID <role>_<grant_role>
+// (the former <role>_<grant_role>_<with_admin_option> is accepted). The split of the
+// names at an underscore is checked against pg_auth_members.
+func resourcePostgreSQLGrantRoleImport(_ context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	db, err := meta.(*Client).Connect()
+	if err != nil {
+		return nil, err
+	}
+
+	var found [][2]string
+	for _, c := range grantRoleImportCandidates(d.Id()) {
+		var exists bool
+		err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_auth_members WHERE pg_get_userbyid(member) = $1 AND pg_get_userbyid(roleid) = $2)`, c[0], c[1]).Scan(&exists)
+		if err != nil {
+			return nil, fmt.Errorf("error reading grant role: %w", err)
+		}
+		if exists {
+			found = append(found, c)
+		}
+	}
+
+	switch len(found) {
+	case 0:
+		return nil, fmt.Errorf("no membership found for the ID %q, expected <role>_<grant_role>", d.Id())
+	case 1:
+		d.Set("role", found[0][0])
+		d.Set("grant_role", found[0][1])
+		return []*schema.ResourceData{d}, nil
+	default:
+		return nil, fmt.Errorf("the ID %q is ambiguous: it matches the memberships %v", d.Id(), found)
+	}
 }

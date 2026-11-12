@@ -124,7 +124,8 @@ resource "postgresql_role" "app_user" {
   is always set (to the conservative and safe value), but may interfere with the
   behavior of
   [PostgreSQL's `password_encryption` setting](https://www.postgresql.org/docs/current/static/runtime-config-connection.html#GUC-PASSWORD-ENCRYPTION).
-  `false` is refused by PostgreSQL 10 and above (`UNENCRYPTED PASSWORD is no longer supported`).
+  `false` is refused at plan time for PostgreSQL 10 and above, where the server
+  no longer supports `UNENCRYPTED PASSWORD`.
 
 * `password` - (Optional) Sets the role's password. A password is only of use
   for roles having the `login` attribute set to true. The magic value `NULL`
@@ -158,8 +159,8 @@ resource "postgresql_role" "app_user" {
 * `valid_until` - (Optional) Defines the date and time after which the role's
   password is no longer valid.  Established connections past this `valid_time`
   will have to be manually terminated.  This value corresponds to a PostgreSQL
-  datetime. If omitted or the magic value `NULL` is used, `valid_until` will be
-  set to `infinity`.  Default is `NULL`, therefore `infinity`.
+  datetime. If omitted, empty, or the magic value `NULL` is used, `valid_until` will be
+  set to `infinity` (removing the attribute removes the expiry).  Default is `NULL`, therefore `infinity`.
 
 * `skip_drop_role` - (Optional) When a PostgreSQL ROLE exists in multiple
   databases and the ROLE is dropped, the
@@ -281,8 +282,7 @@ of the role in this database uses `64MB` in the example above and `16MB` in the 
 * The databases which have no block are never read or modified. When there is
   no `database_parameters` block at all, the existing settings are left untouched.
 
-* They are not read by `terraform import`: add the blocks to the configuration
-  to manage them.
+* `terraform import` reads the parameters of all the databases in which the role has some.
 
 ## Import Example
 

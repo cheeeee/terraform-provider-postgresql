@@ -740,3 +740,69 @@ func grantRoleOptionsSupported() bool {
 	db, err := testAccProvider.Meta().(*Client).Connect()
 	return err == nil && db.featureSupported(featureRoleMembershipOptions)
 }
+
+func TestGrantRoleImportCandidates(t *testing.T) {
+	got := grantRoleImportCandidates("a_b_c_true")
+	want := [][2]string{{"a", "b_c_true"}, {"a_b", "c_true"}, {"a_b_c", "true"}, {"a", "b_c"}, {"a_b", "c"}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+// The ID does not change when the option is changed in place, and the membership is imported.
+func TestAccPostgresqlGrantRole_ID(t *testing.T) {
+	skipIfNotAcc(t)
+
+	grantConfig := func(options string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "gri_granted" {
+  name = "gri_granted_role"
+}
+
+resource "postgresql_role" "gri_member" {
+  name = "gri_member"
+  lifecycle {
+    ignore_changes = [roles]
+  }
+}
+
+resource "postgresql_grant_role" "gri" {
+  role       = postgresql_role.gri_member.name
+  grant_role = postgresql_role.gri_granted.name
+  %s
+}
+`, options)
+	}
+	const id = "gri_member_gri_granted_role"
+	checkID := resource.TestCheckResourceAttr("postgresql_grant_role.gri", "id", id)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		CheckDestroy: func(s *terraform.State) error {
+			return testAccCheckNoMembership("gri_member", "gri_granted_role")(s)
+		},
+		Steps: []resource.TestStep{
+			{Config: grantConfig(``), Check: checkID},
+			{Config: grantConfig(`with_admin_option = true`), Check: resource.ComposeTestCheckFunc(checkID,
+				testAccCheckMembership("gri_member", "gri_granted_role", membershipOptions{admin: true, inherit: true, set: true}))},
+			// nothing to do after the toggle
+			{Config: grantConfig(`with_admin_option = true`), PlanOnly: true},
+			{Config: grantConfig(`with_admin_option = true`), ResourceName: "postgresql_grant_role.gri", ImportState: true, ImportStateVerify: true},
+			// the ID of the former versions, which ended with with_admin_option
+			{
+				Config:            grantConfig(`with_admin_option = true`),
+				ResourceName:      "postgresql_grant_role.gri",
+				ImportState:       true,
+				ImportStateId:     id + "_true",
+				ImportStateVerify: true,
+			},
+			{Config: grantConfig(`with_admin_option = false`), Check: checkID},
+			{Config: grantConfig(`with_admin_option = false`), PlanOnly: true},
+			{Config: grantConfig(`with_admin_option = false`), ResourceName: "postgresql_grant_role.gri", ImportState: true, ImportStateVerify: true},
+		},
+	})
+}
