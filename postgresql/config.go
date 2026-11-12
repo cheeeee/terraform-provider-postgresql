@@ -47,6 +47,8 @@ const (
 	featurePublication
 	featurePubWithoutTruncate
 	featureFunction
+	featureFunctionSQLBody
+	featureFunctionNoDependsOnExtension
 	featureServer
 	featureCreateRoleSelfGrant
 	featureSecurityLabel
@@ -118,6 +120,12 @@ var (
 
 		// We do not support CREATE FUNCTION for Postgresql < 8.4
 		featureFunction: semver.MustParseRange(">=8.4.0"),
+
+		// CREATE FUNCTION with a SQL-standard body (RETURN or BEGIN ATOMIC)
+		featureFunctionSQLBody: semver.MustParseRange(">=14.0.0"),
+
+		// ALTER FUNCTION NO DEPENDS ON EXTENSION
+		featureFunctionNoDependsOnExtension: semver.MustParseRange(">=13.0.0"),
 		// CREATE SERVER support
 		featureServer: semver.MustParseRange(">=10.0.0"),
 
