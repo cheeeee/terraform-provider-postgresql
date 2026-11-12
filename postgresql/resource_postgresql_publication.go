@@ -196,11 +196,17 @@ func resourcePostgreSQLPublicationUpdate(db *DBConnection, d *schema.ResourceDat
 	oldName, _ := d.GetChange(pubNameAttr)
 	pubName := oldName.(string)
 	err = withPublicationOwnerGranted(txn, pubName, func() error {
+		// the schemas are dropped before and added after the tables: a publication
+		// of a schema can not have a column list
+		if err := setPubSchemas(txn, db, d, pubName, true); err != nil {
+			return fmt.Errorf("could not update publication schemas: %w", err)
+		}
+
 		if err := setPubTables(txn, db, d, pubName); err != nil {
 			return fmt.Errorf("could not update publication tables: %w", err)
 		}
 
-		if err := setPubSchemas(txn, db, d, pubName); err != nil {
+		if err := setPubSchemas(txn, db, d, pubName, false); err != nil {
 			return fmt.Errorf("could not update publication schemas: %w", err)
 		}
 
@@ -209,7 +215,7 @@ func resourcePostgreSQLPublicationUpdate(db *DBConnection, d *schema.ResourceDat
 		}
 
 		if err := setPubParams(txn, db, d, pubName); err != nil {
-			return fmt.Errorf("could not update publication parameters: %w", err)
+			return fmt.Errorf("could not update publication tables: %w", err)
 		}
 
 		if err := setPubName(txn, d); err != nil {
@@ -653,7 +659,13 @@ func setPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubName
 		adds = append(adds, w.clause())
 	}
 
+	dropped := map[string]bool{}
 	for _, m := range drops {
+		// a descendant of several tables is a member of all of them
+		if dropped[m] {
+			continue
+		}
+		dropped[m] = true
 		if _, err := txn.Exec(fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE ONLY %s", pq.QuoteIdentifier(pubName), m)); err != nil {
 			return fmt.Errorf("could not drop a table from the publication: %w", err)
 		}
@@ -666,7 +678,8 @@ func setPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubName
 	return nil
 }
 
-func setPubSchemas(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubName string) error {
+// setPubSchemas drops (drop) or adds (otherwise) the schemas of the publication.
+func setPubSchemas(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubName string, drop bool) error {
 	if !d.HasChange(pubSchemasAttr) {
 		return nil
 	}
@@ -678,6 +691,11 @@ func setPubSchemas(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubNam
 		return checkPubFeatures(db, nil, []string{added[0].(string)})
 	}
 
+	if !drop {
+		dropped = nil
+	} else {
+		added = nil
+	}
 	for _, s := range dropped {
 		if _, err := txn.Exec(fmt.Sprintf("ALTER PUBLICATION %s DROP TABLES IN SCHEMA %s", pq.QuoteIdentifier(pubName), pq.QuoteIdentifier(s.(string)))); err != nil {
 			return fmt.Errorf("could not drop a schema from the publication: %w", err)
@@ -1033,9 +1051,12 @@ func readPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubNam
 	// the name of the table, ONLY when it can not be read, the row filter as written.
 	explicit := map[int64]bool{}
 	prior := map[int64]pubTable{}
-	for _, name := range setToStrings(d.Get(pubTablesAttr)) {
-		if oid, err := resolvePubTable(txn, name); err == nil {
-			explicit[oid] = true
+	// (`tables` is Computed: it keeps the tables of the state when the blocks are used)
+	if !blocksMode {
+		for _, name := range setToStrings(d.Get(pubTablesAttr)) {
+			if oid, err := resolvePubTable(txn, name); err == nil {
+				explicit[oid] = true
+			}
 		}
 	}
 	for _, t := range pubTablesFromBlocks(d.Get(pubTableAttr)) {
@@ -1182,7 +1203,7 @@ func getTablesForPublication(db *DBConnection, d *schema.ResourceData) (string, 
 func validatedPublicationPublishParams(paramList []any) ([]string, error) {
 	var attrs []string
 	if elem, ok := isUniqueArr(paramList); !ok {
-		return make([]string, 0), fmt.Errorf("'%s' is duplicated for attribute `%s`", elem.(string), pubPublishAttr)
+		return make([]string, 0), fmt.Errorf("'%s' is duplicated for attribute `%s`", elem.(string), pubTablesAttr)
 	}
 
 	validation := []string{"insert", "update", "delete", "truncate"}
