@@ -55,10 +55,9 @@ resource "postgresql_event_trigger" "event_trigger" {
 
 * `filter` - (Optional) Filter to restrict the firing of the trigger. Currently the only supported filter_variable is TAG, and only one `filter` block is allowed because PostgreSQL does not accept the same filter variable twice.
   * `variable` - (Required) The name of a variable used to filter events. Currently the only supported value is TAG.
-  * `values` - (Required) The name of the filter variable name. For TAG, this means a list of command tags (e.g., 'DROP FUNCTION').
+  * `values` - (Required) A list of values for the filter variable for which the trigger fires. For TAG, these are command tags (e.g., 'DROP FUNCTION').
 
-* `database` - (Optional) The database where the event trigger is located.
-  If not specified, the function is created in the current database.
+* `database` - (Optional) The database where the event trigger is located. If not specified, the provider default database is used.
 
 * `status` - (Optional) These configure the firing of event triggers. The allowed names are "disable", "enable", "enable_replica" or "enable_always". Default is "enable".
 

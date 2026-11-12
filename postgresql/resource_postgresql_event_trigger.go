@@ -161,26 +161,21 @@ func resourcePostgreSQLEventTriggerCreate(db *DBConnection, d *schema.ResourceDa
 	if filters, ok := d.GetOk(eventTriggerFilterAttr); ok {
 		filters := filters.([]interface{})
 
-		for i, filter := range filters {
-			filter := filter.(map[string]interface{})
+		// MaxItems is 1 and a filter block has one variable: PostgreSQL refuses a second filter variable.
+		filter := filters[0].(map[string]interface{})
 
-			if variable, ok := filter[eventTriggerFilterVariableAttr]; ok {
-				if i == 0 {
-					fmt.Fprint(b, " WHEN ", variable)
-				} else {
-					fmt.Fprint(b, " AND ", variable)
-				}
+		if variable, ok := filter[eventTriggerFilterVariableAttr]; ok {
+			fmt.Fprint(b, " WHEN ", variable)
+		}
+
+		if values, ok := filter[eventTriggerFilterValueAttr]; ok {
+			var new_values []string
+
+			for _, value := range values.([]interface{}) {
+				new_values = append(new_values, pq.QuoteLiteral(value.(string)))
 			}
 
-			if values, ok := filter[eventTriggerFilterValueAttr]; ok {
-				var new_values []string
-
-				for _, value := range values.([]interface{}) {
-					new_values = append(new_values, pq.QuoteLiteral(value.(string)))
-				}
-
-				fmt.Fprint(b, " IN (", strings.Join(new_values, ","), ")")
-			}
+			fmt.Fprint(b, " IN (", strings.Join(new_values, ","), ")")
 		}
 	}
 
