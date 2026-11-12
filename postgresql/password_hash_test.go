@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/blang/semver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -257,5 +258,33 @@ func TestIsHashedPassword(t *testing.T) {
 		t.Run(test.password, func(t *testing.T) {
 			assert.Equal(t, test.expected, isHashedPassword(test.password))
 		})
+	}
+}
+
+func TestHashesRolePasswords(t *testing.T) {
+	var tests = []struct {
+		passwordAuthentication string
+		version                string
+		expected               bool
+	}{
+		// by default, as soon as the server supports SCRAM-SHA-256
+		{"", "17.0.0", true},
+		{"", "10.0.0", true},
+		{"", "9.6.0", false},
+		{"scram-sha-256", "17.0.0", true},
+		// refused later by hashRolePassword
+		{"scram-sha-256", "9.6.0", true},
+		{"password", "17.0.0", false},
+		{"password", "9.6.0", false},
+	}
+
+	for _, test := range tests {
+		db := &DBConnection{
+			client:  &Client{config: Config{PasswordAuthentication: test.passwordAuthentication}},
+			version: semver.MustParse(test.version),
+		}
+		if actual := db.hashesRolePasswords(); actual != test.expected {
+			t.Errorf("hashesRolePasswords with %q on %s: expected %t, got %t", test.passwordAuthentication, test.version, test.expected, actual)
+		}
 	}
 }

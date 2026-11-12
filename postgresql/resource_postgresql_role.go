@@ -309,7 +309,7 @@ func resourcePostgreSQLRoleCreate(db *DBConnection, d *schema.ResourceData) erro
 			if strings.ToUpper(val) == "NULL" {
 				createOpts = append(createOpts, "PASSWORD NULL")
 			} else {
-				if db.client.config.PasswordAuthentication == "scram-sha-256" {
+				if db.hashesRolePasswords() {
 					if val, err = hashRolePassword(db, txn, val); err != nil {
 						return err
 					}
@@ -840,7 +840,7 @@ func setRolePassword(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) erro
 		return nil
 	}
 
-	if db.client.config.PasswordAuthentication == "scram-sha-256" {
+	if db.hashesRolePasswords() {
 		var err error
 		if password, err = hashRolePassword(db, txn, password); err != nil {
 			return err
@@ -853,6 +853,21 @@ func setRolePassword(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) erro
 	}
 
 	return nil
+}
+
+// hashesRolePasswords returns true if the provider hashes the passwords of the
+// roles itself instead of sending them in clear-text.
+// It is the default as soon as the server supports SCRAM-SHA-256; it is refused
+// by hashRolePassword when it is asked for explicitly on a server which does not.
+func (db *DBConnection) hashesRolePasswords() bool {
+	switch db.client.config.PasswordAuthentication {
+	case "password":
+		return false
+	case "scram-sha-256":
+		return true
+	default:
+		return db.featureSupported(featureScramSHA256)
+	}
 }
 
 // hashRolePassword hashes a clear-text password with SCRAM-SHA-256, the way

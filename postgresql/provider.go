@@ -227,8 +227,7 @@ func Provider() *schema.Provider {
 			"password_authentication": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				Default:     "password",
-				Description: "When set to `scram-sha-256`, the passwords of the roles are hashed by the provider and stored as-is by PostgreSQL. When set to `password`, they are sent to PostgreSQL in plaintext format and may appear in PostgreSQL logs as-is.",
+				Description: "By default, or when set to `scram-sha-256`, the passwords of the roles are hashed by the provider and stored as-is by PostgreSQL. When set to `password`, they are sent to PostgreSQL in plaintext format and may appear in PostgreSQL logs as-is.",
 				ValidateFunc: validation.StringInSlice([]string{
 					"password",
 					"scram-sha-256",

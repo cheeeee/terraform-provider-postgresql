@@ -187,16 +187,21 @@ The following arguments are supported:
   Version](https://www.postgresql.org/support/versioning/) or `current`.  Once a
   connection has been established, Terraform will fingerprint the actual
   version.  Default: `9.0.0`.
-* `password_authentication` - (Optional) When set to `scram-sha-256`, the
-  passwords of the roles (`password` and `password_wo` of `postgresql_role`)
-  are hashed by the provider and stored as-is by PostgreSQL. Using
-  `scram-sha-256` requires a minimum version of PostgreSQL 10. Available options
-  are `scram-sha-256` and `password`. The default is `password`. When set to
-  `password`, passwords are sent to PostgreSQL in plaintext format and may
-  appear in PostgreSQL logs as-is (e.g. with `log_statement = 'ddl'`). With
-  `scram-sha-256`, a password which is already hashed is sent as-is, a password
-  with more than 30 combining characters in a row is refused, and the server
-  cannot check the strength of the passwords (e.g. with `passwordcheck`).
+* `password_authentication` - (Optional) How the passwords of the roles
+  (`password` and `password_wo` of `postgresql_role`) are sent to PostgreSQL.
+  Available options are `scram-sha-256` and `password`.
+  By default, and with `scram-sha-256`, they are hashed by the provider with
+  SCRAM-SHA-256 and stored as-is by PostgreSQL: the clear-text password is never
+  sent, so it cannot appear in the logs of the server (`log_statement`,
+  `log_min_duration_statement`, a statement which fails...). It needs
+  PostgreSQL 10 or later: on an older server the default is `password`, and
+  `scram-sha-256` is refused.
+  With `password`, the passwords are sent to PostgreSQL in plaintext format and
+  may appear in its logs as-is; use it when the server has to check the strength
+  of the passwords (e.g. with `passwordcheck`) or when some clients cannot
+  authenticate with SCRAM-SHA-256.
+  With `scram-sha-256`, a password which is already hashed is sent as-is, and a
+  password with more than 30 combining characters in a row is refused.
   Changing this setting does not change any resource: it applies the next time
   a password is set.
 * `aws_rds_iam_auth` - (Optional) If set to `true`, call the AWS RDS API to grab a temporary password, using AWS Credentials
