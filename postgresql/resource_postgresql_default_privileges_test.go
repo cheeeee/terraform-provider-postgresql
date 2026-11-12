@@ -943,3 +943,33 @@ resource "postgresql_default_privileges" "test" {
 		},
 	})
 }
+
+// PUBLIC cannot receive privileges WITH GRANT OPTION, the provider refuses it.
+func TestAccPostgresqlDefaultPrivilegesPublicWithGrantOption(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+resource "postgresql_default_privileges" "test" {
+	database          = "postgres"
+	owner             = "%s"
+	role              = "public"
+	object_type       = "table"
+	with_grant_option = true
+	privileges        = ["SELECT"]
+}
+`, config.Username),
+				ExpectError: regexp.MustCompile("with_grant_option cannot be true for role 'public'"),
+			},
+		},
+	})
+}
