@@ -38,10 +38,20 @@ const (
 	roleSearchPathAttr                      = "search_path"
 	roleStatementTimeoutAttr                = "statement_timeout"
 	roleAssumeRoleAttr                      = "assume_role"
+	roleParametersAttr                      = "parameters"
 
 	// Deprecated options
 	roleDepEncryptedAttr = "encrypted"
 )
+
+// roleReservedParameters are the configuration parameters managed by a
+// dedicated attribute, they cannot be set with the parameters attribute.
+var roleReservedParameters = map[string]string{
+	"search_path":                         roleSearchPathAttr,
+	"statement_timeout":                   roleStatementTimeoutAttr,
+	"idle_in_transaction_session_timeout": roleIdleInTransactionSessionTimeoutAttr,
+	"role":                                roleAssumeRoleAttr,
+}
 
 func resourcePostgreSQLRole() *schema.Resource {
 	return &schema.Resource{
@@ -192,6 +202,15 @@ func resourcePostgreSQLRole() *schema.Resource {
 				Type:        schema.TypeString,
 				Optional:    true,
 				Description: "Role to switch to at login",
+			},
+			roleParametersAttr: {
+				Type:             schema.TypeMap,
+				Optional:         true,
+				Computed:         true,
+				Elem:             &schema.Schema{Type: schema.TypeString},
+				ValidateFunc:     validateConfigParameters(roleReservedParameters),
+				DiffSuppressFunc: suppressConfigParametersDiff,
+				Description:      "Configuration parameters set for this role (ALTER ROLE ... SET)",
 			},
 		},
 	}
@@ -370,6 +389,10 @@ func resourcePostgreSQLRoleCreate(db *DBConnection, d *schema.ResourceData) erro
 		return err
 	}
 
+	if err = setRoleParameters(txn, d); err != nil {
+		return err
+	}
+
 	if err = txn.Commit(); err != nil {
 		return fmt.Errorf("could not commit transaction: %w", err)
 	}
@@ -443,7 +466,9 @@ func resourcePostgreSQLRoleReadImpl(db *DBConnection, d *schema.ResourceData) er
 	var roleSuperuser, roleInherit, roleCreateRole, roleCreateDB, roleCanLogin, roleReplication, roleBypassRLS bool
 	var roleConnLimit int
 	var roleName, roleValidUntil string
-	var roleRoles, roleConfig pq.ByteaArray
+	var roleRoles pq.ByteaArray
+	// rolconfig is a text array, pq.ByteaArray would fail on values with a backslash
+	var roleConfig pq.StringArray
 
 	roleID := d.Id()
 
@@ -516,6 +541,7 @@ func resourcePostgreSQLRoleReadImpl(db *DBConnection, d *schema.ResourceData) er
 	d.Set(roleRolesAttr, pgArrayToSet(roleRoles))
 	d.Set(roleSearchPathAttr, readSearchPath(roleConfig))
 	d.Set(roleAssumeRoleAttr, readAssumeRole(roleConfig))
+	d.Set(roleParametersAttr, parseConfigParameters(roleConfig, roleReservedParameters))
 
 	statementTimeout, err := readStatementTimeout(roleConfig)
 	if err != nil {
@@ -545,7 +571,7 @@ func resourcePostgreSQLRoleReadImpl(db *DBConnection, d *schema.ResourceData) er
 
 // readSearchPath searches for a search_path entry in the rolconfig array.
 // In case no such value is present, it returns nil.
-func readSearchPath(roleConfig pq.ByteaArray) []string {
+func readSearchPath(roleConfig pq.StringArray) []string {
 	for _, v := range roleConfig {
 		config := string(v)
 		if strings.HasPrefix(config, roleSearchPathAttr) {
@@ -561,7 +587,7 @@ func readSearchPath(roleConfig pq.ByteaArray) []string {
 
 // readIdleInTransactionSessionTimeout searches for an idle_in_transaction_session_timeout entry in the rolconfig array.
 // In case no such value is present, it returns nil.
-func readIdleInTransactionSessionTimeout(roleConfig pq.ByteaArray) (int, error) {
+func readIdleInTransactionSessionTimeout(roleConfig pq.StringArray) (int, error) {
 	for _, v := range roleConfig {
 		config := string(v)
 		if strings.HasPrefix(config, roleIdleInTransactionSessionTimeoutAttr) {
@@ -578,7 +604,7 @@ func readIdleInTransactionSessionTimeout(roleConfig pq.ByteaArray) (int, error) 
 
 // readStatementTimeout searches for a statement_timeout entry in the rolconfig array.
 // In case no such value is present, it returns nil.
-func readStatementTimeout(roleConfig pq.ByteaArray) (int, error) {
+func readStatementTimeout(roleConfig pq.StringArray) (int, error) {
 	for _, v := range roleConfig {
 		config := string(v)
 		if strings.HasPrefix(config, roleStatementTimeoutAttr) {
@@ -595,7 +621,7 @@ func readStatementTimeout(roleConfig pq.ByteaArray) (int, error) {
 
 // readAssumeRole searches for a role entry in the rolconfig array.
 // In case no such value is present, it returns empty string.
-func readAssumeRole(roleConfig pq.ByteaArray) string {
+func readAssumeRole(roleConfig pq.StringArray) string {
 	var res string
 	var assumeRoleAttr = "role"
 	for _, v := range roleConfig {
@@ -746,6 +772,10 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 	}
 
 	if err = setAssumeRole(txn, d); err != nil {
+		return err
+	}
+
+	if err = setRoleParameters(txn, d); err != nil {
 		return err
 	}
 
@@ -1142,6 +1172,17 @@ func setAssumeRole(txn *sql.Tx, d *schema.ResourceData) error {
 		}
 	}
 	return nil
+}
+
+func setRoleParameters(txn *sql.Tx, d *schema.ResourceData) error {
+	if !d.HasChange(roleParametersAttr) {
+		return nil
+	}
+
+	roleName := d.Get(roleNameAttr).(string)
+	oldParams, newParams := d.GetChange(roleParametersAttr)
+
+	return alterConfigParameters(txn, "ROLE", roleName, oldParams.(map[string]any), newParams.(map[string]any))
 }
 
 func getWO(d *schema.ResourceData, attribute string) (string, bool) {

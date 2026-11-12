@@ -6,7 +6,9 @@ import (
 	"log"
 	"os"
 	"reflect"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -602,6 +604,248 @@ resource "postgresql_role" "switch_role" {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckRoleCanLogin(t, roleName, "wopass2"),
 					resource.TestCheckResourceAttr("postgresql_role.switch_role", "password_wo_version", "2"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlRole_Parameters(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := func(parameters string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "params_role" {
+  name              = "params_role"
+  statement_timeout = 30000
+  %s
+}
+`, parameters)
+	}
+
+	configCreate := roleConfig(`parameters = {
+    work_mem = "64MB"
+    timezone = "UTC"
+  }`)
+	configUpdate := roleConfig(`parameters = {
+    work_mem           = "128MB"
+    extra_float_digits = "2"
+    application_name   = "it's \\ me"
+  }`)
+	configNoParameters := roleConfig("")
+	configEmptyParameters := roleConfig("parameters = {}")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: configCreate,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.%", "2"),
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.work_mem", "64MB"),
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.timezone", "UTC"),
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "statement_timeout", "30000"),
+					testAccCheckConfigParameters(testRoleConfigQuery, "params_role", []string{
+						"statement_timeout=30000", "work_mem=64MB", "TimeZone=UTC",
+					}),
+				),
+			},
+			// Parameters are changed, removed and added.
+			{
+				Config: configUpdate,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.%", "3"),
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.work_mem", "128MB"),
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.application_name", `it's \ me`),
+					testAccCheckConfigParameters(testRoleConfigQuery, "params_role", []string{
+						"statement_timeout=30000", "work_mem=128MB", "extra_float_digits=2", `application_name=it's \ me`,
+					}),
+				),
+			},
+			// Changes made outside of Terraform are detected...
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER ROLE params_role RESET work_mem")
+					dbExecute(t, dsn, "ALTER ROLE params_role SET lock_timeout TO '5s'")
+				},
+				Config:             configUpdate,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			// ...and reverted.
+			{
+				Config: configUpdate,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.%", "3"),
+					testAccCheckConfigParameters(testRoleConfigQuery, "params_role", []string{
+						"statement_timeout=30000", "work_mem=128MB", "extra_float_digits=2", `application_name=it's \ me`,
+					}),
+				),
+			},
+			// The existing parameters are read by the import.
+			{
+				ResourceName:      "postgresql_role.params_role",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			// An empty map resets all the parameters, the ones with a dedicated attribute are kept.
+			{
+				Config: configEmptyParameters,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.%", "0"),
+					testAccCheckConfigParameters(testRoleConfigQuery, "params_role", []string{"statement_timeout=30000"}),
+				),
+			},
+			// Without parameters in the resource, the ones set outside of Terraform
+			// are read but left untouched.
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER ROLE params_role SET work_mem TO '32MB'")
+				},
+				Config: configNoParameters,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.%", "1"),
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.work_mem", "32MB"),
+					testAccCheckConfigParameters(testRoleConfigQuery, "params_role", []string{
+						"statement_timeout=30000", "work_mem=32MB",
+					}),
+				),
+			},
+			// As soon as parameters is defined, the ones which are not in the resource are reset.
+			{
+				Config: configCreate,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.%", "2"),
+					testAccCheckConfigParameters(testRoleConfigQuery, "params_role", []string{
+						"statement_timeout=30000", "work_mem=64MB", "TimeZone=UTC",
+					}),
+				),
+			},
+			// Removing parameters from the resource keeps the existing ones.
+			{
+				Config: configNoParameters,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.params_role", "parameters.%", "2"),
+					testAccCheckConfigParameters(testRoleConfigQuery, "params_role", []string{
+						"statement_timeout=30000", "work_mem=64MB", "TimeZone=UTC",
+					}),
+				),
+			},
+		},
+	})
+}
+
+// Test every parameter PostgreSQL allows to set for a role.
+func TestAccPostgresqlRole_ParametersAllSettable(t *testing.T) {
+	skipIfNotAcc(t)
+
+	parameters := testSettableParameters(t, roleReservedParameters)
+
+	roleConfig := func(parameters string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "all_params_role" {
+  name       = "all_params_role"
+  parameters = %s
+}
+`, parameters)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig(testParametersHCL(parameters)),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.all_params_role", "parameters.%", strconv.Itoa(len(parameters))),
+					testAccCheckAllConfigParameters(testRoleConfigQuery, "all_params_role", roleReservedParameters, parameters),
+				),
+			},
+			{
+				ResourceName:      "postgresql_role.all_params_role",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				Config: roleConfig("{}"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.all_params_role", "parameters.%", "0"),
+					testAccCheckConfigParameters(testRoleConfigQuery, "all_params_role", []string{}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlRole_ParametersReserved(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:  func() { testAccPreCheck(t) },
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_role" "params_role" {
+  name = "params_role"
+  parameters = {
+    search_path = "foo"
+  }
+}
+`,
+				ExpectError: regexp.MustCompile(`"search_path" cannot be set here`),
+			},
+		},
+	})
+}
+
+// Test the pgaudit settings of a role, this is the way to enable / disable
+// the audit of a specific role (e.g.: on AWS RDS).
+func TestAccPostgresqlRole_ParametersPgaudit(t *testing.T) {
+	roleConfig := func(pgauditLog string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "audited_role" {
+  name     = "audited_role"
+  login    = true
+  password = "toto"
+  parameters = {
+    "pgaudit.log" = "%s"
+  }
+}
+`, pgauditLog)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+			testSuperuserPreCheck(t)
+			testCheckPgauditLoaded(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig("ddl, write"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.audited_role", "parameters.pgaudit.log", "ddl, write"),
+					testAccCheckConfigParameters(testRoleConfigQuery, "audited_role", []string{"pgaudit.log=ddl, write"}),
+					testAccCheckSessionParameter(t, "audited_role", "toto", "postgres", "pgaudit.log", "ddl, write"),
+				),
+			},
+			{
+				Config: roleConfig("none"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.audited_role", "parameters.pgaudit.log", "none"),
+					testAccCheckSessionParameter(t, "audited_role", "toto", "postgres", "pgaudit.log", "none"),
 				),
 			},
 		},

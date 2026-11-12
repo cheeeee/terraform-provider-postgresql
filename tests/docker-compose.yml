@@ -12,7 +12,7 @@ services:
           - "-c"
           - "max_replication_slots=10"
           - "-c"
-          - "shared_preload_libraries=/opt/dummy_seclabel/dummy_seclabel"
+          - "shared_preload_libraries=/opt/dummy_seclabel/dummy_seclabel,pgaudit"
         environment:
             POSTGRES_PASSWORD: ${PGPASSWORD}
         ports:

@@ -91,6 +91,53 @@ resource "postgresql_database" "my_db" {
   the database, you must be a direct or indirect member of the specified role, or
   the username in the provider must be superuser.
 
+* `parameters` - (Optional) A map of
+  [configuration parameters](https://www.postgresql.org/docs/current/runtime-config.html)
+  set for this database with
+  [`ALTER DATABASE ... SET`](https://www.postgresql.org/docs/current/sql-alterdatabase.html),
+  they are the session defaults of the database. See [Parameters](#parameters) below.
+
+## Parameters
+
+```hcl
+resource "postgresql_database" "my_db" {
+  name = "my_db"
+
+  parameters = {
+    timezone      = "UTC"
+    "pgaudit.log" = "all"
+  }
+}
+```
+
+* The names must be lowercase (e.g.: `timezone`, not `TimeZone`).
+
+* Only the parameters which can be changed in a session can be set, PostgreSQL
+  rejects the ones which need a reload or a restart of the server (e.g.:
+  `shared_buffers`, `autovacuum`, `log_connections`), these ones are defined at
+  the instance level (e.g.: with the DB parameter group on AWS RDS).
+
+* The parameters which accept a list of identifiers (e.g.: `search_path`, `temp_tablespaces`)
+  are set as a comma-separated list, e.g.: `"\"$user\", public"`.
+  The elements can be double-quoted.
+
+* When `parameters` is defined, it is the exhaustive list of the parameters of
+  the database: the ones which are added, changed or removed outside of Terraform
+  are reported in the plan and reverted on apply. Use `parameters = {}` to
+  remove all of them.
+
+* When `parameters` is not defined, the existing parameters of the database are
+  read (they are available in the state and imported by `terraform import`)
+  but never modified. Removing `parameters` from the resource therefore keeps
+  the parameters which are currently set.
+
+* The parameters set for a specific role in this database
+  (`ALTER ROLE ... IN DATABASE ... SET`) are not managed.
+
+* If the connected user is not a superuser, the owner of the database is temporarily
+  granted to it. Some parameters can be set only by a superuser (or by a member
+  of `rds_superuser` on AWS RDS).
+
 ## Import Example
 
 `postgresql_database` supports importing resources.  Supposing the following

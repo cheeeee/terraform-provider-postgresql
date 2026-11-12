@@ -556,3 +556,254 @@ resource "postgresql_database" "mydb_default_owner" {
 }
 
 `
+
+func TestAccPostgresqlDatabase_Parameters(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	dbConfig := func(parameters string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "params_db" {
+  name = "params_db"
+  %s
+}
+`, parameters)
+	}
+
+	configCreate := dbConfig(`parameters = {
+    work_mem = "64MB"
+    timezone = "UTC"
+  }`)
+	configUpdate := dbConfig(`parameters = {
+    work_mem     = "128MB"
+    lock_timeout = "5s"
+  }`)
+	configNoParameters := dbConfig("")
+	configEmptyParameters := dbConfig("parameters = {}")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: configCreate,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.params_db"),
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.%", "2"),
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.work_mem", "64MB"),
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.timezone", "UTC"),
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "params_db", []string{"work_mem=64MB", "TimeZone=UTC"}),
+				),
+			},
+			// Parameters are changed, removed and added.
+			{
+				Config: configUpdate,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.%", "2"),
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.work_mem", "128MB"),
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.lock_timeout", "5s"),
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "params_db", []string{"work_mem=128MB", "lock_timeout=5s"}),
+				),
+			},
+			// Changes made outside of Terraform are detected...
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER DATABASE params_db RESET work_mem")
+					dbExecute(t, dsn, "ALTER DATABASE params_db SET timezone TO 'UTC'")
+				},
+				Config:             configUpdate,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			// ...and reverted.
+			{
+				Config: configUpdate,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.%", "2"),
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "params_db", []string{"work_mem=128MB", "lock_timeout=5s"}),
+				),
+			},
+			// The existing parameters are read by the import.
+			{
+				ResourceName:            "postgresql_database.params_db",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"template", "alter_object_ownership"},
+			},
+			// An empty map resets all the parameters.
+			{
+				Config: configEmptyParameters,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.%", "0"),
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "params_db", []string{}),
+				),
+			},
+			// Without parameters in the resource, the ones set outside of Terraform
+			// are read but left untouched.
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER DATABASE params_db SET work_mem TO '32MB'")
+				},
+				Config: configNoParameters,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.%", "1"),
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.work_mem", "32MB"),
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "params_db", []string{"work_mem=32MB"}),
+				),
+			},
+			// As soon as parameters is defined, the ones which are not in the resource are reset.
+			{
+				Config: configUpdate,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.%", "2"),
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "params_db", []string{"work_mem=128MB", "lock_timeout=5s"}),
+				),
+			},
+			// Removing parameters from the resource keeps the existing ones.
+			{
+				Config: configNoParameters,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.params_db", "parameters.%", "2"),
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "params_db", []string{"work_mem=128MB", "lock_timeout=5s"}),
+				),
+			},
+		},
+	})
+}
+
+// Test every parameter PostgreSQL allows to set for a database.
+func TestAccPostgresqlDatabase_ParametersAllSettable(t *testing.T) {
+	skipIfNotAcc(t)
+
+	parameters := testSettableParameters(t, nil)
+
+	dbConfig := func(parameters string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "all_params_db" {
+  name       = "all_params_db"
+  parameters = %s
+}
+`, parameters)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig(testParametersHCL(parameters)),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.all_params_db", "parameters.%", strconv.Itoa(len(parameters))),
+					testAccCheckAllConfigParameters(testDatabaseConfigQuery, "all_params_db", nil, parameters),
+				),
+			},
+			{
+				ResourceName:            "postgresql_database.all_params_db",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"template", "alter_object_ownership"},
+			},
+			{
+				Config: dbConfig("{}"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.all_params_db", "parameters.%", "0"),
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "all_params_db", []string{}),
+				),
+			},
+		},
+	})
+}
+
+// Test that the parameters can be set on a database owned by another role
+// when the connected user is not a superuser.
+func TestAccPostgresqlDatabase_ParametersGrantOwner(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+
+	dbConfig := func(workMem string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "params_owner" {
+  name = "params_owner"
+}
+resource "postgresql_database" "params_db" {
+  name  = "params_owned_db"
+  owner = postgresql_role.params_owner.name
+  parameters = {
+    work_mem = "%s"
+  }
+}
+`, workMem)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig("64MB"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "params_owned_db", []string{"work_mem=64MB"}),
+					checkUserMembership(t, config.Username, "params_owner", false),
+				),
+			},
+			{
+				Config: dbConfig("128MB"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "params_owned_db", []string{"work_mem=128MB"}),
+					checkUserMembership(t, config.Username, "params_owner", false),
+				),
+			},
+		},
+	})
+}
+
+// Test the pgaudit settings of a database, this is the way to enable / disable
+// the audit of a specific database (e.g.: on AWS RDS).
+func TestAccPostgresqlDatabase_ParametersPgaudit(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+
+	dbConfig := func(pgauditLog string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "audited_db" {
+  name = "audited_db"
+  parameters = {
+    "pgaudit.log" = "%s"
+  }
+}
+`, pgauditLog)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testSuperuserPreCheck(t)
+			testCheckPgauditLoaded(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig("all"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.audited_db", "parameters.pgaudit.log", "all"),
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "audited_db", []string{"pgaudit.log=all"}),
+					testAccCheckSessionParameter(t, config.Username, config.Password, "audited_db", "pgaudit.log", "all"),
+				),
+			},
+			{
+				Config: dbConfig("none"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSessionParameter(t, config.Username, config.Password, "audited_db", "pgaudit.log", "none"),
+				),
+			},
+		},
+	})
+}

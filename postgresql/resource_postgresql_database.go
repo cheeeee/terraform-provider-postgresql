@@ -25,6 +25,7 @@ const (
 	dbTablespaceAttr       = "tablespace_name"
 	dbTemplateAttr         = "template"
 	dbAlterObjectOwnership = "alter_object_ownership"
+	dbParametersAttr       = "parameters"
 )
 
 func resourcePostgreSQLDatabase() *schema.Resource {
@@ -109,6 +110,15 @@ func resourcePostgreSQLDatabase() *schema.Resource {
 				Default:     false,
 				Description: "If true, the owner of already existing objects will change if the owner changes",
 			},
+			dbParametersAttr: {
+				Type:             schema.TypeMap,
+				Optional:         true,
+				Computed:         true,
+				Elem:             &schema.Schema{Type: schema.TypeString},
+				ValidateFunc:     validateConfigParameters(nil),
+				DiffSuppressFunc: suppressConfigParametersDiff,
+				Description:      "Configuration parameters set for this database (ALTER DATABASE ... SET)",
+			},
 		},
 	}
 }
@@ -119,6 +129,10 @@ func resourcePostgreSQLDatabaseCreate(db *DBConnection, d *schema.ResourceData) 
 	}
 
 	d.SetId(d.Get(dbNameAttr).(string))
+
+	if err := setDBParameters(db, d); err != nil {
+		return err
+	}
 
 	return resourcePostgreSQLDatabaseReadImpl(db, d)
 }
@@ -392,7 +406,18 @@ func resourcePostgreSQLDatabaseReadImpl(db *DBConnection, d *schema.ResourceData
 		d.Set(dbIsTemplateAttr, dbIsTemplate)
 	}
 
+	dbParameters, err := readDBParameters(db, d)
+	if err != nil {
+		return err
+	}
+	d.Set(dbParametersAttr, dbParameters)
+
 	return nil
+}
+
+// readDBParameters returns the configuration parameters defined for the database.
+func readDBParameters(db QueryAble, d *schema.ResourceData) (map[string]any, error) {
+	return readConfigParameters(db, "DATABASE", d.Id())
 }
 
 func resourcePostgreSQLDatabaseUpdate(db *DBConnection, d *schema.ResourceData) error {
@@ -424,7 +449,9 @@ func resourcePostgreSQLDatabaseUpdate(db *DBConnection, d *schema.ResourceData) 
 		return err
 	}
 
-	// Empty values: ALTER DATABASE name RESET configuration_parameter;
+	if err := setDBParameters(db, d); err != nil {
+		return err
+	}
 
 	return resourcePostgreSQLDatabaseReadImpl(db, d)
 }
@@ -539,6 +566,43 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 	if err := lockTxn.Commit(); err != nil {
 		return fmt.Errorf("error committing reassign: %w", err)
 	}
+	return nil
+}
+
+func setDBParameters(db *DBConnection, d *schema.ResourceData) error {
+	if !d.HasChange(dbParametersAttr) {
+		return nil
+	}
+
+	dbName := d.Get(dbNameAttr).(string)
+	oldParams, newParams := d.GetChange(dbParametersAttr)
+
+	txn, err := startTransaction(db.client, "")
+	if err != nil {
+		return err
+	}
+	defer deferredRollback(txn)
+
+	owner, err := getDatabaseOwner(txn, dbName)
+	if err != nil {
+		return fmt.Errorf("error getting database OWNER: %w", err)
+	}
+	if err := pgLockRole(txn, owner); err != nil {
+		return err
+	}
+
+	// Only the owner of the database can alter it,
+	// so it needs to be granted to the connected user if it's not a superuser
+	if err := withRolesGranted(txn, []string{owner}, func() error {
+		return alterConfigParameters(txn, "DATABASE", dbName, oldParams.(map[string]any), newParams.(map[string]any))
+	}); err != nil {
+		return err
+	}
+
+	if err := txn.Commit(); err != nil {
+		return fmt.Errorf("error committing database parameters: %w", err)
+	}
+
 	return nil
 }
 
