@@ -3,10 +3,21 @@ Terraform Provider for PostgreSQL
 
 This provider manages [PostgreSQL](https://www.postgresql.org/) objects with Terraform: roles, databases, schemas, extensions, grants and default privileges, functions, event triggers, publications, subscriptions and replication slots, foreign servers and user mappings, and security labels. It also manages per-role and per-database configuration parameters (`ALTER ROLE ... SET` / `ALTER DATABASE ... SET`), for example to turn pgaudit on or off on AWS RDS, and reports any change made outside of Terraform in the plan.
 
-It's published on the [Terraform registry](https://registry.terraform.io/providers/cyrilgdn/postgresql/latest/docs).
-It replaces https://github.com/hashicorp/terraform-provider-postgresql since Hashicorp stopped hosting community providers in favor of the Terraform registry.
+It is a fork of [cyrilgdn/terraform-provider-postgresql](https://github.com/cyrilgdn/terraform-provider-postgresql),
+published as `cheeeee/postgresql`:
 
-- Documentation: https://registry.terraform.io/providers/cyrilgdn/postgresql/latest/docs
+```hcl
+terraform {
+  required_providers {
+    postgresql = {
+      source  = "cheeeee/postgresql"
+      version = "~> 1.28"
+    }
+  }
+}
+```
+
+- Documentation: https://registry.terraform.io/providers/cheeeee/postgresql/latest/docs
 
 It works the same way with [Terraform](https://www.terraform.io/) and with [OpenTofu](https://opentofu.org/):
 the acceptance and end-to-end tests are run with both of them.
@@ -79,17 +90,14 @@ Requirements
 Building The Provider
 ---------------------
 
-Clone repository to: `$GOPATH/src/github.com/cyrilgdn/terraform-provider-postgresql`
-
 ```sh
-$ mkdir -p $GOPATH/src/github.com/cyrilgdn; cd $GOPATH/src/github.com/cyrilgdn
-$ git clone git@github.com:cyrilgdn/terraform-provider-postgresql
+$ git clone https://github.com/cheeeee/terraform-provider-postgresql
 ```
 
 Enter the provider directory and build the provider
 
 ```sh
-$ cd $GOPATH/src/github.com/cyrilgdn/terraform-provider-postgresql
+$ cd terraform-provider-postgresql
 $ make build
 ```
 
