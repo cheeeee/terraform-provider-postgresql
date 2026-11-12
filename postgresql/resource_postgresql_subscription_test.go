@@ -928,8 +928,7 @@ func TestAccPostgresqlSubscription_Failover(t *testing.T) {
 	})
 }
 
-// retain_dead_tuples exists since PostgreSQL 18, max_retention_duration and
-// wal_receiver_timeout since PostgreSQL 19.
+// retain_dead_tuples, max_retention_duration and wal_receiver_timeout exist since PostgreSQL 19.
 func TestAccPostgresqlSubscription_RetainDeadTuples(t *testing.T) {
 	s := newSubTest(t)
 	const name = "tf_sub_retain"
@@ -969,7 +968,7 @@ func TestAccPostgresqlSubscription_WalReceiverTimeout(t *testing.T) {
 	const name = "tf_sub_timeout"
 
 	resource.Test(t, resource.TestCase{
-		PreCheck:     s.preCheck(featureSubscriptionWalReceiverTimeout),
+		PreCheck:     s.preCheck(featureSubscriptionRetainDeadTuples),
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
 		Steps: []resource.TestStep{
@@ -1021,7 +1020,7 @@ func TestAccPostgresqlSubscription_UnsupportedOptions(t *testing.T) {
 		{`run_as_owner = true`, "16", 160000},
 		{`origin = "none"`, "16", 160000},
 		{`failover = true`, "17", 170000},
-		{`retain_dead_tuples = true`, "18", 180000},
+		{`retain_dead_tuples = true`, "19", 190000},
 		{`max_retention_duration = 10`, "19", 190000},
 		{`wal_receiver_timeout = "10s"`, "19", 190000},
 	}

@@ -113,15 +113,15 @@ var subscriptionOptions = []subscriptionOption{
 		},
 	},
 	{
-		name: "retain_dead_tuples", kind: subscriptionBool, column: "subretaindeadtuples", feature: subFeature(featureSubscriptionRetainDeadTuples), since: "18",
+		name: "retain_dead_tuples", kind: subscriptionBool, column: "subretaindeadtuples", feature: subFeature(featureSubscriptionRetainDeadTuples), since: "19",
 		needsDisabled: true,
 		schema: &schema.Schema{
 			Type: schema.TypeBool, Optional: true, Computed: true,
-			Description: "Whether the information needed to detect conflicts is retained on the subscriber. The server default is false. Requires PostgreSQL 18 or later. The provider disables the subscription while it alters the option",
+			Description: "Whether the information needed to detect conflicts is retained on the subscriber. The server default is false. Requires PostgreSQL 19 or later. The provider disables the subscription while it alters the option",
 		},
 	},
 	{
-		name: "max_retention_duration", kind: subscriptionInt, column: "submaxretention", feature: subFeature(featureSubscriptionWalReceiverTimeout), since: "19",
+		name: "max_retention_duration", kind: subscriptionInt, column: "submaxretention", feature: subFeature(featureSubscriptionRetainDeadTuples), since: "19",
 		schema: &schema.Schema{
 			Type: schema.TypeInt, Optional: true, Computed: true,
 			Description:  "The maximum time in milliseconds the dead tuples are retained for retain_dead_tuples, 0 for no limit. The server default is 0. Requires PostgreSQL 19 or later",
@@ -129,7 +129,7 @@ var subscriptionOptions = []subscriptionOption{
 		},
 	},
 	{
-		name: "wal_receiver_timeout", kind: subscriptionString, column: "subwalrcvtimeout", feature: subFeature(featureSubscriptionWalReceiverTimeout), since: "19",
+		name: "wal_receiver_timeout", kind: subscriptionString, column: "subwalrcvtimeout", feature: subFeature(featureSubscriptionRetainDeadTuples), since: "19",
 		schema: &schema.Schema{
 			Type: schema.TypeString, Optional: true, Computed: true,
 			Description:  "The wal_receiver_timeout of the apply worker of the subscription (e.g. 30s). The server default is -1, which uses the setting of the server. Requires PostgreSQL 19 or later",
@@ -241,7 +241,7 @@ func resourcePostgreSQLSubscriptionCustomizeDiff(_ context.Context, d *schema.Re
 	if err != nil {
 		return nil // the error will be reported when the change is applied
 	}
-	if !db.featureSupported(featureSubscriptionRetainDeadTuples) {
+	if !db.featureSupported(featureSubscriptionAlterTwoPhase) {
 		return d.ForceNew("two_phase")
 	}
 	return nil

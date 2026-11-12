@@ -39,7 +39,7 @@ resource "postgresql_subscription" "subscription" {
 - `run_as_owner` - (Optional) Whether the changes are applied with the privileges of the owner of the subscription. The server default is `false`. PostgreSQL 16 and later.
 - `origin` - (Optional) `any` or `none`. The server default is `any`. PostgreSQL 16 and later.
 - `failover` - (Optional) Whether the slot of the subscription is synchronized to the standbys of the publisher. The server default is `false`. PostgreSQL 17 and later. The server only alters it for a disabled subscription: the provider disables the subscription and enables it again.
-- `retain_dead_tuples` - (Optional) Whether the information to detect the conflicts is retained. The server default is `false`. PostgreSQL 18 and later. Altering it disables and enables the subscription again.
+- `retain_dead_tuples` - (Optional) Whether the information to detect the conflicts is retained. The server default is `false`. PostgreSQL 19 and later. Altering it disables and enables the subscription again.
 - `max_retention_duration` - (Optional) The time in milliseconds the dead tuples are retained, 0 for no limit. PostgreSQL 19 and later.
 - `wal_receiver_timeout` - (Optional) The `wal_receiver_timeout` of the apply worker, for example `30s`. PostgreSQL 19 and later.
 - `create_slot` - (Optional) Specifies whether the command should create the replication slot on the publisher. Default behavior is true. See below.
