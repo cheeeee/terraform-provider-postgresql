@@ -6,8 +6,10 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strconv"
+	"syscall"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
@@ -2016,8 +2018,9 @@ resource "postgresql_database" "builtin_db" {
 	})
 }
 
-// testCheckSessionTerminated checks that the session was ended by the server (pg_terminate_backend or
-// DROP DATABASE ... WITH (FORCE) both end it with SQLSTATE 57P01), not by any other failure.
+// testCheckSessionTerminated checks that the session, which worked when it was opened (testOpenSession),
+// was ended by the server (pg_terminate_backend or DROP DATABASE ... WITH (FORCE) both end it with
+// SQLSTATE 57P01), not by any other failure.
 func testCheckSessionTerminated(conn *sql.Conn) error {
 	var one int
 	err := conn.QueryRowContext(context.Background(), "SELECT 1").Scan(&one)
@@ -2025,8 +2028,12 @@ func testCheckSessionTerminated(conn *sql.Conn) error {
 		return errors.New("the session opened on the database is still connected")
 	}
 	var pqErr *pq.Error
-	if errors.Is(err, driver.ErrBadConn) {
-		return nil // the server closed the socket before the error message was read
+	// The server closed the socket before the error message was read: depending on the timing
+	// and on what is between the client and the server (e.g. the port forwarding of Docker)
+	// it is seen as a bad connection, an end of file or a reset of the connection.
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return nil
 	}
 	if !errors.As(err, &pqErr) || pqErr.Code != "57P01" {
 		return fmt.Errorf("the session was not terminated by the server (expected SQLSTATE 57P01): %w", err)
@@ -2080,6 +2087,8 @@ func TestAccPostgresqlDatabase_DropMechanisms(t *testing.T) {
 	t.Run("terminateBConnections", func(t *testing.T) {
 		pool, conn := testOpenSession(t, dbName)
 		defer pool.Close()
+		// (also when the subtest fails: the next one connects to the database)
+		defer dbExecute(t, admin, "ALTER DATABASE "+dbName+" ALLOW_CONNECTIONS true")
 
 		if err := terminateBConnections(db, dbName); err != nil {
 			t.Fatalf("terminateBConnections: %v", err)
@@ -2093,7 +2102,6 @@ func TestAccPostgresqlDatabase_DropMechanisms(t *testing.T) {
 		if got := testQueryDatabase(t, "SELECT count(*)::text FROM pg_database WHERE datname = $1", dbName); got != "1" {
 			t.Fatalf("the database must still exist after terminateBConnections, count = %s", got)
 		}
-		dbExecute(t, admin, "ALTER DATABASE "+dbName+" ALLOW_CONNECTIONS true")
 	})
 
 	t.Run("with_force", func(t *testing.T) {
