@@ -51,6 +51,7 @@ const (
 	featureCreateRoleSelfGrant
 	featureSecurityLabel
 	featureMaintainPrivilege
+	featureParameterPrivilege
 )
 
 var (
@@ -130,6 +131,9 @@ var (
 
 		// MAINTAIN privilege on tables (PG 17+)
 		featureMaintainPrivilege: semver.MustParseRange(">=17.0.0"),
+
+		// GRANT ... ON PARAMETER (PG 15+)
+		featureParameterPrivilege: semver.MustParseRange(">=15.0.0"),
 	}
 )
 

@@ -1,9 +1,11 @@
 package postgresql
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -1640,4 +1642,440 @@ resource "postgresql_grant" "database" {
 			},
 		},
 	})
+}
+
+// namedObjectGrantCase describes an object type which has no ALL ... IN SCHEMA form: the objects
+// are named in `objects` and the privileges are read back from the catalogs.
+type namedObjectGrantCase struct {
+	// objectType is the object_type value of the resource
+	objectType string
+	// objects is the HCL value of the objects attribute of the first step
+	objects string
+	// withSchema is true when the schema attribute is set
+	withSchema bool
+	// sqlObject is the object as written after ON in a GRANT statement
+	sqlObject string
+	// preCheck skips the test when the object cannot be created or granted in the environment
+	preCheck func(t *testing.T)
+	// setup and teardown are run as the test user around the test, teardown must be idempotent
+	setup, teardown []string
+	// partial and full are the privileges of the steps of the test (HCL lists)
+	partial, full []string
+	// partialACL and fullACL are the privileges expected in the catalogs for partial and full (grant option not set)
+	partialACL, fullACL []string
+	// privileges are the privileges of the object which are not ALL, checked with the effective privileges
+	privileges []string
+	// aclQuery returns the privileges of the object for the grantee given by %[1]s, with * for the grant option
+	aclQuery string
+	// hasQuery returns the effective privilege of the test role, %[1]s is the role and %[2]s the privilege
+	hasQuery string
+	// drift grants a privilege outside of Terraform, %s is the grantee
+	drift string
+}
+
+// testPostgresDSN returns the connection string of the postgres database of the tests.
+func testPostgresDSN(t *testing.T) string {
+	config := getTestConfig(t)
+	return config.connStr("postgres")
+}
+
+// testExecSession runs the statements one after the other in the same session, which is needed
+// for the settings which apply to the following statement (e.g.: allow_in_place_tablespaces).
+func testExecSession(t *testing.T, dsn string, statements ...string) {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("could not create connection pool: %v", err)
+	}
+	defer closeDB(t, db)
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("could not get a connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	for _, statement := range statements {
+		if _, err := conn.ExecContext(context.Background(), statement); err != nil {
+			t.Fatalf("could not execute query %s: %v", statement, err)
+		}
+	}
+}
+
+// namedObjectGrantConfig returns the configuration of a grant on a named object for the role (or PUBLIC).
+func namedObjectGrantConfig(c namedObjectGrantCase, role string, privileges []string, withOption bool, objects string) string {
+	roleExpr := `postgresql_role.test.name`
+	if role == publicRole {
+		roleExpr = `"public"`
+	}
+	schemaLine := ""
+	if c.withSchema {
+		schemaLine = `schema            = "test_grant_objects"`
+	}
+	return fmt.Sprintf(`
+resource "postgresql_role" "test" {
+  name     = "test_grant_role"
+  password = "%s"
+  login    = true
+}
+
+resource "postgresql_grant" "test" {
+  depends_on        = [postgresql_role.test]
+  database          = "postgres"
+  role              = %s
+  %s
+  object_type       = "%s"
+  objects           = %s
+  privileges        = %s
+  with_grant_option = %t
+}
+`, testRolePassword, roleExpr, schemaLine, c.objectType, objects, hclStringList(privileges), withOption)
+}
+
+func hclStringList(values []string) string {
+	quoted := make([]string, len(values))
+	for i, v := range values {
+		quoted[i] = fmt.Sprintf("%q", v)
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+// testCheckNamedObjectGrant checks the privileges of the object in the catalogs, and the effective
+// privileges of the test role, after the grant has been applied. With the grant option, every
+// privilege of the catalogs is expected with a *.
+func testCheckNamedObjectGrant(t *testing.T, c namedObjectGrantCase, role string, expected []string, withOption bool) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		dsn := testPostgresDSN(t)
+		db, err := sql.Open("postgres", dsn)
+		if err != nil {
+			t.Fatalf("could not open connection pool: %v", err)
+		}
+		defer closeDB(t, db)
+
+		grantee := "(SELECT oid FROM pg_roles WHERE rolname = 'test_grant_role')::oid"
+		if role == publicRole {
+			grantee = "0::oid"
+		}
+		var granted pq.StringArray
+		if err := db.QueryRow(fmt.Sprintf(c.aclQuery, grantee)).Scan(&granted); err != nil {
+			return fmt.Errorf("could not read the privileges of %s: %w", c.sqlObject, err)
+		}
+
+		want := []string{}
+		for _, p := range expected {
+			if withOption {
+				p += "*"
+			}
+			want = append(want, p)
+		}
+		if !sameStrings(granted, want) {
+			return fmt.Errorf("the catalogs have the privileges %v on %s for %s, expected %v", granted, c.sqlObject, role, want)
+		}
+
+		for _, p := range c.privileges {
+			has, err := testEffectivePrivilege(t, c, p)
+			if err != nil {
+				return err
+			}
+			if has != sliceContainsStr(expected, p) {
+				return fmt.Errorf("effective privilege %s on %s is %t, expected %t", p, c.sqlObject, has, !has)
+			}
+		}
+		return nil
+	}
+}
+
+// testEffectivePrivilege returns the effective privilege of the test role on the object.
+func testEffectivePrivilege(t *testing.T, c namedObjectGrantCase, privilege string) (bool, error) {
+	if c.objectType == "large_object" {
+		// PostgreSQL has no has_largeobject_privilege function: the role has to use the object.
+		db := connectAsTestRole(t, "test_grant_role", "postgres")
+		defer closeDB(t, db)
+		query := "SELECT lo_get(9001)"
+		if privilege == "UPDATE" {
+			query = "SELECT lo_put(9001, 0, ''::bytea)"
+		}
+		_, err := db.Exec(query)
+		return err == nil, nil
+	}
+
+	dsn := testPostgresDSN(t)
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("could not open connection pool: %v", err)
+	}
+	defer closeDB(t, db)
+
+	var has bool
+	if err := db.QueryRow(fmt.Sprintf(c.hasQuery, "test_grant_role", privilege)).Scan(&has); err != nil {
+		return false, fmt.Errorf("could not check the privilege %s: %w", privilege, err)
+	}
+	return has, nil
+}
+
+func sameStrings(a, b []string) bool {
+	x := append([]string{}, a...)
+	y := append([]string{}, b...)
+	sort.Strings(x)
+	sort.Strings(y)
+	return fmt.Sprint(x) == fmt.Sprint(y)
+}
+
+// testAccPostgresqlGrantNamedObject runs the steps shared by the object types which are named in
+// `objects`: creation, drift detected by the plan, extension, grant option in both directions,
+// reduction and removal. The role is either a role or PUBLIC (which cannot have a grant option).
+func testAccPostgresqlGrantNamedObject(t *testing.T, c namedObjectGrantCase, role string) {
+	const noObjects = `[]`
+	revokeRole := pq.QuoteIdentifier(role)
+	if role == publicRole {
+		revokeRole = "PUBLIC"
+	}
+	withOption := role != publicRole
+
+	check := func(expected []string, option bool) resource.TestCheckFunc {
+		return resource.ComposeTestCheckFunc(
+			resource.TestCheckResourceAttr("postgresql_grant.test", "with_grant_option", fmt.Sprint(option)),
+			testCheckNamedObjectGrant(t, c, role, expected, option),
+		)
+	}
+
+	steps := []resource.TestStep{
+		{
+			// objects are mandatory: PostgreSQL has no ALL ... IN SCHEMA form for these object types
+			Config:      namedObjectGrantConfig(c, role, c.partial, false, noObjects),
+			ExpectError: regexp.MustCompile("must specify `objects`"),
+		},
+		{
+			Config: namedObjectGrantConfig(c, role, c.partial, false, c.objects),
+			Check:  check(c.partialACL, false),
+		},
+		{
+			// privileges revoked outside of Terraform are detected by the plan
+			PreConfig: func() {
+				dbExecute(t, testPostgresDSN(t), fmt.Sprintf("REVOKE ALL ON %s FROM %s", c.sqlObject, revokeRole))
+			},
+			Config:             namedObjectGrantConfig(c, role, c.partial, false, c.objects),
+			PlanOnly:           true,
+			ExpectNonEmptyPlan: true,
+		},
+		{
+			Config: namedObjectGrantConfig(c, role, c.partial, false, c.objects),
+			Check:  check(c.partialACL, false),
+		},
+	}
+
+	if c.drift != "" {
+		steps = append(steps,
+			resource.TestStep{
+				// privileges granted outside of Terraform are detected by the plan
+				PreConfig: func() {
+					dbExecute(t, testPostgresDSN(t), fmt.Sprintf(c.drift, revokeRole))
+				},
+				Config:             namedObjectGrantConfig(c, role, c.partial, false, c.objects),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			resource.TestStep{
+				Config: namedObjectGrantConfig(c, role, c.partial, false, c.objects),
+				Check:  check(c.partialACL, false),
+			},
+		)
+	}
+
+	if withOption {
+		steps = append(steps,
+			resource.TestStep{
+				// extension of the privileges with the grant option (replaces the grant)
+				Config: namedObjectGrantConfig(c, role, c.full, true, c.objects),
+				Check:  check(c.fullACL, true),
+			},
+			resource.TestStep{
+				// removal of the grant option (replaces the grant)
+				Config: namedObjectGrantConfig(c, role, c.full, false, c.objects),
+				Check:  check(c.fullACL, false),
+			},
+		)
+	} else {
+		steps = append(steps,
+			resource.TestStep{
+				Config: namedObjectGrantConfig(c, role, c.full, false, c.objects),
+				Check:  check(c.fullACL, false),
+			},
+		)
+	}
+
+	steps = append(steps,
+		resource.TestStep{
+			// reduction of the privileges
+			Config: namedObjectGrantConfig(c, role, c.partial, false, c.objects),
+			Check:  check(c.partialACL, false),
+		},
+		resource.TestStep{
+			// removal: everything is revoked
+			Config: namedObjectGrantConfig(c, role, []string{}, false, c.objects),
+			Check:  check([]string{}, false),
+		},
+	)
+
+	dsn := testPostgresDSN(t)
+	defer testExecSession(t, dsn, c.teardown...)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			if c.preCheck != nil {
+				c.preCheck(t)
+			}
+			testExecSession(t, dsn, c.setup...)
+		},
+		Providers: testAccProviders,
+		Steps:     steps,
+	})
+}
+
+// TestAccPostgresqlGrantNamedObjectTypes tests the object types which are named explicitly in the
+// GRANT statement (there is no ALL ... IN SCHEMA form for them), for a role and for PUBLIC.
+func TestAccPostgresqlGrantNamedObjectTypes(t *testing.T) {
+	skipIfNotAcc(t)
+
+	cases := map[string]namedObjectGrantCase{
+		"type": {
+			objectType: "type",
+			objects:    `["test_type"]`,
+			withSchema: true,
+			sqlObject:  "TYPE test_grant_objects.test_type",
+			setup: []string{
+				"DROP SCHEMA IF EXISTS test_grant_objects CASCADE",
+				"CREATE SCHEMA test_grant_objects",
+				"CREATE TYPE test_grant_objects.test_type AS ENUM ('a')",
+				// types are granted to PUBLIC by default
+				"REVOKE USAGE ON TYPE test_grant_objects.test_type FROM PUBLIC",
+			},
+			teardown:   []string{"DROP SCHEMA IF EXISTS test_grant_objects CASCADE"},
+			partial:    []string{"USAGE"},
+			full:       []string{"ALL"},
+			partialACL: []string{"USAGE"},
+			fullACL:    []string{"USAGE"},
+			privileges: []string{"USAGE"},
+			aclQuery: `SELECT coalesce(array_agg(p.privilege_type || CASE WHEN p.is_grantable THEN '*' ELSE '' END ORDER BY p.privilege_type), '{}')
+FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace, aclexplode(t.typacl) p
+WHERE n.nspname = 'test_grant_objects' AND t.typname = 'test_type' AND p.grantee = %[1]s`,
+			hasQuery: `SELECT has_type_privilege('%[1]s', 'test_grant_objects.test_type', '%[2]s')`,
+		},
+		"domain": {
+			objectType: "domain",
+			objects:    `["test_domain"]`,
+			withSchema: true,
+			sqlObject:  "DOMAIN test_grant_objects.test_domain",
+			setup: []string{
+				"DROP SCHEMA IF EXISTS test_grant_objects CASCADE",
+				"CREATE SCHEMA test_grant_objects",
+				"CREATE DOMAIN test_grant_objects.test_domain AS int",
+				// domains are granted to PUBLIC by default
+				"REVOKE USAGE ON DOMAIN test_grant_objects.test_domain FROM PUBLIC",
+			},
+			teardown:   []string{"DROP SCHEMA IF EXISTS test_grant_objects CASCADE"},
+			partial:    []string{"USAGE"},
+			full:       []string{"ALL"},
+			partialACL: []string{"USAGE"},
+			fullACL:    []string{"USAGE"},
+			privileges: []string{"USAGE"},
+			aclQuery: `SELECT coalesce(array_agg(p.privilege_type || CASE WHEN p.is_grantable THEN '*' ELSE '' END ORDER BY p.privilege_type), '{}')
+FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace, aclexplode(t.typacl) p
+WHERE n.nspname = 'test_grant_objects' AND t.typname = 'test_domain' AND p.grantee = %[1]s`,
+			hasQuery: `SELECT has_type_privilege('%[1]s', 'test_grant_objects.test_domain', '%[2]s')`,
+		},
+		"language": {
+			objectType: "language",
+			objects:    `["plpgsql"]`,
+			sqlObject:  "LANGUAGE plpgsql",
+			preCheck: func(t *testing.T) {
+				// Languages belong to the superuser: a role which is not one cannot grant them.
+				skipIfNotSuperuser(t)
+			},
+			// languages are granted to PUBLIC by default, the public grant is removed for the test
+			setup:      []string{"REVOKE USAGE ON LANGUAGE plpgsql FROM PUBLIC"},
+			teardown:   []string{"GRANT USAGE ON LANGUAGE plpgsql TO PUBLIC"},
+			partial:    []string{"USAGE"},
+			full:       []string{"ALL"},
+			partialACL: []string{"USAGE"},
+			fullACL:    []string{"USAGE"},
+			privileges: []string{"USAGE"},
+			aclQuery: `SELECT coalesce(array_agg(p.privilege_type || CASE WHEN p.is_grantable THEN '*' ELSE '' END ORDER BY p.privilege_type), '{}')
+FROM pg_language l, aclexplode(l.lanacl) p
+WHERE l.lanname = 'plpgsql' AND p.grantee = %[1]s`,
+			hasQuery: `SELECT has_language_privilege('%[1]s', 'plpgsql', '%[2]s')`,
+		},
+		"large_object": {
+			objectType: "large_object",
+			objects:    `["9001"]`,
+			sqlObject:  "LARGE OBJECT 9001",
+			setup: []string{
+				"DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_largeobject_metadata WHERE oid = 9001) THEN PERFORM lo_unlink(9001); END IF; END $$",
+				"SELECT lo_create(9001)",
+			},
+			teardown:   []string{"DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_largeobject_metadata WHERE oid = 9001) THEN PERFORM lo_unlink(9001); END IF; END $$"},
+			partial:    []string{"SELECT"},
+			full:       []string{"ALL"},
+			partialACL: []string{"SELECT"},
+			fullACL:    []string{"SELECT", "UPDATE"},
+			privileges: []string{"SELECT", "UPDATE"},
+			aclQuery: `SELECT coalesce(array_agg(p.privilege_type || CASE WHEN p.is_grantable THEN '*' ELSE '' END ORDER BY p.privilege_type), '{}')
+FROM pg_largeobject_metadata m, aclexplode(m.lomacl) p
+WHERE m.oid = 9001 AND p.grantee = %[1]s`,
+			drift: "GRANT UPDATE ON LARGE OBJECT 9001 TO %s",
+		},
+		"parameter": {
+			objectType: "parameter",
+			objects:    `["work_mem"]`,
+			sqlObject:  "PARAMETER work_mem",
+			preCheck: func(t *testing.T) {
+				// Only a superuser can grant the parameters which have no grant option for it.
+				skipIfNotSuperuser(t)
+				testCheckCompatibleVersion(t, featureParameterPrivilege)
+			},
+			partial:    []string{"SET"},
+			full:       []string{"ALL"},
+			partialACL: []string{"SET"},
+			fullACL:    []string{"ALTER SYSTEM", "SET"},
+			privileges: []string{"SET", "ALTER SYSTEM"},
+			aclQuery: `SELECT coalesce(array_agg(p.privilege_type || CASE WHEN p.is_grantable THEN '*' ELSE '' END ORDER BY p.privilege_type), '{}')
+FROM pg_parameter_acl a, aclexplode(a.paracl) p
+WHERE a.parname = 'work_mem' AND p.grantee = %[1]s`,
+			hasQuery: `SELECT has_parameter_privilege('%[1]s', 'work_mem', '%[2]s')`,
+			drift:    "GRANT ALTER SYSTEM ON PARAMETER work_mem TO %s",
+		},
+		"tablespace": {
+			objectType: "tablespace",
+			objects:    `["test_grant_ts"]`,
+			sqlObject:  "TABLESPACE test_grant_ts",
+			preCheck: func(t *testing.T) {
+				// Only a superuser can create a tablespace
+				skipIfNotSuperuser(t)
+			},
+			// in place tablespaces do not need a directory outside of the data directory
+			setup: []string{
+				"DROP TABLESPACE IF EXISTS test_grant_ts",
+				"SET allow_in_place_tablespaces = true",
+				"CREATE TABLESPACE test_grant_ts LOCATION ''",
+			},
+			teardown:   []string{"DROP TABLESPACE IF EXISTS test_grant_ts"},
+			partial:    []string{"CREATE"},
+			full:       []string{"ALL"},
+			partialACL: []string{"CREATE"},
+			fullACL:    []string{"CREATE"},
+			privileges: []string{"CREATE"},
+			aclQuery: `SELECT coalesce(array_agg(p.privilege_type || CASE WHEN p.is_grantable THEN '*' ELSE '' END ORDER BY p.privilege_type), '{}')
+FROM pg_tablespace t, aclexplode(t.spcacl) p
+WHERE t.spcname = 'test_grant_ts' AND p.grantee = %[1]s`,
+			hasQuery: `SELECT has_tablespace_privilege('%[1]s', 'test_grant_ts', '%[2]s')`,
+		},
+	}
+
+	for name, c := range cases {
+		for _, role := range []string{"test_grant_role", publicRole} {
+			t.Run(name+"_"+role, func(t *testing.T) {
+				testAccPostgresqlGrantNamedObject(t, c, role)
+			})
+		}
+	}
 }
