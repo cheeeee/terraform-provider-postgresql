@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/hashicorp/go-cty/cty"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/lib/pq"
 )
@@ -137,25 +136,12 @@ func suppressConfigParametersDiff(k, old, new string, d *schema.ResourceData) bo
 			return false
 		}
 	}
-	if len(oldElements) > 0 {
-		return true
-	}
 
-	// Both are empty lists, but a parameter which is not defined is also seen as
-	// an empty value here: the diff is ignored only if the parameter is really
-	// set to an empty list in the database and in the configuration.
-	if old == "" {
-		return false
-	}
-	config := d.GetRawConfig()
-	if config.IsNull() || !config.IsKnown() {
-		return false
-	}
-	parameters := config.GetAttr(attr)
-	if parameters.IsNull() || !parameters.IsKnown() {
-		return false
-	}
-	return parameters.HasIndex(cty.StringVal(name)).True()
+	// The lists are the same. They can also be both empty because the parameter
+	// is not set in the database, or not defined in the configuration, which is
+	// a real difference: the diff is ignored only if the parameter is on both sides.
+	_, defined := d.Get(attr).(map[string]any)[name]
+	return defined && old != ""
 }
 
 // validateConfigParameters returns a schema.SchemaValidateFunc for a map of
@@ -168,9 +154,7 @@ func validateConfigParameters(reserved map[string]string) func(any, string) ([]s
 		for name := range v.(map[string]any) {
 			if attr, ok := reserved[name]; ok {
 				errs = append(errs, fmt.Errorf("%s: %q cannot be set here, use the %q attribute instead", k, name, attr))
-				continue
-			}
-			if !configParameterNameRegexp.MatchString(name) {
+			} else if !configParameterNameRegexp.MatchString(name) {
 				errs = append(errs, fmt.Errorf("%s: %q is not a valid parameter name (it must be lowercase)", k, name))
 			}
 		}
@@ -209,7 +193,8 @@ func alterConfigParameters(db QueryAble, objectType, objectName string, oldParam
 		}
 	}
 	for name, value := range newParams {
-		if old, ok := oldParams[name]; !ok || old != value {
+		// a parameter which is not in oldParams is nil, so it's different too
+		if oldParams[name] != value {
 			toSet = append(toSet, name)
 		}
 	}
@@ -238,31 +223,35 @@ func alterConfigParameters(db QueryAble, objectType, objectName string, oldParam
 	// PostgreSQL stores the value as it is, except for the list parameters.
 	// If one which is not in listQuoteParameters has been stored as one single
 	// quoted element, its value has to be set again element by element.
-	if len(toSet) == 0 {
-		return nil
-	}
 	stored, err := readConfigParameters(db, objectType, objectName)
 	if err != nil {
 		return err
 	}
 	for _, name := range toSet {
 		value := newParams[name].(string)
-		storedValue, ok := stored[name].(string)
-		if !ok || listQuoteParameters[name] || storedValue == value || !strings.HasPrefix(storedValue, `"`) {
-			continue
-		}
-		if elements := splitListParameter(storedValue); len(elements) != 1 || elements[0] != value {
-			continue
-		}
-		if elements := splitListParameter(value); len(elements) == 1 && elements[0] == value {
-			// a single element which only needs to be quoted
-			continue
-		}
-		if err := set(name, listParameterValue(value)); err != nil {
-			return err
+		storedValue, _ := stored[name].(string)
+		if storedAsSingleElement(storedValue, value) {
+			if err := set(name, listParameterValue(value)); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// storedAsSingleElement returns true if stored is value quoted by PostgreSQL as
+// one single element of a list, whereas value is not written as a single element.
+// e.g.: foo, bar stored as "foo, bar"
+func storedAsSingleElement(stored, value string) bool {
+	if stored == value {
+		return false
+	}
+	if elements := splitListParameter(stored); len(elements) != 1 || elements[0] != value {
+		return false
+	}
+	// A value which is already one single element only had to be quoted (e.g.: Foo stored as "Foo")
+	elements := splitListParameter(value)
+	return len(elements) != 1 || elements[0] != value
 }
 
 // readConfigParameters returns all the configuration parameters set for a role or a database.

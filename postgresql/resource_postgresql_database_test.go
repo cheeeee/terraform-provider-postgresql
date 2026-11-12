@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"testing"
 
@@ -678,7 +679,7 @@ resource "postgresql_database" "params_db" {
 func TestAccPostgresqlDatabase_ParametersAllSettable(t *testing.T) {
 	skipIfNotAcc(t)
 
-	parameters := testSettableParameters(t, nil)
+	rounds := testParametersRounds(testSettableParameters(t, nil))
 
 	dbConfig := func(parameters string) string {
 		return fmt.Sprintf(`
@@ -689,32 +690,38 @@ resource "postgresql_database" "all_params_db" {
 `, parameters)
 	}
 
+	// All the parameters are set at once, with other values at each step
+	var steps []resource.TestStep
+	for _, parameters := range rounds {
+		steps = append(steps, resource.TestStep{
+			Config: dbConfig(testParametersHCL(parameters)),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.all_params_db", "parameters.%", strconv.Itoa(len(parameters))),
+				testAccCheckAllConfigParameters(testDatabaseConfigQuery, "all_params_db", nil, parameters),
+			),
+		})
+	}
+	steps = append(steps,
+		resource.TestStep{
+			ResourceName:            "postgresql_database.all_params_db",
+			ImportState:             true,
+			ImportStateVerify:       true,
+			ImportStateVerifyIgnore: []string{"template", "alter_object_ownership"},
+		},
+		resource.TestStep{
+			Config: dbConfig("{}"),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.all_params_db", "parameters.%", "0"),
+				testAccCheckConfigParameters(testDatabaseConfigQuery, "all_params_db", []string{}),
+			),
+		},
+	)
+
 	resource.Test(t, resource.TestCase{
 		PreCheck:     func() { testAccPreCheck(t) },
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
-		Steps: []resource.TestStep{
-			{
-				Config: dbConfig(testParametersHCL(parameters)),
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_database.all_params_db", "parameters.%", strconv.Itoa(len(parameters))),
-					testAccCheckAllConfigParameters(testDatabaseConfigQuery, "all_params_db", nil, parameters),
-				),
-			},
-			{
-				ResourceName:            "postgresql_database.all_params_db",
-				ImportState:             true,
-				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"template", "alter_object_ownership"},
-			},
-			{
-				Config: dbConfig("{}"),
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_database.all_params_db", "parameters.%", "0"),
-					testAccCheckConfigParameters(testDatabaseConfigQuery, "all_params_db", []string{}),
-				),
-			},
-		},
+		Steps:        steps,
 	})
 }
 
@@ -763,6 +770,117 @@ resource "postgresql_database" "params_db" {
 	})
 }
 
+// Test that the error of PostgreSQL is reported when a parameter cannot be set
+// for a database (e.g.: the ones which need a restart of the server).
+func TestAccPostgresqlDatabase_ParametersRejected(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbConfig := func(name, parameters string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "rejected_params_db" {
+  name = "%s"
+  %s
+}
+`, name, parameters)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			// at the creation
+			{
+				Config:      dbConfig("rejected_params_db", `parameters = { shared_buffers = "1GB" }`),
+				ExpectError: regexp.MustCompile(`could not set parameter shared_buffers for database rejected_params_db`),
+			},
+			{
+				Config: dbConfig("rejected_params_db", `parameters = { work_mem = "64MB" }`),
+				Check:  testAccCheckConfigParameters(testDatabaseConfigQuery, "rejected_params_db", []string{"work_mem=64MB"}),
+			},
+			// on update, the other parameters are not changed
+			{
+				Config:      dbConfig("rejected_params_db", `parameters = { work_mem = "128MB", shared_buffers = "1GB" }`),
+				ExpectError: regexp.MustCompile(`could not set parameter shared_buffers for database rejected_params_db`),
+			},
+			{
+				Config: dbConfig("rejected_params_db", `parameters = { work_mem = "64MB" }`),
+				Check:  testAccCheckConfigParameters(testDatabaseConfigQuery, "rejected_params_db", []string{"work_mem=64MB"}),
+			},
+		},
+	})
+}
+
+// Test the parameters which are a list of identifiers: PostgreSQL stores them in
+// a normalized form, the differences of formatting must not be seen as a change.
+func TestAccPostgresqlDatabase_ParametersList(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbConfig := func(searchPath, otherSearchPath, parameters string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "list_params_db" {
+  name = "list_params_db"
+  parameters = {
+    search_path = %s
+    %s
+  }
+}
+
+resource "postgresql_database" "list_params_db2" {
+  name = "list_params_db2"
+  parameters = {
+    search_path = %s
+  }
+}
+`, strconv.Quote(searchPath), parameters, strconv.Quote(otherSearchPath))
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			// The lists are not written as PostgreSQL stores them: no quote, no space,
+			// an empty list, a name which needs to be quoted.
+			{
+				Config: dbConfig(`$user,public`, `Foo`, `temp_tablespaces = ""`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "list_params_db", []string{
+						`search_path="$user", public`, `temp_tablespaces=""`,
+					}),
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "list_params_db2", []string{`search_path="Foo"`}),
+				),
+			},
+			// An element is changed, the number of elements is the same.
+			{
+				Config: dbConfig(`$user,other`, `bar`, `temp_tablespaces = ""`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "list_params_db", []string{
+						`search_path="$user", other`, `temp_tablespaces=""`,
+					}),
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "list_params_db2", []string{`search_path=bar`}),
+				),
+			},
+			// The empty list is removed.
+			{
+				Config: dbConfig(`$user,other`, `bar`, ``),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "list_params_db", []string{`search_path="$user", other`}),
+				),
+			},
+			// An empty list is not the same as no parameter.
+			{
+				Config: dbConfig(`$user,other`, `bar`, `temp_tablespaces = ""`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckConfigParameters(testDatabaseConfigQuery, "list_params_db", []string{
+						`search_path="$user", other`, `temp_tablespaces=""`,
+					}),
+				),
+			},
+		},
+	})
+}
+
 // Test the pgaudit settings of a database, this is the way to enable / disable
 // the audit of a specific database (e.g.: on AWS RDS).
 func TestAccPostgresqlDatabase_ParametersPgaudit(t *testing.T) {
@@ -784,8 +902,8 @@ resource "postgresql_database" "audited_db" {
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
-			testSuperuserPreCheck(t)
 			testCheckPgauditLoaded(t)
+			testCheckCanSetParameter(t, "pgaudit.log", "none")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,

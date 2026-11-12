@@ -745,7 +745,7 @@ resource "postgresql_role" "params_role" {
 func TestAccPostgresqlRole_ParametersAllSettable(t *testing.T) {
 	skipIfNotAcc(t)
 
-	parameters := testSettableParameters(t, roleReservedParameters)
+	rounds := testParametersRounds(testSettableParameters(t, roleReservedParameters))
 
 	roleConfig := func(parameters string) string {
 		return fmt.Sprintf(`
@@ -756,6 +756,32 @@ resource "postgresql_role" "all_params_role" {
 `, parameters)
 	}
 
+	// All the parameters are set at once, with other values at each step
+	var steps []resource.TestStep
+	for _, parameters := range rounds {
+		steps = append(steps, resource.TestStep{
+			Config: roleConfig(testParametersHCL(parameters)),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_role.all_params_role", "parameters.%", strconv.Itoa(len(parameters))),
+				testAccCheckAllConfigParameters(testRoleConfigQuery, "all_params_role", roleReservedParameters, parameters),
+			),
+		})
+	}
+	steps = append(steps,
+		resource.TestStep{
+			ResourceName:      "postgresql_role.all_params_role",
+			ImportState:       true,
+			ImportStateVerify: true,
+		},
+		resource.TestStep{
+			Config: roleConfig("{}"),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_role.all_params_role", "parameters.%", "0"),
+				testAccCheckConfigParameters(testRoleConfigQuery, "all_params_role", []string{}),
+			),
+		},
+	)
+
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -763,27 +789,7 @@ resource "postgresql_role" "all_params_role" {
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
-		Steps: []resource.TestStep{
-			{
-				Config: roleConfig(testParametersHCL(parameters)),
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_role.all_params_role", "parameters.%", strconv.Itoa(len(parameters))),
-					testAccCheckAllConfigParameters(testRoleConfigQuery, "all_params_role", roleReservedParameters, parameters),
-				),
-			},
-			{
-				ResourceName:      "postgresql_role.all_params_role",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-			{
-				Config: roleConfig("{}"),
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_role.all_params_role", "parameters.%", "0"),
-					testAccCheckConfigParameters(testRoleConfigQuery, "all_params_role", []string{}),
-				),
-			},
-		},
+		Steps:        steps,
 	})
 }
 
@@ -802,6 +808,45 @@ resource "postgresql_role" "params_role" {
 }
 `,
 				ExpectError: regexp.MustCompile(`"search_path" cannot be set here`),
+			},
+		},
+	})
+}
+
+// Test that the error of PostgreSQL is reported when a parameter cannot be set
+// for a role (e.g.: the ones which need a restart of the server).
+func TestAccPostgresqlRole_ParametersRejected(t *testing.T) {
+	roleConfig := func(parameters string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "rejected_params_role" {
+  name = "rejected_params_role"
+  %s
+}
+`, parameters)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			// at the creation, the role is not created
+			{
+				Config:      roleConfig(`parameters = { shared_buffers = "1GB" }`),
+				ExpectError: regexp.MustCompile(`could not set parameter shared_buffers for role rejected_params_role`),
+			},
+			{
+				Config: roleConfig(`parameters = { work_mem = "64MB" }`),
+				Check:  testAccCheckConfigParameters(testRoleConfigQuery, "rejected_params_role", []string{"work_mem=64MB"}),
+			},
+			// on update, the other changes are not applied
+			{
+				Config:      roleConfig(`parameters = { work_mem = "128MB", shared_buffers = "1GB" }`),
+				ExpectError: regexp.MustCompile(`could not set parameter shared_buffers for role rejected_params_role`),
+			},
+			{
+				Config: roleConfig(`parameters = { work_mem = "64MB" }`),
+				Check:  testAccCheckConfigParameters(testRoleConfigQuery, "rejected_params_role", []string{"work_mem=64MB"}),
 			},
 		},
 	})
@@ -827,8 +872,8 @@ resource "postgresql_role" "audited_role" {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePrivileges)
-			testSuperuserPreCheck(t)
 			testCheckPgauditLoaded(t)
+			testCheckCanSetParameter(t, "pgaudit.log", "none")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
