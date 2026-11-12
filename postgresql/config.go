@@ -52,6 +52,8 @@ const (
 	featureSecurityLabel
 	featureMaintainPrivilege
 	featureEventTriggerLogin
+	featureLogicalSlotTwoPhase
+	featureLogicalSlotFailover
 )
 
 var (
@@ -134,6 +136,10 @@ var (
 
 		// Event triggers on the login event (PG 17+)
 		featureEventTriggerLogin: semver.MustParseRange(">=17.0.0"),
+		// twophase argument of pg_create_logical_replication_slot (PG 14+)
+		featureLogicalSlotTwoPhase: semver.MustParseRange(">=14.0.0"),
+		// failover argument of pg_create_logical_replication_slot (PG 17+)
+		featureLogicalSlotFailover: semver.MustParseRange(">=17.0.0"),
 	}
 )
 

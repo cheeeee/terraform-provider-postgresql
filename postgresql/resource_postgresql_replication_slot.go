@@ -38,6 +38,18 @@ func resourcePostgreSQLReplicationSlot() *schema.Resource {
 				ForceNew:    true,
 				Description: "Sets the output plugin to use",
 			},
+			"two_phase": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				ForceNew:    true,
+				Description: "Enables two-phase decoding of the replication slot (PostgreSQL 14 or newer)",
+			},
+			"failover": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				ForceNew:    true,
+				Description: "Enables the replication slot to be synchronized to standbys for failover (PostgreSQL 17 or newer)",
+			},
 		},
 	}
 }
@@ -46,7 +58,16 @@ func resourcePostgreSQLReplicationSlotCreate(db *DBConnection, d *schema.Resourc
 
 	name := d.Get("name").(string)
 	plugin := d.Get("plugin").(string)
+	twoPhase := d.Get("two_phase").(bool)
+	failover := d.Get("failover").(bool)
 	databaseName := getDatabaseForReplicationSlot(d, db.client.databaseName)
+
+	if twoPhase && !db.featureSupported(featureLogicalSlotTwoPhase) {
+		return fmt.Errorf("attribute two_phase requires PostgreSQL 14 or newer, the server runs PostgreSQL %s", db.version)
+	}
+	if failover && !db.featureSupported(featureLogicalSlotFailover) {
+		return fmt.Errorf("attribute failover requires PostgreSQL 17 or newer, the server runs PostgreSQL %s", db.version)
+	}
 
 	// NB: we use initConnection instead of startTransaction so that replication slots can be managed on replica servers too, for cascading replication
 	dbc, err := initConnection(db.client, databaseName)
@@ -54,8 +75,18 @@ func resourcePostgreSQLReplicationSlotCreate(db *DBConnection, d *schema.Resourc
 		return err
 	}
 
-	sql := "SELECT FROM pg_create_logical_replication_slot($1, $2)"
-	if _, err := dbc.Exec(sql, name, plugin); err != nil {
+	sql := "SELECT FROM pg_create_logical_replication_slot($1, $2"
+	args := []interface{}{name, plugin}
+	if twoPhase {
+		args = append(args, true)
+		sql += fmt.Sprintf(", twophase => $%d", len(args))
+	}
+	if failover {
+		args = append(args, true)
+		sql += fmt.Sprintf(", failover => $%d", len(args))
+	}
+	sql += ")"
+	if _, err := dbc.Exec(sql, args...); err != nil {
 		return err
 	}
 
@@ -114,10 +145,21 @@ func resourcePostgreSQLReplicationSlotReadImpl(db *DBConnection, d *schema.Resou
 	}
 
 	var replicationSlotPlugin string
-	query := `SELECT plugin ` +
-		`FROM pg_catalog.pg_replication_slots ` +
-		`WHERE slot_name = $1 AND database = $2`
-	err = dbc.QueryRow(query, replicationSlotName, database).Scan(&replicationSlotPlugin)
+	var twoPhase, failover bool
+	columns := "plugin"
+	dest := []interface{}{&replicationSlotPlugin}
+	if db.featureSupported(featureLogicalSlotTwoPhase) {
+		columns += ", two_phase"
+		dest = append(dest, &twoPhase)
+	}
+	if db.featureSupported(featureLogicalSlotFailover) {
+		columns += ", failover"
+		dest = append(dest, &failover)
+	}
+	query := fmt.Sprintf(`SELECT %s `+
+		`FROM pg_catalog.pg_replication_slots `+
+		`WHERE slot_name = $1 AND database = $2`, columns)
+	err = dbc.QueryRow(query, replicationSlotName, database).Scan(dest...)
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL ReplicationSlot (%s) not found for database %s", replicationSlotName, database)
@@ -130,6 +172,12 @@ func resourcePostgreSQLReplicationSlotReadImpl(db *DBConnection, d *schema.Resou
 	d.Set("name", replicationSlotName)
 	d.Set("plugin", replicationSlotPlugin)
 	d.Set("database", database)
+	if db.featureSupported(featureLogicalSlotTwoPhase) {
+		d.Set("two_phase", twoPhase)
+	}
+	if db.featureSupported(featureLogicalSlotFailover) {
+		d.Set("failover", failover)
+	}
 	d.SetId(generateReplicationSlotID(d, database))
 
 	return nil
