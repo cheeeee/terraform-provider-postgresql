@@ -1,6 +1,8 @@
 package postgresql
 
 import (
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -18,6 +20,18 @@ type PGFunction struct {
 	SecurityDefiner bool
 	Strict          bool
 	Volatility      string
+
+	Leakproof  bool
+	Window     bool
+	Cost       float64
+	Rows       float64
+	Support    string
+	Transform  []string
+	Parameters map[string]any
+	Owner      string
+	Extensions []string
+	SQLBody    string
+	ObjFile    string
 }
 
 type PGFunctionArg struct {
@@ -44,6 +58,27 @@ func (pgFunction *PGFunction) FromResourceData(d *schema.ResourceData) error {
 	}
 	pgFunction.Body = normalizeFunctionBody(d.Get(funcBodyAttr).(string))
 	pgFunction.Args = []PGFunctionArg{}
+	pgFunction.SQLBody = d.Get(funcSQLBodyAttr).(string)
+	if pgFunction.SQLBody != "" {
+		pgFunction.Body = ""
+	}
+	pgFunction.ObjFile = d.Get(funcObjFileAttr).(string)
+	pgFunction.Leakproof = d.Get(funcLeakproofAttr).(bool)
+	pgFunction.Window = d.Get(funcWindowAttr).(bool)
+	pgFunction.Cost = d.Get(funcCostAttr).(float64)
+	pgFunction.Rows = d.Get(funcRowsAttr).(float64)
+	pgFunction.Support = d.Get(funcSupportAttr).(string)
+	pgFunction.Owner = d.Get(funcOwnerAttr).(string)
+	for _, t := range d.Get(funcTransformAttr).([]any) {
+		pgFunction.Transform = append(pgFunction.Transform, t.(string))
+	}
+	if parameters := d.Get(funcParametersAttr).(map[string]any); len(parameters) > 0 {
+		pgFunction.Parameters = parameters
+	}
+	for _, e := range d.Get(funcDependsOnExtensionsAttr).(*schema.Set).List() {
+		pgFunction.Extensions = append(pgFunction.Extensions, e.(string))
+	}
+	sort.Strings(pgFunction.Extensions)
 
 	if v, ok := d.GetOk(funcParallelAttr); ok {
 		pgFunction.Parallel = v.(string)
@@ -66,8 +101,10 @@ func (pgFunction *PGFunction) FromResourceData(d *schema.ResourceData) error {
 		pgFunction.Volatility = defaultFunctionVolatility
 	}
 
-	// For the main returns if not provided
+	// For the main returns if not provided: the OUT and INOUT arguments are the
+	// result of the function, which is a record when there are several of them.
 	argOutput := "void"
+	outputs := 0
 
 	if args, ok := d.GetOk(funcArgAttr); ok {
 		args := args.([]any)
@@ -92,12 +129,17 @@ func (pgFunction *PGFunction) FromResourceData(d *schema.ResourceData) error {
 			}
 
 			// For the main returns if not provided
-			if strings.ToUpper(pgArg.Mode) == "OUT" {
+			if mode := strings.ToUpper(pgArg.Mode); mode == "OUT" || mode == "INOUT" {
 				argOutput = pgArg.Type
+				outputs++
 			}
 
 			pgFunction.Args = append(pgFunction.Args, pgArg)
 		}
+	}
+
+	if outputs > 1 {
+		argOutput = "record"
 	}
 
 	if v, ok := d.GetOk(funcReturnsAttr); ok {
@@ -121,7 +163,7 @@ func (pgFunction *PGFunction) Parse(functionDefinition string) error {
 	args := []PGFunctionArg{}
 
 	if argsData != "" {
-		rawArgs := strings.Split(argsData, ",")
+		rawArgs := splitFunctionArgs(argsData)
 		for i := 0; i < len(rawArgs); i++ {
 			var arg PGFunctionArg
 			err := arg.Parse(rawArgs[i])
@@ -182,4 +224,60 @@ func normalizeFunctionBody(body string) string {
 		return newBody
 	}
 	return body
+}
+
+var functionArgModeRegexp = regexp.MustCompile(`(?si)^(IN|OUT|INOUT|VARIADIC)\s+(.*)$`)
+
+// functionArgDefinitions returns the definitions of the arguments (without their default values)
+// of the header of a function definition, as written by pg_get_functiondef.
+func functionArgDefinitions(functionDefinition string) []string {
+	args := findStringSubmatchMap(`(?si)CREATE\sOR\sREPLACE\sFUNCTION\s[^.]+\.[^(]+\((?P<Args>.*)\).*RETURNS\s`, functionDefinition)["Args"]
+	if args == "" {
+		return nil
+	}
+	definitions := splitFunctionArgs(args)
+	for i, definition := range definitions {
+		if m := findStringSubmatchMap(`(?si)(?P<ArgData>.*)\sDEFAULT\s.*`, definition); len(m) > 0 {
+			definitions[i] = m["ArgData"]
+		}
+	}
+	return definitions
+}
+
+// parseUnnamedArg parses the definition of an argument which has no name: a mode and a type,
+// which cannot be told from a name and a type (e.g.: "OUT integer").
+func parseUnnamedArg(definition, defaultValue string) PGFunctionArg {
+	arg := PGFunctionArg{Mode: "IN", Type: strings.TrimSpace(definition), Default: defaultValue}
+	if m := functionArgModeRegexp.FindStringSubmatch(arg.Type); m != nil {
+		arg.Mode = strings.ToUpper(m[1])
+		arg.Type = strings.TrimSpace(m[2])
+	}
+	return arg
+}
+
+// splitFunctionArgs splits a list of arguments on the commas which are not
+// in parentheses, brackets or quotes (e.g.: a numeric(10,2) DEFAULT f(1, 2)).
+func splitFunctionArgs(args string) []string {
+	var parts []string
+	depth := 0
+	var quote rune
+	start := 0
+	for i, r := range args {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			}
+		case r == '\'' || r == '"':
+			quote = r
+		case r == '(' || r == '[':
+			depth++
+		case r == ')' || r == ']':
+			depth--
+		case r == ',' && depth == 0:
+			parts = append(parts, strings.TrimSpace(args[start:i]))
+			start = i + 1
+		}
+	}
+	return append(parts, strings.TrimSpace(args[start:]))
 }
