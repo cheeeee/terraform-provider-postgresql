@@ -2979,3 +2979,210 @@ resource "postgresql_grant" "test" {
 		})
 	}
 }
+
+func TestGrantedByQueries(t *testing.T) {
+	d := schema.TestResourceDataRaw(t, resourcePostgreSQLGrant().Schema, map[string]any{
+		"object_type":       "table",
+		"schema":            "public",
+		"objects":           []any{"t"},
+		"role":              "r",
+		"granted_by":        "g",
+		"privileges":        []any{"SELECT"},
+		"with_grant_option": true,
+	})
+	if got, want := createGrantQuery(d, []string{"SELECT"}), `GRANT SELECT ON TABLE "public"."t" TO "r" WITH GRANT OPTION GRANTED BY "g"`; got != want {
+		t.Errorf("grant query is %s, expected %s", got, want)
+	}
+	if got, want := createRevokeQuery(d.Get), `REVOKE SELECT ON TABLE "public"."t" FROM "r" GRANTED BY "g"`; got != want {
+		t.Errorf("revoke query is %s, expected %s", got, want)
+	}
+}
+
+// testSkipUnlessGrantedBy skips the test before PostgreSQL 19, where GRANTED BY is only accepted for the current user.
+func testSkipUnlessGrantedBy(t *testing.T) {
+	db, err := testAccProvider.Meta().(*Client).Connect()
+	if err != nil {
+		t.Fatalf("could not connect to database: %v", err)
+	}
+	if !db.featureSupported(featureGrantedBy) {
+		t.Skipf("GRANTED BY is a clause of the object privileges since PostgreSQL 19, not of %s", db.version)
+	}
+}
+
+// testSetupGrantedBy creates test_gb_owner, test_gb_grantor and test_gb_grantee, and the table
+// test_gb_schema.t, owned by test_gb_owner. As the connected user is perhaps not a superuser, it joins the owner
+// for the time of the setup, as the provider does.
+func testSetupGrantedBy(t *testing.T) func() {
+	dsn := testPostgresDSN(t)
+	for _, role := range []string{"test_gb_owner", "test_gb_grantor", "test_gb_grantee"} {
+		dbExecute(t, dsn, "CREATE ROLE "+role+" NOLOGIN")
+	}
+	dbExecute(t, dsn, "CREATE SCHEMA test_gb_schema")
+	dbExecute(t, dsn, "GRANT USAGE, CREATE ON SCHEMA test_gb_schema TO test_gb_owner")
+	dbExecute(t, dsn, "GRANT test_gb_owner TO CURRENT_USER")
+	dbExecute(t, dsn, `
+SET ROLE test_gb_owner;
+CREATE TABLE test_gb_schema.t (a int);
+RESET ROLE;
+REVOKE test_gb_owner FROM CURRENT_USER;`)
+	return func() {
+		dbExecute(t, dsn, "GRANT test_gb_owner TO CURRENT_USER")
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_gb_schema CASCADE")
+		for _, role := range []string{"test_gb_grantee", "test_gb_grantor", "test_gb_owner"} {
+			dbExecute(t, dsn, "DROP ROLE IF EXISTS "+role)
+		}
+	}
+}
+
+// testGrantedByACL checks the ACL entries "grantor:PRIVILEGE" of test_gb_grantee on test_gb_schema.t.
+func testGrantedByACL(t *testing.T, want ...string) resource.TestCheckFunc {
+	return testCheckGrantors(t, `SELECT coalesce(array_agg(pg_get_userbyid(p.grantor) || ':' || p.privilege_type), '{}')
+FROM pg_class c, aclexplode(c.relacl) p
+WHERE c.oid = 'test_gb_schema.t'::regclass AND p.grantee = 'test_gb_grantee'::regrole`, want)
+}
+
+func testGrantedByConfig(grantedBy string, privileges string) string {
+	return fmt.Sprintf(`
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_gb_grantee"
+  schema      = "test_gb_schema"
+  object_type = "table"
+  objects     = ["t"]
+  privileges  = %s
+  granted_by  = "%s"
+}
+`, privileges, grantedBy)
+}
+
+// TestAccPostgresqlGrantGrantedByUnsupported checks the error of the versions where GRANTED BY is not a real clause.
+func TestAccPostgresqlGrantGrantedByUnsupported(t *testing.T) {
+	skipIfNotAcc(t)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			db, err := testAccProvider.Meta().(*Client).Connect()
+			if err != nil {
+				t.Fatalf("could not connect to database: %v", err)
+			}
+			if db.featureSupported(featureGrantedBy) {
+				t.Skipf("GRANTED BY is supported by PostgreSQL %s", db.version)
+			}
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config:      testGrantedByConfig("postgres", `["SELECT"]`),
+				ExpectError: regexp.MustCompile("granted_by is not supported for this Postgres version"),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantGrantedByOwner grants as the owner of the table, in both modes (a user who is not a
+// superuser joins the owner during the change), and removes the grant with REVOKE ... GRANTED BY.
+func TestAccPostgresqlGrantGrantedByOwner(t *testing.T) {
+	skipIfNotAcc(t)
+
+	revokeOutside := func() {
+		dsn := testPostgresDSN(t)
+		dbExecute(t, dsn, "GRANT test_gb_owner TO CURRENT_USER")
+		dbExecute(t, dsn, "REVOKE SELECT ON test_gb_schema.t FROM test_gb_grantee GRANTED BY test_gb_owner")
+		dbExecute(t, dsn, "REVOKE test_gb_owner FROM CURRENT_USER")
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testSkipUnlessGrantedBy(t)
+			t.Cleanup(testSetupGrantedBy(t))
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: testGrantedByConfig("test_gb_owner", `["SELECT"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:SELECT"),
+			},
+			{
+				Config: testGrantedByConfig("test_gb_owner", `["SELECT", "INSERT"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:SELECT", "test_gb_owner:INSERT"),
+			},
+			{
+				PreConfig:          revokeOutside,
+				Config:             testGrantedByConfig("test_gb_owner", `["SELECT", "INSERT"]`),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: testGrantedByConfig("test_gb_owner", `["SELECT", "INSERT"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:SELECT", "test_gb_owner:INSERT"),
+			},
+			{
+				Config:  testGrantedByConfig("test_gb_owner", `["SELECT", "INSERT"]`),
+				Destroy: true,
+				Check:   testGrantedByACL(t),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantGrantedByOtherRole uses a grantor which is not the owner: a role which holds the grant
+// option. Only the entries of this grantor are read, changed and removed; the privileges which the owner
+// granted to the same role are left alone.
+func TestAccPostgresqlGrantGrantedByOtherRole(t *testing.T) {
+	skipIfNotAcc(t)
+	skipIfNotSuperuser(t)
+
+	dsn := testPostgresDSN(t)
+	config := func(privileges string) string { return testGrantedByConfig("test_gb_grantor", privileges) }
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testSkipUnlessGrantedBy(t)
+			t.Cleanup(testSetupGrantedBy(t))
+			dbExecute(t, dsn, "GRANT SELECT, INSERT, UPDATE ON test_gb_schema.t TO test_gb_grantor WITH GRANT OPTION")
+			// granted by the owner, not by the grantor of the resource
+			dbExecute(t, dsn, "GRANT INSERT ON test_gb_schema.t TO test_gb_grantee")
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: config(`["SELECT"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:INSERT", "test_gb_grantor:SELECT"),
+			},
+			{
+				Config: config(`["SELECT", "UPDATE"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:INSERT", "test_gb_grantor:SELECT", "test_gb_grantor:UPDATE"),
+			},
+			{
+				// the owner grants the same privilege: it is not the one of the resource, the revoke is seen
+				PreConfig: func() {
+					dbExecute(t, dsn, "GRANT SELECT ON test_gb_schema.t TO test_gb_grantee")
+					dbExecute(t, dsn, "REVOKE SELECT ON test_gb_schema.t FROM test_gb_grantee GRANTED BY test_gb_grantor")
+				},
+				Config:             config(`["SELECT", "UPDATE"]`),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config(`["SELECT", "UPDATE"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:INSERT", "test_gb_owner:SELECT", "test_gb_grantor:SELECT", "test_gb_grantor:UPDATE"),
+			},
+			{
+				// what the owner grants is not managed: no change
+				PreConfig: func() {
+					dbExecute(t, dsn, "GRANT UPDATE ON test_gb_schema.t TO test_gb_grantee GRANTED BY test_gb_owner")
+				},
+				Config:   config(`["SELECT", "UPDATE"]`),
+				PlanOnly: true,
+			},
+			{
+				Config:  config(`["SELECT", "UPDATE"]`),
+				Destroy: true,
+				Check:   testGrantedByACL(t, "test_gb_owner:INSERT", "test_gb_owner:SELECT", "test_gb_owner:UPDATE"),
+			},
+		},
+	})
+}

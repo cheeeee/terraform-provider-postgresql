@@ -115,6 +115,12 @@ func resourcePostgreSQLGrant() *schema.Resource {
 				Set:         schema.HashString,
 				Description: "The list of privileges to grant",
 			},
+			"granted_by": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				ForceNew:    true,
+				Description: "The role recorded as the grantor of the privileges (PostgreSQL 19 or above); only the privileges granted by this role are managed",
+			},
 			"with_grant_option": {
 				Type:        schema.TypeBool,
 				Optional:    true,
@@ -304,7 +310,7 @@ SELECT array_agg(privilege_type)
 FROM (
 	SELECT (aclexplode(datacl)).* FROM pg_database WHERE datname=$1
 ) as privileges
-WHERE grantee = $2
+WHERE grantee = $2` + grantorClause(d, "") + `
 `
 
 	var privileges pq.ByteaArray
@@ -325,7 +331,7 @@ SELECT array_agg(privilege_type)
 FROM (
 	SELECT (aclexplode(nspacl)).* FROM pg_namespace WHERE nspname=$1
 ) as privileges
-WHERE grantee = $2
+WHERE grantee = $2` + grantorClause(d, "") + `
 `
 
 	var privileges pq.ByteaArray
@@ -348,7 +354,7 @@ SELECT pg_catalog.array_agg(privilege_type)
 FROM (
 	SELECT (pg_catalog.aclexplode(fdwacl)).* FROM pg_catalog.pg_foreign_data_wrapper WHERE fdwname=$1
 ) as privileges
-WHERE grantee = $2
+WHERE grantee = $2` + grantorClause(d, "") + `
 `
 
 	var privileges pq.ByteaArray
@@ -371,7 +377,7 @@ SELECT pg_catalog.array_agg(privilege_type)
 FROM (
 	SELECT (pg_catalog.aclexplode(srvacl)).* FROM pg_catalog.pg_foreign_server WHERE srvname=$1
 ) as privileges
-WHERE grantee = $2
+WHERE grantee = $2` + grantorClause(d, "") + `
 `
 
 	var privileges pq.ByteaArray
@@ -406,7 +412,7 @@ FROM (SELECT relname, attname, (aclexplode(attacl)).*
         AND relkind = $4)
          AS col_privs
          LEFT JOIN pg_roles ON pg_roles.oid = col_privs.grantee
-WHERE COALESCE(rolname, 'public') = $1
+WHERE COALESCE(rolname, 'public') = $1` + grantorClause(d, "col_privs.") + `
 GROUP BY col_privs.relname, col_privs.attname
 ORDER BY col_privs.attname
 ;`
@@ -503,7 +509,7 @@ LEFT JOIN (
     from (
              SELECT proname, pronamespace, (aclexplode(proacl)).* FROM pg_proc
          ) acls
-    WHERE grantee = $1
+    WHERE grantee = $1` + grantorClause(d, "") + `
 ) privs
 USING (proname, pronamespace)
       WHERE nspname = $2
@@ -522,7 +528,7 @@ SELECT pg_type.typname, array_remove(array_agg(privs.privilege_type), NULL)
 FROM pg_type
 JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
 LEFT JOIN (SELECT oid, (aclexplode(typacl)).* FROM pg_type) privs
-	ON privs.oid = pg_type.oid AND privs.grantee = $1
+	ON privs.oid = pg_type.oid AND privs.grantee = $1` + grantorClause(d, "privs.") + `
 WHERE pg_namespace.nspname = $2 AND pg_type.typname = ANY($3)
 GROUP BY pg_type.oid, pg_type.typname
 `
@@ -533,7 +539,7 @@ GROUP BY pg_type.oid, pg_type.typname
 SELECT pg_language.lanname, array_remove(array_agg(privs.privilege_type), NULL)
 FROM pg_language
 LEFT JOIN (SELECT lanname, (aclexplode(lanacl)).* FROM pg_language) privs
-	ON privs.lanname = pg_language.lanname AND privs.grantee = $1
+	ON privs.lanname = pg_language.lanname AND privs.grantee = $1` + grantorClause(d, "privs.") + `
 WHERE pg_language.lanname = ANY($2)
 GROUP BY pg_language.oid, pg_language.lanname
 `
@@ -544,7 +550,7 @@ GROUP BY pg_language.oid, pg_language.lanname
 SELECT pg_tablespace.spcname, array_remove(array_agg(privs.privilege_type), NULL)
 FROM pg_tablespace
 LEFT JOIN (SELECT spcname, (aclexplode(spcacl)).* FROM pg_tablespace) privs
-	ON privs.spcname = pg_tablespace.spcname AND privs.grantee = $1
+	ON privs.spcname = pg_tablespace.spcname AND privs.grantee = $1` + grantorClause(d, "privs.") + `
 WHERE pg_tablespace.spcname = ANY($2)
 GROUP BY pg_tablespace.oid, pg_tablespace.spcname
 `
@@ -555,7 +561,7 @@ GROUP BY pg_tablespace.oid, pg_tablespace.spcname
 SELECT pg_largeobject_metadata.oid::text, array_remove(array_agg(privs.privilege_type), NULL)
 FROM pg_largeobject_metadata
 LEFT JOIN (SELECT oid, (aclexplode(lomacl)).* FROM pg_largeobject_metadata) privs
-	ON privs.oid = pg_largeobject_metadata.oid AND privs.grantee = $1
+	ON privs.oid = pg_largeobject_metadata.oid AND privs.grantee = $1` + grantorClause(d, "privs.") + `
 WHERE pg_largeobject_metadata.oid::text = ANY($2)
 GROUP BY pg_largeobject_metadata.oid
 `
@@ -567,7 +573,7 @@ GROUP BY pg_largeobject_metadata.oid
 SELECT params.name, array_remove(array_agg(privs.privilege_type), NULL)
 FROM unnest($2::text[]) AS params(name)
 LEFT JOIN (SELECT parname, (aclexplode(paracl)).* FROM pg_parameter_acl) privs
-	ON privs.parname = params.name AND privs.grantee = $1
+	ON privs.parname = params.name AND privs.grantee = $1` + grantorClause(d, "privs.") + `
 GROUP BY params.name
 `
 		rows, err = txn.Query(query, roleOID, pq.StringArray(setToStrings(objects)))
@@ -581,7 +587,7 @@ LEFT JOIN (
     SELECT acls.* FROM (
         SELECT relname, relnamespace, relkind, (aclexplode(relacl)).* FROM pg_class c
     ) as acls
-    WHERE grantee=$1
+    WHERE grantee=$1` + grantorClause(d, "") + `
 ) privs
 USING (relname, relnamespace, relkind)
 WHERE nspname = $2 AND relkind = $3
@@ -629,6 +635,16 @@ GROUP BY pg_class.relname
 	return nil
 }
 
+// grantorClause restricts the ACL entries of a query to the ones of the grantor `granted_by`, when it is set:
+// the entries recorded for another grantor are not managed by the resource. prefix is the alias of the exploded ACL.
+func grantorClause(d *schema.ResourceData, prefix string) string {
+	grantedBy := d.Get("granted_by").(string)
+	if grantedBy == "" {
+		return ""
+	}
+	return fmt.Sprintf(" AND %sgrantor = (SELECT oid FROM pg_roles WHERE rolname = %s)", prefix, pq.QuoteLiteral(grantedBy))
+}
+
 // readFunctionSignaturesPrivileges compares the privileges of the objects of `objects` which are given with
 // their argument types, e.g. f(integer), with the ones of the state. The catalog only knows the bare name of a
 // function, which cannot tell two overloads apart, so each signature is resolved to the OID of exactly one
@@ -638,7 +654,7 @@ func readFunctionSignaturesPrivileges(txn *sql.Tx, db *DBConnection, d *schema.R
 	query := `
 SELECT array_remove(array_agg(privilege_type), NULL)
 FROM (SELECT (aclexplode(proacl)).* FROM pg_proc WHERE oid = $1::oid) AS privileges
-WHERE grantee = $2
+WHERE grantee = $2` + grantorClause(d, "") + `
 `
 	for _, object := range d.Get("objects").(*schema.Set).List() {
 		signature := object.(string)
@@ -894,6 +910,9 @@ func createGrantQuery(d *schema.ResourceData, privileges []string) string {
 	if d.Get("with_grant_option").(bool) {
 		query = query + " WITH GRANT OPTION"
 	}
+	if grantedBy := d.Get("granted_by").(string); grantedBy != "" {
+		query = query + " GRANTED BY " + pq.QuoteIdentifier(grantedBy)
+	}
 
 	return query
 }
@@ -991,6 +1010,10 @@ func createRevokeQuery(getter ResourceSchemeGetter) string {
 				pq.QuoteIdentifier(getter("role").(string)),
 			)
 		}
+	}
+
+	if grantedBy := getter("granted_by").(string); grantedBy != "" && query != "SELECT NULL" {
+		query = query + " GRANTED BY " + pq.QuoteIdentifier(grantedBy)
 	}
 
 	return query
@@ -1310,6 +1333,12 @@ func validateFeatureSupport(db *DBConnection, d *schema.ResourceData) error {
 	if d.Get("object_type") == "routine" && !db.featureSupported(featureRoutine) {
 		return fmt.Errorf(
 			"object type ROUTINE is not supported for this Postgres version (%s)",
+			db.version,
+		)
+	}
+	if d.Get("granted_by").(string) != "" && !db.featureSupported(featureGrantedBy) {
+		return fmt.Errorf(
+			"granted_by is not supported for this Postgres version (%s): GRANTED BY needs PostgreSQL 19 or above",
 			db.version,
 		)
 	}

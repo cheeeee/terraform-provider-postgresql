@@ -78,6 +78,7 @@ const (
 	featureSubscriptionRetainDeadTuples
 	featureRoleMembershipOptions
 	featureParameterPrivilege
+	featureGrantedBy
 )
 
 var (
@@ -212,6 +213,8 @@ var (
 		featureSubscriptionRetainDeadTuples: semver.MustParseRange(">=19.0.0"),
 		// GRANT ... ON PARAMETER (PG 15+)
 		featureParameterPrivilege: semver.MustParseRange(">=15.0.0"),
+		// GRANT / REVOKE ... GRANTED BY on the objects (PG 19+: older versions only accept the current user)
+		featureGrantedBy: semver.MustParseRange(">=19.0.0"),
 	}
 )
 
