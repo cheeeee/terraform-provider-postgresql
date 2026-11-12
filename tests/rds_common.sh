@@ -15,3 +15,6 @@ RDS_STATE=${RDS_STATE:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/${RDS_NAME}.env}
 export RDS_USER=tfadmin
 # Secret of AWS Secrets Manager created by the end-to-end test.
 RDS_SECRET=${RDS_NAME}-reporting
+# IAM role and IAM user created by the test of the IAM authentication of the provider.
+RDS_IAM_ROLE=${RDS_NAME}-connect
+RDS_IAM_USER=${RDS_NAME}-assumer

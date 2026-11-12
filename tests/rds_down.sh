@@ -29,6 +29,21 @@ if aws secretsmanager describe-secret --secret-id "$RDS_SECRET" > /dev/null 2>&1
     aws secretsmanager delete-secret --secret-id "$RDS_SECRET" --force-delete-without-recovery > /dev/null
 fi
 
+if aws iam get-user --user-name "$RDS_IAM_USER" > /dev/null 2>&1; then
+    echo "Deleting IAM user $RDS_IAM_USER"
+    for key in $(aws iam list-access-keys --user-name "$RDS_IAM_USER" --query 'AccessKeyMetadata[].AccessKeyId' --output text); do
+        aws iam delete-access-key --user-name "$RDS_IAM_USER" --access-key-id "$key"
+    done
+    aws iam delete-user-policy --user-name "$RDS_IAM_USER" --policy-name assume > /dev/null 2>&1
+    aws iam delete-user --user-name "$RDS_IAM_USER"
+fi
+
+if aws iam get-role --role-name "$RDS_IAM_ROLE" > /dev/null 2>&1; then
+    echo "Deleting IAM role $RDS_IAM_ROLE"
+    aws iam delete-role-policy --role-name "$RDS_IAM_ROLE" --policy-name connect > /dev/null 2>&1
+    aws iam delete-role --role-name "$RDS_IAM_ROLE"
+fi
+
 rm -f "$RDS_STATE"
 
 # Make sure nothing is left
@@ -47,6 +62,14 @@ if [ -n "$("${sg_query[@]}")" ]; then
 fi
 if aws secretsmanager describe-secret --secret-id "$RDS_SECRET" --query 'DeletedDate' --output text 2> /dev/null | grep -q None; then
     echo "Secret $RDS_SECRET still exists" >&2
+    left=1
+fi
+if aws iam get-user --user-name "$RDS_IAM_USER" > /dev/null 2>&1; then
+    echo "IAM user $RDS_IAM_USER still exists" >&2
+    left=1
+fi
+if aws iam get-role --role-name "$RDS_IAM_ROLE" > /dev/null 2>&1; then
+    echo "IAM role $RDS_IAM_ROLE still exists" >&2
     left=1
 fi
 [ "$left" -eq 0 ] && echo "Nothing is left of $RDS_NAME"

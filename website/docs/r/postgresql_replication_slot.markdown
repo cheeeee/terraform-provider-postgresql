@@ -30,3 +30,19 @@ resource "postgresql_replication_slot" "my_slot" {
 * `failover` - (Optional) Enables the replication slot to be synchronized to standbys, for failover. Requires PostgreSQL 17 or newer. Changing it replaces the slot.
 
 ~> **Note:** `two_phase` and `failover` can only be set when the slot is created: a change replaces the slot, which drops it.
+
+~> **Note:** A subscription changes the slot it uses: `postgresql_subscription` with `two_phase = true` and
+`create_slot = false` enables two-phase decoding on its slot once its tables are synchronized. The next plan then reports
+the new value of the slot as a change made outside of Terraform and proposes to replace the slot, which would break the
+replication. Give the slot the same value as the subscription, or let the subscription decide:
+
+```hcl
+resource "postgresql_replication_slot" "sub" {
+  name   = "sub"
+  plugin = "pgoutput"
+
+  lifecycle {
+    ignore_changes = [two_phase]
+  }
+}
+```
