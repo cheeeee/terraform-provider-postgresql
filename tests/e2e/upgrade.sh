@@ -67,6 +67,11 @@ tf() {
     "$TERRAFORM" -chdir="$WORK/tf" "$@"
 }
 
+# count_managed: how many roles, databases and replication slots of the configuration exist
+count_managed() {
+    sql postgres "SELECT (SELECT count(*) FROM pg_roles WHERE rolname LIKE 'upg\\_%' AND rolname <> 'upg_member') + (SELECT count(*) FROM pg_database WHERE datname IN ('upg_db', 'upg_audited')) + (SELECT count(*) FROM pg_replication_slots WHERE slot_name IN ('upg_logical', 'upg_physical'))"
+}
+
 # use_provider <source> [<version constraint>]: the provider required by the configuration
 use_provider() {
     local version=""
@@ -109,6 +114,8 @@ provider_installation {
 }
 RC
 
+skipped=0
+checked=0
 for from in $UPGRADE_FROM; do
     source=$REGISTRY/${from%%=*}
     constraint=${from#*=}
@@ -133,7 +140,18 @@ for from in $UPGRADE_FROM; do
     use_provider "$source" "$constraint"
     tf init -input=false -no-color > "$WORK/init.txt" 2>&1 || { cat "$WORK/init.txt"; exit 1; }
     echo "## $(grep -E "Installed .*postgresql" "$WORK/init.txt" | sed 's/^- //')"
-    tf apply -input=false -no-color -auto-approve > "$WORK/apply.txt" 2>&1 || { cat "$WORK/apply.txt"; exit 1; }
+    if ! tf apply -input=false -no-color -auto-approve > "$WORK/apply.txt" 2>&1; then
+        # A released provider which does not know the version of the server (a release
+        # candidate: "19rc1") cannot connect at all: there is nothing to upgrade from.
+        if grep -q "error parsing version" "$WORK/apply.txt" && [ "$(count_managed)" = 0 ]; then
+            echo "skipped: the released provider cannot read the version of this server ($(sql postgres "SHOW server_version"))"
+            skipped=$((skipped + 1))
+            rm -rf "$WORK/tf"
+            continue
+        fi
+        cat "$WORK/apply.txt"
+        exit 1
+    fi
     grep -E "^Apply complete" "$WORK/apply.txt"
     expect_no_change "the plan of the released provider is empty"
 
@@ -150,13 +168,22 @@ for from in $UPGRADE_FROM; do
 
     tf destroy -input=false -no-color -auto-approve > "$WORK/destroy.txt" 2>&1 || { cat "$WORK/destroy.txt"; exit 1; }
     grep -E "^Destroy complete" "$WORK/destroy.txt"
-    left=$(sql postgres "SELECT (SELECT count(*) FROM pg_roles WHERE rolname LIKE 'upg\\_%' AND rolname <> 'upg_member') + (SELECT count(*) FROM pg_database WHERE datname IN ('upg_db', 'upg_audited')) + (SELECT count(*) FROM pg_replication_slots WHERE slot_name IN ('upg_logical', 'upg_physical'))")
+    left=$(count_managed)
     if [ "$left" != 0 ]; then
         echo "FAIL: $left objects are left after the destroy of the new provider"
         exit 1
     fi
     echo "ok: the new provider destroys what the released provider created"
+    checked=$((checked + 1))
 done
 
 echo
-echo "All the upgrade checks passed"
+if [ "$checked" = 0 ]; then
+    echo "FAIL: no released provider could be checked"
+    exit 1
+fi
+if [ "$skipped" != 0 ]; then
+    echo "All the upgrade checks passed ($skipped released provider skipped)"
+else
+    echo "All the upgrade checks passed"
+fi
