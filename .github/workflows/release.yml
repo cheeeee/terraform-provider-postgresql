@@ -14,6 +14,10 @@ on:
   push:
     tags:
       - 'v*'
+# The release is created with the token of the workflow, which is read-only by default.
+permissions:
+  contents: write
+
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
