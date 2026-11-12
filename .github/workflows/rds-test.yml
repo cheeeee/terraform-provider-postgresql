@@ -1,0 +1,125 @@
+# Run the acceptance tests against a real (and temporary) AWS RDS instance.
+#
+# It only runs on demand:
+#   gh workflow run rds-test.yml -f pgversion=17
+#
+# On GitHub, the AWS credentials come from the role defined in the AWS_ROLE_ARN
+# variable of the "rds-test" environment (OpenID Connect, no stored key). Protect
+# this environment with a required reviewer to control who can create instances.
+#
+# It can also be run locally with act, with the AWS credentials of the host:
+#   - access keys in a file (AWS_ACCESS_KEY_ID=... / AWS_SECRET_ACCESS_KEY=...):
+#       act workflow_dispatch -W .github/workflows/rds-test.yml --input pgversion=17 --env-file aws.env
+#   - or the AWS configuration of the host, e.g. for the short-lived credentials
+#     of "aws login" / "aws sso login" which have to be refreshed during the run:
+#       act workflow_dispatch -W .github/workflows/rds-test.yml --input pgversion=17 \
+#         --container-options "-v $HOME/.aws:/root/.aws"
+name: rds-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      pgversion:
+        description: PostgreSQL major version
+        required: true
+        default: '17'
+      tests:
+        description: Tests to run (go test -run pattern)
+        required: true
+        default: Parameter
+      cli:
+        description: CLI used by the tests
+        required: true
+        default: terraform
+        type: choice
+        options:
+          - terraform
+          - opentofu
+
+permissions:
+  id-token: write
+  contents: read
+
+# The instances are named after the PostgreSQL version.
+concurrency: rds-test-${{ inputs.pgversion }}-${{ inputs.cli }}
+
+jobs:
+  rds:
+    runs-on: ubuntu-latest
+    environment: rds-test
+    timeout-minutes: 60
+
+    env:
+      AWS_REGION: ca-central-1
+      PGVERSION: ${{ inputs.pgversion }}
+      RDS_SUFFIX: ${{ inputs.cli }}
+      RDS_TESTS: ${{ inputs.tests }}
+
+    steps:
+      - name: Only the owner of the repository can run this workflow
+        if: ${{ !env.ACT && github.actor != github.repository_owner }}
+        run: exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+
+      - name: Set up Terraform
+        if: inputs.cli != 'opentofu'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.15.4'
+          terraform_wrapper: false
+
+      - name: Set up OpenTofu
+        if: inputs.cli == 'opentofu'
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_wrapper: false
+
+      - name: Use OpenTofu in the tests
+        if: inputs.cli == 'opentofu'
+        run: |
+          {
+            echo "TF_ACC_TERRAFORM_PATH=$(command -v tofu)"
+            echo "TF_ACC_PROVIDER_HOST=registry.opentofu.org"
+            echo "E2E_TERRAFORM=tofu"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        if: ${{ !env.ACT }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The AWS CLI and psql are not in the default act image.
+      - name: Install the AWS CLI and psql (act)
+        if: ${{ env.ACT }}
+        run: |
+          if ! command -v aws > /dev/null; then
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscli.zip
+            unzip -q /tmp/awscli.zip -d /tmp
+            sudo /tmp/aws/install
+          fi
+          if ! command -v psql > /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-client
+          fi
+
+      - name: Create the RDS instance
+        run: ./tests/rds_up.sh
+
+      - name: Run the tests
+        run: ./tests/rds_test.sh
+
+      - name: Run the Terraform end-to-end test
+        run: ./tests/rds_e2e.sh
+
+      - name: Delete the RDS instance
+        if: always()
+        run: ./tests/rds_down.sh
