@@ -54,6 +54,7 @@ resource "postgresql_grant" "read_insert_column" {
   * `language` and `tablespace`: the names of the languages or tablespaces.
   * `large_object`: the OIDs of the large objects, as strings (e.g.: `["16384"]`).
   * `parameter`: the names of the configuration parameters (e.g.: `["work_mem"]`).
+  The objects of the types `function`, `procedure` and `routine` are given by their name, which applies to all the overloads of that name, or by their name and argument types, written as in the PostgreSQL statement and without the schema (e.g.: `["f(integer)", "g(varchar(10), numeric(10,2))"]`). The argument list may contain argument names and modes (`IN a text`), array types (`integer[]`), schema-qualified types and, between double quotes, types whose name needs quoting. Type modifiers (`varchar(10)`) are accepted but ignored by PostgreSQL to identify a function: `f(varchar(10))` and `f(varchar)` are the same function. The signature is compared with the functions of the database, not as a string, so that two overloads of the same name are told apart.
 * `columns` - (Optional) The columns upon which to grant the privileges. Required when `object_type` is `column`. You cannot specify this option if the `object_type` is not `column`.
 * `with_grant_option` - (Optional) Whether the recipient of these privileges can grant the same privileges to others. Defaults to false. It cannot be set when `role` is "public": PostgreSQL does not allow to grant options to PUBLIC.
 

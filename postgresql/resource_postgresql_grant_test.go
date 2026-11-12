@@ -2549,3 +2549,113 @@ resource "postgresql_grant" "test" {
 		},
 	})
 }
+
+func TestQuoteIdentifyIdent(t *testing.T) {
+	for in, want := range map[string]string{
+		"table1":                           `"table1"`,
+		`we"ird`:                           `"we""ird"`,
+		"f(text, char)":                    `"f"(text, char)`,
+		"f(varchar(10), numeric(10,2))":    `"f"(varchar(10), numeric(10,2))`,
+		"f(integer[], public.\"My Type\")": `"f"(integer[], public."My Type")`,
+		"f()":                              `"f"()`,
+	} {
+		if got := quoteIdentifyIdent(in); got != want {
+			t.Errorf("quoteIdentifyIdent(%q) = %s, want %s", in, got, want)
+		}
+	}
+}
+
+// testFunctionPrivilege checks, in the catalog, whether role can execute the function with this exact signature.
+func testFunctionPrivilege(t *testing.T, role, signature string, want bool) error {
+	var got bool
+	db, err := sql.Open("postgres", testPostgresDSN(t))
+	if err != nil {
+		return err
+	}
+	defer closeDB(t, db)
+	if err := db.QueryRow("SELECT has_function_privilege($1, $2::regprocedure, 'EXECUTE')", role, signature).Scan(&got); err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("role %s can execute %s: %v, expected %v", role, signature, got, want)
+	}
+	return nil
+}
+
+// TestAccPostgresqlGrantFunctionSignatures grants EXECUTE on functions given with every kind of argument
+// list: type modifiers (with commas), argument names and modes, a schema-qualified type, an array type, a type
+// whose name needs quoting, and one overload among two with the same name.
+func TestAccPostgresqlGrantFunctionSignatures(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dsn := testPostgresDSN(t)
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_sig_role LOGIN PASSWORD '%s'", testRolePassword))
+	dbExecute(t, dsn, "CREATE SCHEMA test_sig_schema")
+	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_sig_schema TO test_sig_role")
+	dbExecute(t, dsn, `CREATE TYPE test_sig_schema.mytype AS ENUM ('a')`)
+	dbExecute(t, dsn, `CREATE TYPE test_sig_schema."My Type" AS ENUM ('a')`)
+	for _, f := range []string{
+		"f_typmod(a varchar(10), b numeric(10,2))",
+		"f_named(IN a text, b double precision)",
+		"f_qualified(a test_sig_schema.mytype)",
+		"f_array(a integer[])",
+		`f_quoted(a test_sig_schema."My Type")`,
+		"f_over(a integer)",
+		"f_over(a text)",
+	} {
+		dbExecute(t, dsn, fmt.Sprintf("CREATE FUNCTION test_sig_schema.%s RETURNS int AS $$ select 1 $$ LANGUAGE SQL", f))
+	}
+	dbExecute(t, dsn, "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA test_sig_schema FROM PUBLIC")
+	defer func() {
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_sig_schema CASCADE")
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_sig_role")
+	}()
+
+	// the canonical signature of each function of the configuration, and whether it is granted
+	expected := map[string]bool{
+		"test_sig_schema.f_typmod(character varying,numeric)": true,
+		"test_sig_schema.f_named(text,double precision)":      true,
+		"test_sig_schema.f_qualified(test_sig_schema.mytype)": true,
+		"test_sig_schema.f_array(integer[])":                  true,
+		`test_sig_schema.f_quoted(test_sig_schema."My Type")`: true,
+		"test_sig_schema.f_over(integer)":                     true,
+		"test_sig_schema.f_over(text)":                        false,
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_sig_role"
+  schema      = "test_sig_schema"
+  object_type = "function"
+  privileges  = ["EXECUTE"]
+  objects = [
+    "f_typmod(varchar(10), numeric(10,2))",
+    "f_named(IN a text, b double precision)",
+    "f_qualified(test_sig_schema.mytype)",
+    "f_array(integer[])",
+    "f_quoted(test_sig_schema.\"My Type\")",
+    "f_over(integer)",
+  ]
+}
+`,
+				Check: func(*terraform.State) error {
+					for sig, want := range expected {
+						if err := testFunctionPrivilege(t, "test_sig_role", sig, want); err != nil {
+							return err
+						}
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
