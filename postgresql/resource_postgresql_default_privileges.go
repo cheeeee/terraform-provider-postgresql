@@ -183,7 +183,7 @@ func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.Resou
 	// Needed in order to set the owner of the db if the connection user is not a superuser
 	if err := withRolesGranted(txn, []string{owner}, func() error {
 
-		if err = checkDefaultPrivilegesRevokeHasEffect(txn, d); err != nil {
+		if err = warnDefaultPrivilegesRevokeNoEffect(txn, d); err != nil {
 			return err
 		}
 
@@ -343,12 +343,14 @@ func readDefaultPrivilegesACL(txn *sql.Tx, objectType, pgSchema string, ownerOID
 	return privileges, grantOption, nil
 }
 
-// checkDefaultPrivilegesRevokeHasEffect refuses a schema-scoped resource with no privileges
-// when the role has default privileges only globally or by built-in default: the REVOKE
-// IN SCHEMA would be a silent no-op in PostgreSQL, which says in ALTER DEFAULT PRIVILEGES:
+// warnDefaultPrivilegesRevokeNoEffect logs a warning for a schema-scoped resource with no
+// privileges when the role has default privileges globally or by built-in default: the
+// resource is right (nothing is granted in the schema) but the role keeps these privileges,
+// because the REVOKE IN SCHEMA has no effect on them. PostgreSQL says in ALTER DEFAULT PRIVILEGES:
 // "This means you cannot revoke privileges per-schema if they are granted globally (either by
 // default or according to an ALTER DEFAULT PRIVILEGES command that does not specify a schema)."
-func checkDefaultPrivilegesRevokeHasEffect(txn *sql.Tx, d *schema.ResourceData) error {
+// It is not an error: the configuration is valid and was accepted by the previous versions.
+func warnDefaultPrivilegesRevokeNoEffect(txn *sql.Tx, d *schema.ResourceData) error {
 	pgSchema := d.Get("schema").(string)
 	if pgSchema == "" || d.Get("privileges").(*schema.Set).Len() != 0 {
 		return nil
@@ -379,13 +381,13 @@ func checkDefaultPrivilegesRevokeHasEffect(txn *sql.Tx, d *schema.ResourceData) 
 		return nil
 	}
 
-	return fmt.Errorf(
-		"role %q has default privileges on %s created by %q which are not granted in schema %q "+
-			"(they are granted globally or by the built-in default): a revoke IN SCHEMA has no effect on them, "+
-			"because PostgreSQL adds the privileges of a schema to the global ones and \"cannot revoke privileges per-schema "+
-			"if they are granted globally\". Use a postgresql_default_privileges resource without `schema` to change them",
+	log.Printf(
+		"[WARN] role %q keeps its default privileges on %s created by %q in schema %q: they are granted globally "+
+			"or by the built-in default, which a revoke IN SCHEMA cannot remove. "+
+			"Use a postgresql_default_privileges resource without `schema` to change them",
 		d.Get("role").(string), defaultPrivilegesObjectClasses[objectType].class, d.Get("owner").(string), pgSchema,
 	)
+	return nil
 }
 
 func grantRoleDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {

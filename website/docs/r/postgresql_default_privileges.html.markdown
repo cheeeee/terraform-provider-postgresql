@@ -67,7 +67,7 @@ resource "postgresql_default_privileges" "public_insert" {
 
 Each resource reads back only its own entry of the catalog `pg_default_acl`. A resource with a `schema` which has no entry has no privileges. The built-in default privileges (such as EXECUTE on functions for PUBLIC) belong to the global scope only.
 
-~> **Note:** A revoke per schema cannot remove a privilege which is granted globally or by the built-in default. PostgreSQL says: "This means you cannot revoke privileges per-schema if they are granted globally (either by default or according to an ALTER DEFAULT PRIVILEGES command that does not specify a schema). Per-schema REVOKE is only useful to reverse the effects of a previous per-schema GRANT." A resource with a `schema` and `privileges = []` for a role which has such privileges would therefore do nothing, so the provider returns an error: use a resource without `schema` instead, as in the last example below.
+~> **Note:** A revoke per schema cannot remove a privilege which is granted globally or by the built-in default. PostgreSQL says: "This means you cannot revoke privileges per-schema if they are granted globally (either by default or according to an ALTER DEFAULT PRIVILEGES command that does not specify a schema). Per-schema REVOKE is only useful to reverse the effects of a previous per-schema GRANT." A resource with a `schema` and `privileges = []` for a role which has such privileges is applied without error, but the role keeps them: use a resource without `schema` to remove them, as in the last example below.
 
 ## Examples
 

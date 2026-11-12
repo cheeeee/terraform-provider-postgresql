@@ -1172,7 +1172,8 @@ func TestAccPostgresqlDefaultPrivilegesSchemaNoBuiltInDefault(t *testing.T) {
 }
 
 // IN SCHEMA ... REVOKE of a privilege which only exists globally or by built-in default is a
-// silent no-op in PostgreSQL: the provider refuses it and points to a global resource.
+// silent no-op in PostgreSQL: the resource of the schema is valid (nothing is granted in the
+// schema) and the role keeps the privileges it has globally.
 func TestAccPostgresqlDefaultPrivilegesSchemaRevokeNoEffect(t *testing.T) {
 	skipIfNotAcc(t)
 
@@ -1186,7 +1187,16 @@ func TestAccPostgresqlDefaultPrivilegesSchemaRevokeNoEffect(t *testing.T) {
 	defer testResetDefaultPrivileges(t, dbName, tableClass, config.Username, roleName)
 	defer testResetDefaultPrivileges(t, dbName, functionClass, config.Username, roleName)
 
-	expected := regexp.MustCompile("(?s)without.*schema")
+	// The resource of the schema is applied and its plan is empty afterwards (checked by
+	// every step); nothing is stored for the schema and the global privileges are untouched.
+	check := func(class defaultPrivilegesObjectClass, role string, global []string) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			if err := testCheckDefaultPrivilegesACL(t, dbName, class, config.Username, role, "test_schema", []string{}, false); err != nil {
+				return err
+			}
+			return testCheckDefaultPrivilegesACL(t, dbName, class, config.Username, role, "", global, false)
+		}
+	}
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -1196,24 +1206,25 @@ func TestAccPostgresqlDefaultPrivilegesSchemaRevokeNoEffect(t *testing.T) {
 		Providers: testAccProviders,
 		Steps: []resource.TestStep{
 			{
-				// EXECUTE of PUBLIC on functions is the built-in default
-				Config:      testDefaultPrivilegesResource("test", dbName, config.Username, "public", "test_schema", "function", "[]"),
-				ExpectError: expected,
+				// EXECUTE of PUBLIC on functions is the built-in default: PUBLIC keeps it
+				Config: testDefaultPrivilegesResource("test", dbName, config.Username, "public", "test_schema", "function", "[]"),
+				Check:  check(functionClass, "public", []string{"EXECUTE"}),
 			},
 			{
-				// SELECT granted globally
+				// SELECT granted globally: the role keeps it
 				PreConfig: func() {
 					dbExecute(t, config.connStr(dbName), fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s GRANT SELECT ON TABLES TO %s", config.Username, roleName))
 				},
-				Config:      testDefaultPrivilegesResource("test", dbName, config.Username, roleName, "test_schema", "table", "[]"),
-				ExpectError: expected,
+				Config: testDefaultPrivilegesResource("test", dbName, config.Username, roleName, "test_schema", "table", "[]"),
+				Check:  check(tableClass, roleName, []string{"SELECT"}),
 			},
 			{
-				// Nothing is granted to the role globally: an empty list is a harmless no-op
+				// Nothing is granted to the role globally
 				PreConfig: func() {
 					dbExecute(t, config.connStr(dbName), fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s REVOKE ALL ON TABLES FROM %s", config.Username, roleName))
 				},
 				Config: testDefaultPrivilegesResource("test", dbName, config.Username, roleName, "test_schema", "table", "[]"),
+				Check:  check(tableClass, roleName, []string{}),
 			},
 		},
 	})
