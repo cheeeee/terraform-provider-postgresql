@@ -11,8 +11,12 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         pgversion: [18, 17, 16, 15, 14, 13, 12]
+        # Everything which goes through the CLI (acceptance and end-to-end tests)
+        # is run the same way with Terraform and with OpenTofu.
+        cli: [terraform, opentofu]
 
     env:
       PGVERSION: ${{ matrix.pgversion }}
@@ -27,10 +31,27 @@ jobs:
           go-version: '1.26'
 
       - name: Set up Terraform
+        if: matrix.cli == 'terraform'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: '1.15.4'
           terraform_wrapper: false
+
+      - name: Set up OpenTofu
+        if: matrix.cli == 'opentofu'
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_wrapper: false
+
+      # The acceptance tests and the end-to-end test use Terraform by default.
+      - name: Use OpenTofu in the tests
+        if: matrix.cli == 'opentofu'
+        run: |
+          {
+            echo "TF_ACC_TERRAFORM_PATH=$(command -v tofu)"
+            echo "TF_ACC_PROVIDER_HOST=registry.opentofu.org"
+            echo "E2E_TERRAFORM=tofu"
+          } >> "$GITHUB_ENV"
 
       - name: test
         run: make test
@@ -40,3 +61,6 @@ jobs:
 
       - name: testacc
         run: make testacc
+
+      - name: teste2e
+        run: make teste2e
