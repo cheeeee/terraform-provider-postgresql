@@ -436,7 +436,7 @@ func parseServerVersion(pgVersion string) (*semver.Version, error) {
 
 	number := serverVersionRegexp.FindString(fields[1])
 	if number == "" {
-		number = fields[1]
+		return nil, fmt.Errorf("error parsing version: %q is not a version number", fields[1])
 	}
 	version, err := semver.ParseTolerant(number)
 	if err != nil {

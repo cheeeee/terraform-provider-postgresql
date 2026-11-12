@@ -162,6 +162,11 @@ func TestParseServerVersion(t *testing.T) {
 		{"", ""},
 	}
 
+	// The error gives what could not be parsed
+	if _, err := parseServerVersion("PostgreSQL unknown on x86_64-pc-linux-gnu"); err == nil || !strings.Contains(err.Error(), `"unknown"`) {
+		t.Errorf(`parseServerVersion: expected an error about "unknown", got %v`, err)
+	}
+
 	for _, test := range tests {
 		version, err := parseServerVersion(test.pgVersion)
 		if test.expected == "" {
