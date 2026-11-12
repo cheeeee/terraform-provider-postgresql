@@ -269,3 +269,70 @@ func mockFunctionResourceData(t *testing.T, obj PGFunction) *schema.ResourceData
 
 	return schema.TestResourceDataRaw(t, resourcePostgreSQLFunction().Schema, attributes)
 }
+
+func TestSplitFunctionArgs(t *testing.T) {
+	cases := map[string][]string{
+		"a integer, b text": {"a integer", "b text"},
+		"a numeric(10,2) DEFAULT round(1.5, 1), b text DEFAULT 'x,y'::text": {"a numeric(10,2) DEFAULT round(1.5, 1)", "b text DEFAULT 'x,y'::text"},
+		`"a,b" integer[], c integer`:                                        {`"a,b" integer[]`, "c integer"},
+		"integer":                                                           {"integer"},
+	}
+	for input, expected := range cases {
+		assert.Equal(t, expected, splitFunctionArgs(input), input)
+	}
+}
+
+func TestParseUnnamedArg(t *testing.T) {
+	assert.Equal(t, PGFunctionArg{Mode: "IN", Type: "integer"}, parseUnnamedArg("integer", ""))
+	assert.Equal(t, PGFunctionArg{Mode: "OUT", Type: "double precision"}, parseUnnamedArg("OUT double precision", ""))
+	assert.Equal(t, PGFunctionArg{Mode: "VARIADIC", Type: "integer[]"}, parseUnnamedArg("VARIADIC integer[]", ""))
+	assert.Equal(t, PGFunctionArg{Mode: "INOUT", Type: "text", Default: "'a'"}, parseUnnamedArg("INOUT text", "'a'"))
+}
+
+func TestFunctionArgDefinitions(t *testing.T) {
+	definition := "CREATE OR REPLACE FUNCTION public.f(integer, OUT double precision, a text DEFAULT 'x'::text)\n RETURNS record\n LANGUAGE sql\n"
+	assert.Equal(t, []string{"integer", "OUT double precision", "a text"}, functionArgDefinitions(definition))
+}
+
+func TestCreateFunctionSQL(t *testing.T) {
+	f := PGFunction{
+		Schema:     "public",
+		Name:       "My Func",
+		Returns:    "TABLE(a integer)",
+		Language:   "sql",
+		Body:       "SELECT 1",
+		Volatility: "STABLE",
+		Parallel:   "SAFE",
+		Strict:     true,
+		Leakproof:  true,
+		Cost:       5,
+		Rows:       10,
+		Support:    "pg_catalog.s",
+		Transform:  []string{"integer", "text"},
+		Parameters: map[string]any{"work_mem": "1MB", "search_path": "a, b"},
+	}
+	assert.Equal(t, `CREATE FUNCTION "public"."My Func" ()
+RETURNS TABLE(a integer)
+LANGUAGE sql
+TRANSFORM FOR TYPE integer, FOR TYPE text
+STABLE
+LEAKPROOF
+PARALLEL SAFE
+STRICT
+COST 5
+ROWS 10
+SUPPORT pg_catalog.s
+SET search_path TO 'a', 'b'
+SET work_mem TO '1MB'
+AS $function$SELECT 1$function$;`, createFunctionSQL(&f, false))
+
+	// a function which does not use the new attributes has the same statement as before
+	f = PGFunction{Schema: "public", Name: "f", Returns: "integer", Language: "plpgsql", Body: "BEGIN RETURN 1; END;", Volatility: "VOLATILE", Parallel: "UNSAFE", Cost: 100, Rows: 0}
+	assert.Equal(t, "CREATE  OR REPLACE FUNCTION \"public\".\"f\" ()\nRETURNS integer\nLANGUAGE plpgsql\nAS $function$BEGIN RETURN 1; END;$function$;", createFunctionSQL(&f, true))
+
+	f = PGFunction{Schema: "public", Name: "f", Returns: "boolean", Language: "c", ObjFile: "$libdir/citext", Body: "citext_eq", Volatility: "VOLATILE", Parallel: "UNSAFE", Cost: 1}
+	assert.Contains(t, createFunctionSQL(&f, false), "\nAS '$libdir/citext', 'citext_eq';")
+
+	f = PGFunction{Schema: "public", Name: "f", Returns: "integer", Language: "sql", SQLBody: "RETURN 1", Volatility: "VOLATILE", Parallel: "UNSAFE"}
+	assert.Contains(t, createFunctionSQL(&f, false), "\nRETURN 1;")
+}

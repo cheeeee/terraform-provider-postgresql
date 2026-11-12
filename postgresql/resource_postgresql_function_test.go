@@ -1735,12 +1735,18 @@ resource "postgresql_function" "dep" {
 `, extensions)
 	}
 	var oid string
+	canRemove := true
 	const res = "postgresql_function.dep"
 	depends := "(SELECT string_agg(e.extname, ',' ORDER BY e.extname) FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid WHERE d.objid = p.oid AND d.classid = 'pg_proc'::regclass AND d.deptype = 'x')"
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccFunctionPreCheck(t)
 			testCheckCanCreateExtension(t, "pg_trgm", "citext")
+			db, err := testAccProvider.Meta().(*Client).Connect()
+			if err != nil {
+				t.Fatal(err)
+			}
+			canRemove = db.featureSupported(featureFunctionNoDependsOnExtension)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
@@ -1783,19 +1789,68 @@ resource "postgresql_function" "dep" {
 				),
 			},
 			{
+				// changed outside of Terraform (NO DEPENDS ON EXTENSION does not exist before PostgreSQL 13)
+				SkipFunc: func() (bool, error) { return !canRemove, nil },
 				PreConfig: func() {
-					testAccFunctionExec(t, "ALTER FUNCTION public.tf_depends() NO DEPENDS ON EXTENSION citext")
+					if canRemove {
+						testAccFunctionExec(t, "ALTER FUNCTION public.tf_depends() NO DEPENDS ON EXTENSION citext")
+					}
 				},
 				Config:             strings.Replace(config(`[postgresql_extension.trgm.name, postgresql_extension.citext.name]`), "SELECT 1", "SELECT 2", 1),
 				PlanOnly:           true,
 				ExpectNonEmptyPlan: true,
 			},
 			{
-				Config: strings.Replace(config(`[postgresql_extension.citext.name]`), "SELECT 1", "SELECT 2", 1),
+				SkipFunc: func() (bool, error) { return !canRemove, nil },
+				Config:   strings.Replace(config(`[postgresql_extension.citext.name]`), "SELECT 1", "SELECT 2", 1),
 				Check: resource.ComposeTestCheckFunc(
 					testAccFunctionOID(res, &oid),
 					testAccFunctionProp(res, depends, "citext"),
 				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_NoDependsOnExtensionOldVersion(t *testing.T) {
+	config := func(extensions string) string {
+		return fmt.Sprintf(`
+resource "postgresql_extension" "trgm" {
+    name = "pg_trgm"
+}
+
+resource "postgresql_function" "dep" {
+    name = "tf_depends_old"
+    returns = "integer"
+    language = "sql"
+    depends_on_extensions = %s
+    body = "SELECT 1"
+}
+`, extensions)
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			testCheckCanCreateExtension(t, "pg_trgm")
+			db, err := testAccProvider.Meta().(*Client).Connect()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if db.featureSupported(featureFunctionNoDependsOnExtension) {
+				t.Skipf("Skip: PostgreSQL %s has NO DEPENDS ON EXTENSION", db.version)
+			}
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(`[postgresql_extension.trgm.name]`),
+				Check: testAccFunctionProp("postgresql_function.dep",
+					"(SELECT string_agg(e.extname, ',') FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid WHERE d.objid = p.oid AND d.classid = 'pg_proc'::regclass AND d.deptype = 'x')", "pg_trgm"),
+			},
+			{
+				Config:      config(`[]`),
+				ExpectError: regexp.MustCompile("requires PostgreSQL 13 or later"),
 			},
 		},
 	})
