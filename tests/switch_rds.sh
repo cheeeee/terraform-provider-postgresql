@@ -56,3 +56,8 @@ export PGUSER=rds
 export PGPASSWORD=rds
 export PGSSLMODE=disable
 export PGSUPERUSER=false
+
+# The subscriptions of the tests connect to the server itself. A user who is not a superuser
+# cannot do it through the trusted local connection of the container ("password is required"):
+# the address is the one of the service on the network of Docker, where a password is asked.
+export TEST_PUBLISHER_HOST=postgres

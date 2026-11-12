@@ -13,6 +13,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func testAccCheckPostgresqlSubscriptionDestroy(s *terraform.State) error {
@@ -194,6 +195,7 @@ func TestAccPostgresqlSubscription_Basic(t *testing.T) {
 	dbNameSub, _ := getTestDBNames(dbSuffixSub)
 
 	conninfo := getConnInfo(t, dbNamePub)
+	config := getTestConfig(t)
 
 	subName := "subscription"
 	testAccPostgresqlSubscriptionDatabaseConfig := fmt.Sprintf(`
@@ -253,7 +255,13 @@ func TestAccPostgresqlSubscription_Basic(t *testing.T) {
 						"postgresql_subscription.test_sub",
 						"create_slot",
 						"false"),
+					testAccCheckSubscriptionConninfo("postgresql_subscription.test_sub", config.connStr(dbNameSub), subName, conninfo),
 				),
+			},
+			{
+				// nothing to change
+				Config:   testAccPostgresqlSubscriptionDatabaseConfig,
+				PlanOnly: true,
 			},
 		},
 	},
@@ -274,6 +282,7 @@ func TestAccPostgresqlSubscription_CustomSlotName(t *testing.T) {
 	dbNameSub, _ := getTestDBNames(dbSuffixSub)
 
 	conninfo := getConnInfo(t, dbNamePub)
+	config := getTestConfig(t)
 
 	subName := "subscription"
 	testAccPostgresqlSubscriptionDatabaseConfig := fmt.Sprintf(`
@@ -338,7 +347,13 @@ func TestAccPostgresqlSubscription_CustomSlotName(t *testing.T) {
 						"postgresql_subscription.test_sub",
 						"slot_name",
 						"custom_slot_name"),
+					testAccCheckSubscriptionConninfo("postgresql_subscription.test_sub", config.connStr(dbNameSub), subName, conninfo),
 				),
+			},
+			{
+				// nothing to change
+				Config:   testAccPostgresqlSubscriptionDatabaseConfig,
+				PlanOnly: true,
 			},
 		},
 	},
@@ -373,7 +388,73 @@ func newSubTest(t *testing.T) *subTest {
 	dbNamePub, _ := getTestDBNames(dbSuffixPub)
 	dbNameSub, _ := getTestDBNames(dbSuffixSub)
 
-	return &subTest{t: t, dbPub: dbNamePub, dbSub: dbNameSub, conninfo: getConnInfo(t, dbNamePub)}
+	s := &subTest{t: t, dbPub: dbNamePub, dbSub: dbNameSub, conninfo: getConnInfo(t, dbNamePub)}
+	// registered last, so it runs first: before the databases are dropped
+	t.Cleanup(s.cleanLeftovers)
+	return s
+}
+
+// dropSubscriptions drops the subscriptions of the database dbName without connecting to
+// their publisher: the slot is unset first. Best effort: it is a cleanup.
+func dropSubscriptions(t *testing.T, dbName string) {
+	config := getTestConfig(t)
+	db, err := sql.Open("postgres", config.connStr(dbName))
+	if err != nil {
+		t.Logf("cleanup: could not connect to %s: %v", dbName, err)
+		return
+	}
+	defer closeDB(t, db)
+	rows, err := db.Query("SELECT subname FROM pg_catalog.pg_subscription WHERE subdbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())")
+	if err != nil {
+		t.Logf("cleanup: could not list the subscriptions of %s: %v", dbName, err)
+		return
+	}
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err == nil {
+			names = append(names, name)
+		}
+	}
+	_ = rows.Close()
+	for _, name := range names {
+		for _, statement := range []string{"ALTER SUBSCRIPTION %[1]s DISABLE", "ALTER SUBSCRIPTION %[1]s SET (slot_name = NONE)", "DROP SUBSCRIPTION %[1]s"} {
+			if _, err := db.Exec(fmt.Sprintf(statement, pq.QuoteIdentifier(name))); err != nil {
+				t.Logf("cleanup: %s: %v", fmt.Sprintf(statement, name), err)
+			}
+		}
+	}
+}
+
+// dropSlots drops the logical replication slots of the database of a server (the publisher):
+// a slot which is left blocks the DROP DATABASE. Best effort, it waits for the walsenders to stop.
+func dropSlots(t *testing.T, dsn string) {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Logf("cleanup: could not connect to the publisher: %v", err)
+		return
+	}
+	defer closeDB(t, db)
+	for i := 0; i < 15; i++ {
+		var remaining int
+		err := db.QueryRow(`SELECT count(*) FROM (SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots
+			WHERE database = current_database() AND active_pid IS NOT NULL) AS t`).Scan(&remaining)
+		_, errDrop := db.Exec("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database = current_database() AND NOT active")
+		if err == nil && errDrop == nil {
+			if err := db.QueryRow("SELECT count(*) FROM pg_replication_slots WHERE database = current_database()").Scan(&remaining); err == nil && remaining == 0 {
+				return
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	t.Logf("cleanup: slots left on the publisher")
+}
+
+// cleanLeftovers removes what a failed test leaves behind: the subscriptions, and the slots
+// of the publisher which block the DROP DATABASE of the teardown.
+func (s *subTest) cleanLeftovers() {
+	dropSubscriptions(s.t, s.dbSub)
+	dropSlots(s.t, s.dsn(s.dbPub))
 }
 
 func (s *subTest) preCheck(features ...featureName) func() {
@@ -448,7 +529,11 @@ func (s *subTest) dsn(dbName string) string {
 
 func (s *subTest) query(dbName, query string, args ...any) (string, error) {
 	config := getTestConfig(s.t)
-	db, err := sql.Open("postgres", config.connStr(dbName))
+	return queryDB(config.connStr(dbName), query, args...)
+}
+
+func queryDB(dsn, query string, args ...any) (string, error) {
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return "", err
 	}
@@ -562,6 +647,13 @@ func (s *subTest) replicated(table string, count int) resource.TestCheckFunc {
 	}
 }
 
+// synced waits until the tables of the subscription are ready (the initial copy is done)
+func (s *subTest) synced() resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		return s.waitFor(s.dbSub, "SELECT count(*)::text FROM pg_catalog.pg_subscription_rel WHERE srsubstate <> 'r'", "0")
+	}
+}
+
 func (s *subTest) insert(table, val string) resource.TestCheckFunc {
 	return func(_ *terraform.State) error {
 		config := getTestConfig(s.t)
@@ -570,19 +662,75 @@ func (s *subTest) insert(table, val string) resource.TestCheckFunc {
 	}
 }
 
+// testAccCheckSubscriptionConninfo checks the connection string of the subscription subName of the
+// database dbName (the dsn of the subscriber is dsn). The state keeps the configured value. Where
+// the connected user can read pg_subscription.subconninfo (the superusers) the catalog holds it too;
+// where PostgreSQL hides it from the user (it does from every non superuser), the column is refused:
+// the provider can only keep the configured value in the state.
+func testAccCheckSubscriptionConninfo(resourceName, dsn, subName, expected string) resource.TestCheckFunc {
+	return func(st *terraform.State) error {
+		rs, ok := st.RootModule().Resources[resourceName]
+		if !ok {
+			return fmt.Errorf("Resource not found: %s", resourceName)
+		}
+		if got := rs.Primary.Attributes["conninfo"]; got != expected {
+			return fmt.Errorf("conninfo in the state is %q, expected %q", got, expected)
+		}
+		got, err := queryDB(dsn, "SELECT subconninfo FROM pg_catalog.pg_subscription WHERE subname = $1", subName)
+		if subconninfoReadable(dsn) {
+			if err != nil {
+				return fmt.Errorf("could not read subconninfo of subscription %s: %w", subName, err)
+			}
+			if got != expected {
+				return fmt.Errorf("subconninfo of subscription %s is %q, expected %q", subName, got, expected)
+			}
+			return nil
+		}
+		if err == nil || !strings.Contains(err.Error(), "permission denied") {
+			return fmt.Errorf("subconninfo should be hidden from this user: got %q, error %v", got, err)
+		}
+		return nil
+	}
+}
+
+func subconninfoReadable(dsn string) bool {
+	got, err := queryDB(dsn, "SELECT has_column_privilege('pg_catalog.pg_subscription', 'subconninfo', 'SELECT')::text")
+	return err == nil && got == "true"
+}
+
+func (s *subTest) conninfoReadable() bool {
+	return subconninfoReadable(s.dsn(s.dbSub))
+}
+
+// checkConninfo checks the connection string of the subscription (see testAccCheckSubscriptionConninfo).
+func (s *subTest) checkConninfo(subName, expected string) resource.TestCheckFunc {
+	return testAccCheckSubscriptionConninfo(subRes, s.dsn(s.dbSub), subName, expected)
+}
+
 // importStep checks the import of the subscription. The options of the creation are
 // not in the catalog, and the connection string is only readable by the superusers.
 func (s *subTest) importStep() resource.TestStep {
 	ignore := []string{"create_slot", "connect", "copy_data"}
-	if got, err := s.query(s.dbSub, "SELECT has_column_privilege('pg_catalog.pg_subscription', 'subconninfo', 'SELECT')::text"); err != nil || got != "true" {
+	step := resource.TestStep{
+		ResourceName:      "postgresql_subscription.test_sub",
+		ImportState:       true,
+		ImportStateVerify: true,
+	}
+	if !s.conninfoReadable() {
+		// the import cannot read it: it is left empty (the verification of the other attributes goes on)
 		ignore = append(ignore, "conninfo")
+		step.ImportStateCheck = func(states []*terraform.InstanceState) error {
+			if len(states) != 1 {
+				return fmt.Errorf("expected one imported resource, got %d", len(states))
+			}
+			if got := states[0].Attributes["conninfo"]; got != "" {
+				return fmt.Errorf("conninfo of the imported subscription is %q, expected it to be empty (hidden by PostgreSQL)", got)
+			}
+			return nil
+		}
 	}
-	return resource.TestStep{
-		ResourceName:            "postgresql_subscription.test_sub",
-		ImportState:             true,
-		ImportStateVerify:       true,
-		ImportStateVerifyIgnore: ignore,
-	}
+	step.ImportStateVerifyIgnore = ignore
+	return step
 }
 
 const subRes = "postgresql_subscription.test_sub"
@@ -1048,15 +1196,6 @@ func TestAccPostgresqlSubscription_AlterInPlace(t *testing.T) {
 	const name = "tf_sub_alter"
 	const renamed = "tf_sub_alter_renamed"
 	var oid string
-	// the connection string is not readable from the catalog by every user
-	checkConninfo := func(sub, contains string) resource.TestCheckFunc {
-		return func(st *terraform.State) error {
-			if got, err := s.query(s.dbSub, "SELECT has_column_privilege('pg_catalog.pg_subscription', 'subconninfo', 'SELECT')::text"); err != nil || got != "true" {
-				return nil
-			}
-			return s.catalog(sub, "subconninfo LIKE '%"+contains+"%'", "true")(st)
-		}
-	}
 	const application = " application_name=tf_sub_alter"
 
 	resource.Test(t, resource.TestCase{
@@ -1091,9 +1230,13 @@ func TestAccPostgresqlSubscription_AlterInPlace(t *testing.T) {
 				// another connection string
 				Config: s.configFull(name, "test_slot", application, []string{"pub1", "pub2"}, ""),
 				Check: resource.ComposeTestCheckFunc(
-					checkConninfo(name, "application_name=tf_sub_alter"),
+					s.checkConninfo(name, s.conninfo+application),
 					s.sameOID(name, &oid),
 				),
+			},
+			{
+				Config:   s.configFull(name, "test_slot", application, []string{"pub1", "pub2"}, ""),
+				PlanOnly: true,
 			},
 			{
 				// fewer publications
@@ -1290,12 +1433,13 @@ func TestAccPostgresqlSubscription_DestroyKeepsSlot(t *testing.T) {
 	}
 	`, s.dbPub, name, s.dbSub, s.conninfo)
 
-	var slotCreated bool
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			s.preCheck()()
 			dbExecute(t, s.dsn(s.dbPub), "SELECT pg_create_logical_replication_slot('tf_kept_slot', 'pgoutput')")
-			slotCreated = true
+			// The slot is kept by the destroy: it is dropped when the test ends, also when it fails
+			// (the subscription which uses it goes first).
+			t.Cleanup(s.cleanLeftovers)
 		},
 		Providers: testAccProviders,
 		CheckDestroy: func(st *terraform.State) error {
@@ -1315,9 +1459,6 @@ func TestAccPostgresqlSubscription_DestroyKeepsSlot(t *testing.T) {
 			},
 		},
 	})
-	if slotCreated {
-		dbExecute(t, s.dsn(s.dbPub), "SELECT pg_drop_replication_slot('tf_kept_slot')")
-	}
 }
 
 // slotState checks that the slot of the publisher exists and whether it is active.
@@ -1475,14 +1616,14 @@ func TestAccPostgresqlSubscription_Replication(t *testing.T) {
 	})
 }
 
-// The owner of the subscription is altered in place.
-func TestAccPostgresqlSubscription_Owner(t *testing.T) {
-	s := newSubTest(t)
-	const name = "tf_sub_owner"
+// ownerRole returns the name of a role which can own a subscription and the PreCheck which skips
+// the test when the connected user cannot create it, and creates it. The cleanup drops the role:
+// DROP OWNED BY revokes its privilege on the database of the subscriber (a shared object, revoked
+// from any database), without which the role could not be dropped, whenever the database is dropped.
+func (s *subTest) ownerRole() (string, func()) {
+	t := s.t
 	roleName := "tf_sub_owner_" + strconv.Itoa(int(time.Now().UnixNano()))
-	var oid string
-
-	setup := func() {
+	return roleName, func() {
 		testAccPreCheck(t)
 		testCheckCanExecute(t, "create a role which can own a subscription",
 			"CREATE ROLE tf_probe_owner",
@@ -1495,9 +1636,11 @@ func TestAccPostgresqlSubscription_Owner(t *testing.T) {
 			END $$`,
 		)
 		s.preCheck()()
-	}
-	createRole := func() {
 		config := getTestConfig(t)
+		t.Cleanup(func() {
+			dbExecute(t, config.connStr("postgres"), fmt.Sprintf(
+				`DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = '%[1]s') THEN DROP OWNED BY %[1]s; DROP ROLE %[1]s; END IF; END $$`, roleName))
+		})
 		dbExecute(t, config.connStr("postgres"), fmt.Sprintf("CREATE ROLE %s", roleName))
 		if testServerVersionNum(t) >= 160000 {
 			dbExecute(t, config.connStr("postgres"), fmt.Sprintf("GRANT pg_create_subscription TO %s", roleName))
@@ -1506,20 +1649,19 @@ func TestAccPostgresqlSubscription_Owner(t *testing.T) {
 			dbExecute(t, config.connStr("postgres"), fmt.Sprintf("ALTER ROLE %s SUPERUSER", roleName))
 		}
 	}
-	t.Cleanup(func() {
-		config := getTestConfig(t)
-		// the role has privileges on the database, which is dropped after
-		dbExecute(t, config.connStr("postgres"), fmt.Sprintf(
-			`DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = '%[1]s') THEN DROP OWNED BY %[1]s; DROP ROLE %[1]s; END IF; END $$`, roleName))
-	})
+}
+
+// The owner of the subscription is altered in place.
+func TestAccPostgresqlSubscription_Owner(t *testing.T) {
+	s := newSubTest(t)
+	const name = "tf_sub_owner"
+	roleName, preCheck := s.ownerRole()
+	var oid string
 	// a non superuser owner is disabled, its apply worker could not connect without a password
 	disabled := "enabled = false"
 
 	resource.Test(t, resource.TestCase{
-		PreCheck: func() {
-			setup()
-			createRole()
-		},
+		PreCheck:     preCheck,
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
 		Steps: []resource.TestStep{
@@ -1558,126 +1700,462 @@ func TestAccPostgresqlSubscription_Owner(t *testing.T) {
 	})
 }
 
+// The owner is set when the subscription is created (CREATE, then OWNER TO).
+func TestAccPostgresqlSubscription_OwnerAtCreate(t *testing.T) {
+	s := newSubTest(t)
+	const name = "tf_sub_owner_create"
+	roleName, preCheck := s.ownerRole()
+	config := s.config(name, []string{"pub1"}, "enabled = false\nowner = \""+roleName+"\"")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     preCheck,
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(subRes, "owner", roleName),
+					s.catalog(name, "pg_get_userbyid(subowner)", roleName),
+					s.catalog(name, "subenabled", "false"),
+				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
+			s.importStep(),
+			{
+				// back to the first owner, which can drop the subscription without a password
+				Config: s.config(name, []string{"pub1"}, "enabled = false\nowner = \""+getTestConfig(t).Username+"\""),
+				Check:  s.catalog(name, "pg_get_userbyid(subowner)", getTestConfig(t).Username),
+			},
+		},
+	})
+}
+
+// slot_name = NONE at the creation: no slot, so the subscription has to be disabled and not to create one.
+func TestAccPostgresqlSubscription_SlotNoneAtCreate(t *testing.T) {
+	s := newSubTest(t)
+	const name = "tf_sub_none_create"
+	config := strings.Replace(s.config(name, []string{"pub1"}, "enabled = false"), `slot_name    = postgresql_replication_slot.test_slot.name`, `slot_name    = "none"`, 1)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     s.preCheck(),
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(subRes, "slot_name", "NONE"),
+					resource.TestCheckResourceAttr(subRes, "enabled", "false"),
+					s.catalog(name, "subslotname IS NULL", "true"),
+					s.catalog(name, "subenabled", "false"),
+					// the subscription did not create a slot, and does not use the ones of the test
+					s.slots("test_slot,test_slot2"),
+				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
+			s.importStep(),
+		},
+	})
+}
+
+// Several publications at the creation, and the data of the tables of both is copied.
+func TestAccPostgresqlSubscription_TwoPublicationsAtCreate(t *testing.T) {
+	s := newSubTest(t)
+	const name = "tf_sub_two_pubs"
+	config := s.config(name, []string{"pub1", "pub2"}, "")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			s.preCheck()()
+			dbExecute(t, s.dsn(s.dbPub), "INSERT INTO test_schema.test_table_1 (val) VALUES ('first')")
+			dbExecute(t, s.dsn(s.dbPub), "INSERT INTO test_schema.test_table_2 (val) VALUES ('second')")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlSubscriptionExists(subRes),
+					resource.TestCheckResourceAttr(subRes, "publications.#", "2"),
+					s.publications(name, "test_publication_1,test_publication_2"),
+					s.replicated("test_schema.test_table_1", 1),
+					s.replicated("test_schema.test_table_2", 1),
+					s.insert("test_schema.test_table_1", "third"),
+					s.insert("test_schema.test_table_2", "fourth"),
+					s.replicated("test_schema.test_table_1", 2),
+					s.replicated("test_schema.test_table_2", 2),
+				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
+			s.importStep(),
+			{
+				// the list changed outside of Terraform
+				PreConfig:          s.outside(fmt.Sprintf("ALTER SUBSCRIPTION %s SET PUBLICATION test_publication_1 WITH (refresh = false)", name)),
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+// copy_data at the creation: the rows which exist on the publisher are copied or not.
+func TestAccPostgresqlSubscription_CopyDataAtCreate(t *testing.T) {
+	for _, copyData := range []bool{true, false} {
+		t.Run(fmt.Sprintf("copy_data=%t", copyData), func(t *testing.T) {
+			s := newSubTest(t)
+			const name = "tf_sub_copy"
+			config := s.config(name, []string{"pub1"}, fmt.Sprintf("copy_data = %t", copyData))
+			existing, total := 2, 3
+			if !copyData {
+				existing, total = 0, 1
+			}
+
+			resource.Test(t, resource.TestCase{
+				PreCheck: func() {
+					s.preCheck()()
+					dbExecute(t, s.dsn(s.dbPub), "INSERT INTO test_schema.test_table_1 (val) VALUES ('one'), ('two')")
+				},
+				Providers:    testAccProviders,
+				CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
+				Steps: []resource.TestStep{
+					{
+						Config: config,
+						Check: resource.ComposeTestCheckFunc(
+							testAccCheckPostgresqlSubscriptionExists(subRes),
+							resource.TestCheckResourceAttr(subRes, "copy_data", strconv.FormatBool(copyData)),
+							s.synced(),
+							s.replicated("test_schema.test_table_1", existing),
+							// the changes which follow are replicated in both cases
+							s.insert("test_schema.test_table_1", "three"),
+							s.replicated("test_schema.test_table_1", total),
+						),
+					},
+					{
+						Config:   config,
+						PlanOnly: true,
+					},
+				},
+			})
+		})
+	}
+}
+
 // A subscription which connects to the server it lives on cannot create its replication slot
 // (the creation of the slot waits for the transaction of CREATE SUBSCRIPTION). To test
-// create_slot = true, the publisher has to be another server:
+// create_slot = true, the publisher has to be another server: the service "publisher" of
+// tests/docker-compose.yml, which the scripts tests/switch_*.sh declare with
 //
-//	TEST_REMOTE_PUBLISHER_DSN       how the test reaches it, e.g. postgres://postgres:postgres@localhost:25449/postgres?sslmode=disable
+//	TEST_REMOTE_PUBLISHER_DSN       how the test reaches it, e.g. postgres://postgres:postgres@localhost:25433/postgres?sslmode=disable
 //	TEST_REMOTE_PUBLISHER_CONNINFO  how the subscriber reaches it, without dbname, e.g. host=publisher port=5432 user=postgres password=postgres
 //
-// The test is skipped when they are not set.
-func TestAccPostgresqlSubscription_CreateSlotOnRemotePublisher(t *testing.T) {
+// The tests which use it are skipped when they are not set (e.g. against a managed service).
+type remoteTest struct {
+	*subTest
+	dsn string // of the server of the remote publisher
+	db  string // database of the remote publisher
+}
+
+func newRemoteTest(t *testing.T) *remoteTest {
 	skipIfNotAcc(t)
 	remoteDSN := os.Getenv("TEST_REMOTE_PUBLISHER_DSN")
 	remoteConninfo := os.Getenv("TEST_REMOTE_PUBLISHER_CONNINFO")
 	if remoteDSN == "" || remoteConninfo == "" {
 		t.Skip("Skip test: TEST_REMOTE_PUBLISHER_DSN and TEST_REMOTE_PUBLISHER_CONNINFO are not set")
 	}
-	dsnFor := func(dbName string) string {
-		u, err := url.Parse(remoteDSN)
-		if err != nil {
-			t.Fatalf("could not parse TEST_REMOTE_PUBLISHER_DSN: %v", err)
-		}
-		u.Path = "/" + dbName
-		return u.String()
-	}
-	remoteQuery := func(dbName, query string) string {
-		db, err := sql.Open("postgres", dsnFor(dbName))
-		if err != nil {
-			t.Fatalf("could not connect to the remote publisher: %v", err)
-		}
-		defer closeDB(t, db)
-		var result sql.NullString
-		if err := db.QueryRow(query).Scan(&result); err != nil {
-			t.Fatalf("could not execute %s on the remote publisher: %v", query, err)
-		}
-		return result.String
-	}
-
 	dbSuffixSub, teardownSub := setupTestDatabase(t, true, true)
 	t.Cleanup(teardownSub)
 	t.Cleanup(func() { coolDown() })
-	createTestTables(t, dbSuffixSub, []string{"test_schema.test_table_1"}, "")
+	createTestTables(t, dbSuffixSub, []string{"test_schema.test_table_1", "test_schema.test_table_2"}, "")
 	dbNameSub, _ := getTestDBNames(dbSuffixSub)
-	remoteDB := "tf_remote_pub_" + strconv.Itoa(int(time.Now().UnixNano()))
-	dbExecute(t, dsnFor("postgres"), "CREATE DATABASE "+remoteDB)
-	t.Cleanup(func() { dbExecute(t, dsnFor("postgres"), "DROP DATABASE IF EXISTS "+remoteDB+"") })
-	dbExecute(t, dsnFor(remoteDB), "CREATE SCHEMA test_schema")
-	dbExecute(t, dsnFor(remoteDB), "CREATE TABLE test_schema.test_table_1 (val text, test_column_one text, test_column_two text)")
-	dbExecute(t, dsnFor(remoteDB), "CREATE PUBLICATION tf_remote_publication FOR TABLE test_schema.test_table_1")
 
-	s := &subTest{t: t, dbSub: dbNameSub, conninfo: remoteConninfo + " dbname=" + remoteDB}
-	slots := func(expected string) resource.TestCheckFunc {
-		return func(_ *terraform.State) error {
-			var got string
-			for i := 0; i < 30; i++ {
-				got = remoteQuery(remoteDB, "SELECT COALESCE(string_agg(slot_name || ':' || active::text, ',' ORDER BY slot_name), '') FROM pg_replication_slots WHERE database = current_database()")
-				if got == expected {
-					return nil
-				}
-				time.Sleep(time.Second)
+	r := &remoteTest{dsn: remoteDSN, db: "tf_remote_pub_" + strconv.Itoa(int(time.Now().UnixNano()))}
+	r.subTest = &subTest{t: t, dbSub: dbNameSub, conninfo: remoteConninfo + " dbname=" + r.db}
+	r.exec("postgres", "CREATE DATABASE "+r.db)
+	// What a failed test leaves: the subscription goes first, then its slot, then the database
+	// (the slots of the publisher are dropped by the subscription, or here).
+	t.Cleanup(func() {
+		dropSubscriptions(t, dbNameSub)
+		dropSlots(t, r.dsnFor(r.db))
+		for i := 0; i < 10; i++ {
+			if err := execDB(r.dsnFor("postgres"), "DROP DATABASE IF EXISTS "+r.db); err == nil {
+				return
 			}
-			return fmt.Errorf("slots of the remote publisher are %q, expected %q", got, expected)
+			time.Sleep(time.Second)
 		}
+		t.Logf("cleanup: could not drop the database %s of the remote publisher", r.db)
+	})
+	r.exec(r.db, "CREATE SCHEMA test_schema")
+	r.exec(r.db, "CREATE TABLE test_schema.test_table_1 (val text, test_column_one text, test_column_two text)")
+	r.exec(r.db, "CREATE TABLE test_schema.test_table_2 (val text, test_column_one text, test_column_two text)")
+	r.exec(r.db, "CREATE PUBLICATION tf_remote_publication FOR TABLE test_schema.test_table_1")
+	return r
+}
+
+func execDB(dsn, query string) error {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return err
 	}
-	config := func(extra string) string {
-		return fmt.Sprintf(`
-		resource "postgresql_subscription" "test_sub" {
-			name         = "tf_sub_remote"
-			database     = "%s"
-			conninfo     = "%s"
-			publications = ["tf_remote_publication"]
-			%s
-		}`, dbNameSub, s.conninfo, extra)
+	defer db.Close()
+	_, err = db.Exec(query)
+	return err
+}
+
+func (r *remoteTest) dsnFor(dbName string) string {
+	u, err := url.Parse(r.dsn)
+	if err != nil {
+		r.t.Fatalf("could not parse TEST_REMOTE_PUBLISHER_DSN: %v", err)
 	}
+	u.Path = "/" + dbName
+	return u.String()
+}
+
+func (r *remoteTest) exec(dbName, query string) {
+	if err := execDB(r.dsnFor(dbName), query); err != nil {
+		r.t.Fatalf("could not execute %s on the remote publisher: %v", query, err)
+	}
+}
+
+// slots checks the slots of the remote publisher ("name:active" separated by commas)
+func (r *remoteTest) slots(expected string) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		var got string
+		var err error
+		for i := 0; i < 30; i++ {
+			got, err = queryDB(r.dsnFor(r.db), "SELECT COALESCE(string_agg(slot_name || ':' || active::text, ',' ORDER BY slot_name), '') FROM pg_replication_slots WHERE database = current_database()")
+			if err == nil && got == expected {
+				return nil
+			}
+			time.Sleep(time.Second)
+		}
+		return fmt.Errorf("slots of the remote publisher are %q (%v), expected %q", got, err, expected)
+	}
+}
+
+func (r *remoteTest) insert(table, val string) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		r.exec(r.db, fmt.Sprintf("INSERT INTO %s (val) VALUES ('%s')", table, val))
+		return nil
+	}
+}
+
+func (r *remoteTest) preCheck() {
+	testAccPreCheck(r.t)
+	testCheckCanCreateSubscription(r.t, r.conninfo)
+}
+
+// config is a subscription which creates its slot (create_slot is true unless the extra lines say it).
+func (r *remoteTest) config(name, extra string) string {
+	return r.configNamed(name, "", extra)
+}
+
+func (r *remoteTest) configNamed(name, conninfoSuffix, extra string) string {
+	return fmt.Sprintf(`
+	resource "postgresql_subscription" "test_sub" {
+		name         = "%s"
+		database     = "%s"
+		conninfo     = "%s%s"
+		publications = ["tf_remote_publication"]
+		%s
+	}`, name, r.dbSub, r.conninfo, conninfoSuffix, extra)
+}
+
+// create_slot = true (the default): the subscription creates its slot on the publisher, the
+// data replicates, the slot is dropped with the subscription.
+func TestAccPostgresqlSubscription_CreateSlotOnRemotePublisher(t *testing.T) {
+	r := newRemoteTest(t)
+	s := r.subTest
 	const name = "tf_sub_remote"
 	var oid string
 
 	resource.Test(t, resource.TestCase{
-		PreCheck: func() {
-			testAccPreCheck(t)
-			testCheckCanCreateSubscription(t, s.conninfo)
-		},
+		PreCheck:  r.preCheck,
 		Providers: testAccProviders,
 		CheckDestroy: func(st *terraform.State) error {
 			if err := testAccCheckPostgresqlSubscriptionDestroy(st); err != nil {
 				return err
 			}
 			// the slot which the subscription created is dropped with it: nothing leaks on the publisher
-			return slots("")(st)
+			return r.slots("")(st)
 		},
 		Steps: []resource.TestStep{
 			{
-				Config: config(""),
+				Config: r.config(name, ""),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr(subRes, "create_slot", "true"),
 					resource.TestCheckResourceAttr(subRes, "slot_name", name),
 					resource.TestCheckResourceAttr(subRes, "enabled", "true"),
 					s.catalog(name, "subslotname", name),
-					slots(name+":true"),
+					s.catalog(name, "subenabled", "true"),
+					// the slot has been created on the publisher, not on the subscriber, and is in use
+					r.slots(name+":true"),
+					s.checkConninfo(name, r.conninfo),
 					s.rememberOID(name, &oid),
-					func(_ *terraform.State) error {
-						dbExecute(t, dsnFor(remoteDB), "INSERT INTO test_schema.test_table_1 (val) VALUES ('remote')")
-						return s.waitFor(dbNameSub, "SELECT count(*)::text FROM test_schema.test_table_1", "1")
-					},
+					r.insert("test_schema.test_table_1", "remote"),
+					s.replicated("test_schema.test_table_1", 1),
 				),
 			},
+			s.importStep(),
 			{
-				// create_slot = true is created only once: no diff, no replacement
-				Config: config("create_slot = false"),
+				// create_slot = true is used only at the creation: no diff, no replacement
+				Config: r.config(name, "create_slot = false"),
 				Check:  s.sameOID(name, &oid),
 			},
 			{
-				Config:   config("create_slot = false"),
+				Config:   r.config(name, "create_slot = false"),
 				PlanOnly: true,
 			},
 			{
 				// renamed: the slot keeps its name
-				Config: strings.Replace(config("create_slot = false"), `name         = "tf_sub_remote"`, `name         = "tf_sub_remote_2"`, 1),
+				Config: strings.Replace(r.config(name, "create_slot = false"), `name         = "tf_sub_remote"`, `name         = "tf_sub_remote_2"`, 1),
 				Check: resource.ComposeTestCheckFunc(
 					s.catalog("tf_sub_remote_2", "subslotname", name),
 					s.sameOID("tf_sub_remote_2", &oid),
-					slots(name+":true"),
+					r.slots(name+":true"),
+					r.insert("test_schema.test_table_1", "after the rename"),
+					s.replicated("test_schema.test_table_1", 2),
+				),
+			},
+		},
+	})
+}
+
+// slot_name with create_slot = true: the slot of the publisher has this name, not the one of the subscription.
+func TestAccPostgresqlSubscription_CreateSlotCustomName(t *testing.T) {
+	r := newRemoteTest(t)
+	s := r.subTest
+	const name = "tf_sub_remote_custom"
+	const slot = "tf_custom_remote_slot"
+	config := r.config(name, `slot_name = "`+slot+`"`)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:  r.preCheck,
+		Providers: testAccProviders,
+		CheckDestroy: func(st *terraform.State) error {
+			if err := testAccCheckPostgresqlSubscriptionDestroy(st); err != nil {
+				return err
+			}
+			return r.slots("")(st)
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(subRes, "slot_name", slot),
+					s.catalog(name, "subslotname", slot),
+					r.slots(slot+":true"),
+					r.insert("test_schema.test_table_1", "custom"),
+					s.replicated("test_schema.test_table_1", 1),
+				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
+			s.importStep(),
+		},
+	})
+}
+
+// copy_data = true at the creation: the rows which exist on the publisher are copied.
+func TestAccPostgresqlSubscription_CreateSlotCopyData(t *testing.T) {
+	r := newRemoteTest(t)
+	s := r.subTest
+	const name = "tf_sub_remote_copy"
+	config := r.config(name, "copy_data = true")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			r.preCheck()
+			r.exec(r.db, "INSERT INTO test_schema.test_table_1 (val) VALUES ('one'), ('two')")
+		},
+		Providers: testAccProviders,
+		CheckDestroy: func(st *terraform.State) error {
+			if err := testAccCheckPostgresqlSubscriptionDestroy(st); err != nil {
+				return err
+			}
+			return r.slots("")(st)
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(subRes, "copy_data", "true"),
+					s.synced(),
+					s.replicated("test_schema.test_table_1", 2),
+					r.insert("test_schema.test_table_1", "three"),
+					s.replicated("test_schema.test_table_1", 3),
+					r.slots(name+":true"),
+				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// enabled = false with create_slot = true: the slot is created on the publisher but nobody uses it,
+// and nothing is replicated until the subscription is enabled.
+func TestAccPostgresqlSubscription_CreateSlotDisabled(t *testing.T) {
+	r := newRemoteTest(t)
+	s := r.subTest
+	const name = "tf_sub_remote_disabled"
+	var oid string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			r.preCheck()
+			r.exec(r.db, "INSERT INTO test_schema.test_table_1 (val) VALUES ('before')")
+		},
+		Providers: testAccProviders,
+		CheckDestroy: func(st *terraform.State) error {
+			if err := testAccCheckPostgresqlSubscriptionDestroy(st); err != nil {
+				return err
+			}
+			return r.slots("")(st)
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: r.config(name, "enabled = false"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(subRes, "enabled", "false"),
+					s.catalog(name, "subenabled", "false"),
+					s.catalog(name, "subslotname", name),
+					r.slots(name+":false"),
+					r.insert("test_schema.test_table_1", "while disabled"),
+					func(_ *terraform.State) error {
+						time.Sleep(3 * time.Second)
+						return s.waitFor(s.dbSub, "SELECT count(*)::text FROM test_schema.test_table_1", "0")
+					},
+					s.rememberOID(name, &oid),
+				),
+			},
+			{
+				Config:   r.config(name, "enabled = false"),
+				PlanOnly: true,
+			},
+			{
+				// enabled: the slot is used, the existing rows are copied
+				Config: r.config(name, "enabled = true"),
+				Check: resource.ComposeTestCheckFunc(
+					s.catalog(name, "subenabled", "true"),
+					r.slots(name+":true"),
+					s.replicated("test_schema.test_table_1", 2),
+					s.sameOID(name, &oid),
 				),
 			},
 		},

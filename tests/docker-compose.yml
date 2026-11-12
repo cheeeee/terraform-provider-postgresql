@@ -1,10 +1,22 @@
+# The image is built once for the two services
+x-postgres: &postgres
+    build:
+      context: build
+      args:
+        - PGVERSION=${PGVERSION}
+    image: tfpg-test-postgres:${PGVERSION}
+    user: postgres
+    environment:
+        POSTGRES_PASSWORD: ${PGPASSWORD}
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 services:
     postgres:
-        build: 
-          context: build
-          args:
-            - PGVERSION=${PGVERSION}
-        user: postgres
+        <<: *postgres
         command:
           - "postgres"
           - "-c"
@@ -13,13 +25,19 @@ services:
           - "max_replication_slots=10"
           - "-c"
           - "shared_preload_libraries=/opt/dummy_seclabel/dummy_seclabel,pgaudit"
-        environment:
-            POSTGRES_PASSWORD: ${PGPASSWORD}
         ports:
             # TEST_PGPORT and COMPOSE_PROJECT_NAME allow several test databases at the same time
             - ${TEST_PGPORT:-25432}:5432
-        healthcheck:
-          test: [ "CMD-SHELL", "pg_isready" ]
-          interval: 10s
-          timeout: 5s
-          retries: 5
+    # A second server, the remote publisher of the subscriptions which create their slot
+    # (a subscription cannot create its slot on the server it lives on).
+    # The subscriber reaches it as publisher:5432, the tests as localhost:TEST_PUBLISHER_PGPORT.
+    publisher:
+        <<: *postgres
+        command:
+          - "postgres"
+          - "-c"
+          - "wal_level=logical"
+          - "-c"
+          - "max_replication_slots=10"
+        ports:
+            - ${TEST_PUBLISHER_PGPORT:-25433}:5432

@@ -65,6 +65,7 @@ jobs:
           {
             echo "COMPOSE_PROJECT_NAME=tfpg-ci-${version}-${{ matrix.cli }}"
             echo "TEST_PGPORT=${port}"
+            echo "TEST_PUBLISHER_PGPORT=$((port + 100))"
           } >> "$GITHUB_ENV"
 
       - name: test
