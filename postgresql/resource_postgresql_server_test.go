@@ -3,10 +3,14 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
+	"reflect"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlServer_Basic(t *testing.T) {
@@ -276,6 +280,441 @@ func testAccCreateServerDependency(serverName string) resource.TestCheckFunc {
 
 		return nil
 	}
+}
+
+// testAccOptionsFromCatalog converts the options of pg_foreign_server.srvoptions or
+// pg_user_mappings.umoptions to a map: the value of an option follows its first "=".
+func testAccOptionsFromCatalog(options []string) map[string]string {
+	m := make(map[string]string)
+	for _, o := range options {
+		pair := strings.SplitN(o, "=", 2)
+		m[pair[0]] = pair[1]
+	}
+	return m
+}
+
+// testAccCheckServerCatalog checks the version and the options of a foreign server in the catalog.
+func testAccCheckServerCatalog(serverName, version string, options map[string]string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		txn, err := startTransaction(testAccProvider.Meta().(*Client), "")
+		if err != nil {
+			return err
+		}
+		defer deferredRollback(txn)
+
+		var srvVersion string
+		var srvOptions []string
+		err = txn.QueryRow(
+			"SELECT COALESCE(srvversion, ''), srvoptions FROM pg_foreign_server WHERE srvname = $1",
+			serverName,
+		).Scan(&srvVersion, pq.Array(&srvOptions))
+		if err != nil {
+			return fmt.Errorf("error reading foreign server %s: %w", serverName, err)
+		}
+		if srvVersion != version {
+			return fmt.Errorf("version of foreign server %s is %q, expected %q", serverName, srvVersion, version)
+		}
+		if got := testAccOptionsFromCatalog(srvOptions); !reflect.DeepEqual(got, options) {
+			return fmt.Errorf("options of foreign server %s are %v, expected %v", serverName, got, options)
+		}
+		return nil
+	}
+}
+
+// testAccCheckServerOwner checks the owner of a foreign server in the catalog.
+func testAccCheckServerOwner(serverName, owner string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		txn, err := startTransaction(testAccProvider.Meta().(*Client), "")
+		if err != nil {
+			return err
+		}
+		defer deferredRollback(txn)
+
+		var srvOwner string
+		err = txn.QueryRow(
+			"SELECT pg_get_userbyid(srvowner) FROM pg_foreign_server WHERE srvname = $1",
+			serverName,
+		).Scan(&srvOwner)
+		if err != nil {
+			return fmt.Errorf("error reading foreign server %s: %w", serverName, err)
+		}
+		if srvOwner != owner {
+			return fmt.Errorf("owner of foreign server %s is %q, expected %q", serverName, srvOwner, owner)
+		}
+		return nil
+	}
+}
+
+// testAccCheckServerNotExists checks that a foreign server is not in the catalog.
+func testAccCheckServerNotExists(serverName string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		txn, err := startTransaction(testAccProvider.Meta().(*Client), "")
+		if err != nil {
+			return err
+		}
+		defer deferredRollback(txn)
+
+		exists, err := checkServerExists(txn, serverName)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return fmt.Errorf("foreign server %s still exists", serverName)
+		}
+		return nil
+	}
+}
+
+// testAccDropServerDependency drops the user mapping of the connected user created by
+// testAccCreateServerDependency, which lets the server be dropped.
+func testAccDropServerDependency(t *testing.T, serverName string) {
+	client := testAccProvider.Meta().(*Client)
+	db, err := client.Connect()
+	if err != nil {
+		t.Fatalf("could not connect to database: %v", err)
+	}
+	currentUser, err := getCurrentUser(db)
+	if err != nil {
+		t.Fatalf("could not get the current user: %v", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf("DROP USER MAPPING FOR %s SERVER %s", pq.QuoteIdentifier(currentUser), pq.QuoteIdentifier(serverName))); err != nil {
+		t.Fatalf("could not drop user mapping: %v", err)
+	}
+}
+
+// testAccPostgresqlServerOptionsConfig returns a foreign server with the given options
+// (lines of HCL) and the extension of its foreign-data wrapper.
+func testAccPostgresqlServerOptionsConfig(serverName, options string) string {
+	return fmt.Sprintf(`
+resource "postgresql_extension" "ext_postgres_fdw" {
+  name = "postgres_fdw"
+}
+
+resource "postgresql_server" "myserver" {
+  server_name = %q
+  fdw_name    = "postgres_fdw"
+  options = {
+%s
+  }
+
+  depends_on = [postgresql_extension.ext_postgres_fdw]
+}
+`, serverName, options)
+}
+
+func TestAccPostgresqlServer_OptionsAddSetDrop(t *testing.T) {
+	const serverName = "myserver_options"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlServerDestroy,
+		Steps: []resource.TestStep{
+			{
+				// Creation
+				Config: testAccPostgresqlServerOptionsConfig(serverName, `
+    host   = "foo"
+    dbname = "foodb"
+    port   = "5432"`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServerCatalog(serverName, "", map[string]string{"host": "foo", "dbname": "foodb", "port": "5432"}),
+				),
+			},
+			{
+				// SET host, ADD sslmode, DROP port, and dbname is kept
+				Config: testAccPostgresqlServerOptionsConfig(serverName, `
+    host    = "bar"
+    dbname  = "foodb"
+    sslmode = "require"`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServerCatalog(serverName, "", map[string]string{"host": "bar", "dbname": "foodb", "sslmode": "require"}),
+				),
+			},
+			{
+				// DROP all the options
+				Config: testAccPostgresqlServerOptionsConfig(serverName, ""),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServerCatalog(serverName, "", map[string]string{}),
+				),
+			},
+			{
+				// ADD to a server without options
+				Config: testAccPostgresqlServerOptionsConfig(serverName, `
+    host = "baz"`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServerCatalog(serverName, "", map[string]string{"host": "baz"}),
+					resource.TestCheckResourceAttr("postgresql_server.myserver", "options.host", "baz"),
+				),
+			},
+		},
+	})
+}
+
+// An option value which contains "=" is read back in full.
+func TestAccPostgresqlServer_OptionValueWithEquals(t *testing.T) {
+	const serverName = "myserver_equals"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlServerDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlServerOptionsConfig(serverName, `
+    host   = "a=b"
+    dbname = "foodb"`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServerCatalog(serverName, "", map[string]string{"host": "a=b", "dbname": "foodb"}),
+					resource.TestCheckResourceAttr("postgresql_server.myserver", "options.host", "a=b"),
+				),
+			},
+		},
+	})
+}
+
+// server_version is set, changed and removed from the configuration.
+func TestAccPostgresqlServer_Version(t *testing.T) {
+	const serverName = "myserver_version"
+	config := func(version string) string {
+		versionLine := ""
+		if version != "" {
+			versionLine = fmt.Sprintf("  server_version = %q\n", version)
+		}
+		return fmt.Sprintf(`
+resource "postgresql_extension" "ext_postgres_fdw" {
+  name = "postgres_fdw"
+}
+
+resource "postgresql_server" "myserver" {
+  server_name = %q
+  fdw_name    = "postgres_fdw"
+%s
+  depends_on = [postgresql_extension.ext_postgres_fdw]
+}
+`, serverName, versionLine)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlServerDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("1.0"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServerCatalog(serverName, "1.0", map[string]string{}),
+				),
+			},
+			{
+				Config: config("2.0"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServerCatalog(serverName, "2.0", map[string]string{}),
+				),
+			},
+			{
+				// Removing the attribute removes the version in the catalog
+				Config: config(""),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServerCatalog(serverName, "", map[string]string{}),
+					resource.TestCheckResourceAttr("postgresql_server.myserver", "server_version", ""),
+				),
+			},
+		},
+	})
+}
+
+// The owner of a server is changed on update.
+func TestAccPostgresqlServer_OwnerChange(t *testing.T) {
+	const serverName = "myserver_owner"
+	config := func(owner string) string {
+		return fmt.Sprintf(`
+resource "postgresql_extension" "ext_postgres_fdw" {
+  name = "postgres_fdw"
+}
+
+resource "postgresql_role" "owner_a" {
+  name = "srv_owner_a"
+}
+
+resource "postgresql_role" "owner_b" {
+  name = "srv_owner_b"
+}
+
+resource "postgresql_server" "myserver" {
+  server_name  = %q
+  fdw_name     = "postgres_fdw"
+  server_owner = postgresql_role.%s.name
+
+  depends_on = [postgresql_extension.ext_postgres_fdw]
+}
+`, serverName, owner)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlServerDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("owner_a"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServerOwner(serverName, "srv_owner_a"),
+				),
+			},
+			{
+				Config: config("owner_b"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServerOwner(serverName, "srv_owner_b"),
+					resource.TestCheckResourceAttr("postgresql_server.myserver", "server_owner", "srv_owner_b"),
+				),
+			},
+		},
+	})
+}
+
+// The server is renamed on update, its options are kept.
+func TestAccPostgresqlServer_Rename(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlServerDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlServerOptionsConfig("myserver_rename_old", `
+    host = "foo"`),
+				Check: testAccCheckServerCatalog("myserver_rename_old", "", map[string]string{"host": "foo"}),
+			},
+			{
+				Config: testAccPostgresqlServerOptionsConfig("myserver_rename_new", `
+    host = "foo"`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckServerNotExists("myserver_rename_old"),
+					testAccCheckServerCatalog("myserver_rename_new", "", map[string]string{"host": "foo"}),
+				),
+			},
+		},
+	})
+}
+
+// drop_cascade = false (RESTRICT) refuses to drop a server which has a dependent user mapping.
+func TestAccPostgresqlServer_DropRestrict(t *testing.T) {
+	const serverName = "myserver_restrict"
+	extensionOnly := `
+resource "postgresql_extension" "ext_postgres_fdw" {
+  name = "postgres_fdw"
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlServerDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlServerOptionsConfig(serverName, `
+    host = "foo"`),
+				Check: testAccCreateServerDependency(serverName),
+			},
+			{
+				// The server cannot be dropped while the user mapping exists
+				Config:      extensionOnly,
+				ExpectError: regexp.MustCompile(`cannot drop server`),
+			},
+			{
+				// Once the dependency is removed, the server is dropped
+				PreConfig: func() {
+					testAccDropServerDependency(t, serverName)
+				},
+				Config: extensionOnly,
+				Check:  testAccCheckServerNotExists(serverName),
+			},
+		},
+	})
+}
+
+// A server is imported by its name.
+func TestAccPostgresqlServer_Import(t *testing.T) {
+	const serverName = "myserver_import"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlServerDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlServerOptionsConfig(serverName, `
+    host = "foo"`),
+			},
+			{
+				ResourceName:      "postgresql_server.myserver",
+				ImportState:       true,
+				ImportStateId:     serverName,
+				ImportStateVerify: true,
+				// drop_cascade is a setting of the configuration, not of the server
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+		},
+	})
+}
+
+// Changes made outside of Terraform appear in the plan, and are reverted by an apply.
+func TestAccPostgresqlServer_ChangedOutsideTerraform(t *testing.T) {
+	const serverName = "myserver_outside"
+	config := testAccPostgresqlServerOptionsConfig(serverName, `
+    host = "foo"`)
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlServerDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check:  testAccCheckServerCatalog(serverName, "", map[string]string{"host": "foo"}),
+			},
+			{
+				PreConfig: func() {
+					testConfig := getTestConfig(t)
+					dbExecute(t, testConfig.connStr("postgres"),
+						fmt.Sprintf("ALTER SERVER %s VERSION '9.9' OPTIONS (SET host 'changed')", pq.QuoteIdentifier(serverName)))
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config,
+				Check:  testAccCheckServerCatalog(serverName, "", map[string]string{"host": "foo"}),
+			},
+		},
+	})
 }
 
 var testAccPostgresqlServerConfig = `
