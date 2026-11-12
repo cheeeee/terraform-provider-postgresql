@@ -2404,3 +2404,43 @@ resource "postgresql_role" "skip_drop_role" {
 		},
 	})
 }
+
+func TestHashRoleDatabaseParameters(t *testing.T) {
+	block := func(database string, parameters map[string]any) map[string]any {
+		return map[string]any{"database": database, "parameters": parameters}
+	}
+
+	same := [][2]map[string]any{
+		// the order of the parameters does not matter
+		{block("a", map[string]any{"work_mem": "1MB", "lock_timeout": "1s"}), block("a", map[string]any{"lock_timeout": "1s", "work_mem": "1MB"})},
+		// a list is the same list whatever the way it is written
+		{block("a", map[string]any{"temp_tablespaces": "foo,bar"}), block("a", map[string]any{"temp_tablespaces": `foo, "bar"`})},
+	}
+	for _, c := range same {
+		if hashRoleDatabaseParameters(c[0]) != hashRoleDatabaseParameters(c[1]) {
+			t.Errorf("%v and %v have to be the same block", c[0], c[1])
+		}
+	}
+
+	different := [][2]map[string]any{
+		{block("a", map[string]any{"work_mem": "1MB"}), block("b", map[string]any{"work_mem": "1MB"})},
+		{block("a", map[string]any{"work_mem": "1MB"}), block("a", map[string]any{"work_mem": "2MB"})},
+		{block("a", map[string]any{"temp_tablespaces": "foo,bar"}), block("a", map[string]any{"temp_tablespaces": "bar,foo"})},
+		{block("a", map[string]any{}), block("a", map[string]any{"work_mem": "1MB"})},
+	}
+	for _, c := range different {
+		if hashRoleDatabaseParameters(c[0]) == hashRoleDatabaseParameters(c[1]) {
+			t.Errorf("%v and %v have to be different blocks", c[0], c[1])
+		}
+	}
+}
+
+func TestRoleDatabaseParametersDuplicate(t *testing.T) {
+	set := schema.NewSet(hashRoleDatabaseParameters, []any{
+		map[string]any{"database": "a", "parameters": map[string]any{"work_mem": "1MB"}},
+		map[string]any{"database": "a", "parameters": map[string]any{"work_mem": "2MB"}},
+	})
+	if _, err := roleDatabaseParameters(set); err == nil {
+		t.Fatal("a database defined twice has to be refused")
+	}
+}

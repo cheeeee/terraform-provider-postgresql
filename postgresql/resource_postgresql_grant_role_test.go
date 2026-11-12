@@ -608,10 +608,6 @@ resource "postgresql_grant_role" "grr" {
 				Config:      grantConfig(`with_set_option = true`),
 				ExpectError: regexp.MustCompile(`with_set_option requires PostgreSQL 16 or later`),
 			},
-			{
-				Config:      grantConfig(`grantor = "grr_member"`),
-				ExpectError: regexp.MustCompile(`grantor requires PostgreSQL 16 or later`),
-			},
 			// without the options, the membership is the same as before
 			{
 				Config: grantConfig(`with_admin_option = true`),
@@ -625,7 +621,7 @@ resource "postgresql_grant_role" "grr" {
 	})
 }
 
-// Test GRANTED BY: the grantor is stored in the membership by PostgreSQL 16+.
+// Test GRANTED BY: the grantor is stored in the membership.
 func TestAccPostgresqlGrantRole_Grantor(t *testing.T) {
 	skipIfNotAcc(t)
 
@@ -687,7 +683,7 @@ resource "postgresql_grant_role" "grg" {
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
-			testCheckCompatibleVersion(t, featureRoleMembershipOptions)
+			testCheckCompatibleVersion(t, featurePrivileges)
 			// only a superuser can grant on behalf of another role
 			testCheckCanExecute(t, "grant a role on behalf of another one",
 				"CREATE ROLE tf_probe_grantor",
@@ -720,9 +716,16 @@ resource "postgresql_grant_role" "grg" {
 			// the options are changed in place, for the same grantor
 			{
 				Config: grantConfig(`postgresql_role.grg_grantor2.name
+  with_admin_option = true`),
+				Check: testAccCheckMembership("grg_member", "grg_granted", membershipOptions{admin: true, inherit: true, set: true, grantor: "grg_grantor2"}),
+			},
+			{
+				SkipFunc: func() (bool, error) { return !grantRoleOptionsSupported(), nil },
+				Config: grantConfig(`postgresql_role.grg_grantor2.name
+  with_admin_option = true
   with_set_option = false
   with_inherit_option = false`),
-				Check: testAccCheckMembership("grg_member", "grg_granted", membershipOptions{grantor: "grg_grantor2"}),
+				Check: testAccCheckMembership("grg_member", "grg_granted", membershipOptions{admin: true, grantor: "grg_grantor2"}),
 			},
 			// without grantor in the configuration, the grantor of the membership is kept
 			{
@@ -731,4 +734,9 @@ resource "postgresql_grant_role" "grg" {
 			},
 		},
 	})
+}
+
+func grantRoleOptionsSupported() bool {
+	db, err := testAccProvider.Meta().(*Client).Connect()
+	return err == nil && db.featureSupported(featureRoleMembershipOptions)
 }

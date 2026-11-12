@@ -19,10 +19,9 @@ const (
 )
 
 // getGrantRoleQuery returns the role membership for role, grant_role.
-// The inherit and set options and the grantor are stored by PostgreSQL 16+,
-// in the older versions there is only one grantor: the role which ran the GRANT.
-// A membership can be granted several times, by different grantors (PostgreSQL 16+):
-// the one of the grantor of the resource is read if it is known.
+// The inherit and set options are stored by PostgreSQL 16+.
+// A membership can be granted several times, by different grantors (PostgreSQL 16+,
+// before there is only one): the one of the grantor of the resource is read if it is known.
 func getGrantRoleQuery(db *DBConnection, withGrantor bool) string {
 	inheritOption, setOption := "true", "true"
 	if db.featureSupported(featureRoleMembershipOptions) {
@@ -94,7 +93,7 @@ func resourcePostgreSQLGrantRole() *schema.Resource {
 				Optional:    true,
 				Computed:    true,
 				ForceNew:    true,
-				Description: "The role recorded as the grantor of the membership (GRANTED BY, PostgreSQL 16+). Defaults to the role which runs the GRANT",
+				Description: "The role recorded as the grantor of the membership (GRANTED BY, only a superuser can name another role than the connected one). Defaults to the role which runs the GRANT",
 			},
 		},
 	}
@@ -295,11 +294,6 @@ func checkGrantRoleOptions(db *DBConnection, d *schema.ResourceData) error {
 	for _, attr := range []string{grantRoleWithInheritOptionAttr, grantRoleWithSetOptionAttr} {
 		if _, ok := rawConfigBool(d, attr); ok {
 			return fmt.Errorf("%s requires PostgreSQL 16 or later (server version: %s)", attr, db.version)
-		}
-	}
-	if config := d.GetRawConfig(); !config.IsNull() && config.IsKnown() && config.Type().IsObjectType() && config.Type().HasAttribute(grantRoleGrantorAttr) {
-		if g := config.GetAttr(grantRoleGrantorAttr); !g.IsNull() && g.IsKnown() && g.AsString() != "" {
-			return fmt.Errorf("%s requires PostgreSQL 16 or later (server version: %s)", grantRoleGrantorAttr, db.version)
 		}
 	}
 	return nil

@@ -12,7 +12,7 @@ The ``postgresql_grant_role`` resource creates and manages membership in a role 
 
 When using ``postgresql_grant_role`` resource it is likely because the PostgreSQL role you are modifying was created outside of this provider.
 
-~> **Note:** This resource needs PostgreSQL version 9 or above. `with_inherit_option`, `with_set_option` and `grantor` need PostgreSQL 16 or above, they are refused by the older versions.
+~> **Note:** This resource needs PostgreSQL version 9 or above. `with_inherit_option` and `with_set_option` need PostgreSQL 16 or above, they are refused by the older versions.
 
 ## Usage
 
@@ -53,10 +53,11 @@ resource "postgresql_grant_role" "bob_admin" {
   It is changed in place (`GRANT ... WITH INHERIT TRUE`, `REVOKE INHERIT OPTION FOR`).
 * `with_set_option` - (Optional) Whether `role` can use `SET ROLE` to `grant_role` (`WITH SET`, PostgreSQL 16+).
   When it is not set, PostgreSQL chooses `true`. It is changed in place (`GRANT ... WITH SET TRUE`, `REVOKE SET OPTION FOR`).
-* `grantor` - (Optional) The role recorded as the grantor of the membership (`GRANTED BY`, PostgreSQL 16+),
-  it needs the `ADMIN` option on `grant_role` and the connected user has to be a superuser to grant on behalf of
-  another role. When it is not set, the grantor is the connected user (the bootstrap superuser for a superuser).
-  Changing it grants the membership again. Before PostgreSQL 16, `GRANTED BY` can only name the connected user and is not supported.
+* `grantor` - (Optional) The role recorded as the grantor of the membership (`GRANTED BY`).
+  Only a superuser can name a role other than the connected user. Since PostgreSQL 16 the grantor
+  needs the `ADMIN` option on `grant_role` and a membership can have several grantors, before only one.
+  When it is not set, the grantor is the connected user (the bootstrap superuser for a superuser).
+  Changing it grants the membership again.
 
 The options which are not set in the configuration are read from `pg_auth_members` and left as they are.
 
