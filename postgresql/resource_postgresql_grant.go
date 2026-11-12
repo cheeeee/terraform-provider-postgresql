@@ -54,7 +54,6 @@ var objectTypes = map[string]string{
 	"sequence": "S",
 	"function": "f",
 	"routine":  "f",
-	"type":     "T",
 	"schema":   "n",
 }
 
