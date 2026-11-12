@@ -51,6 +51,12 @@ const (
 	featureCreateRoleSelfGrant
 	featureSecurityLabel
 	featureMaintainPrivilege
+	featureSubscriptionBinary
+	featureSubscriptionTwoPhase
+	featureSubscriptionRunAsOwner
+	featureSubscriptionFailover
+	featureSubscriptionRetainDeadTuples
+	featureSubscriptionWalReceiverTimeout
 )
 
 var (
@@ -130,6 +136,18 @@ var (
 
 		// MAINTAIN privilege on tables (PG 17+)
 		featureMaintainPrivilege: semver.MustParseRange(">=17.0.0"),
+
+		// subscription options: binary and streaming (on/off) since 14, two_phase and
+		// disable_on_error since 15, password_required, run_as_owner, origin and
+		// streaming = parallel since 16, failover since 17, retain_dead_tuples and
+		// the alteration of two_phase since 18, max_retention_duration and
+		// wal_receiver_timeout since 19
+		featureSubscriptionBinary:             semver.MustParseRange(">=14.0.0"),
+		featureSubscriptionTwoPhase:           semver.MustParseRange(">=15.0.0"),
+		featureSubscriptionRunAsOwner:         semver.MustParseRange(">=16.0.0"),
+		featureSubscriptionFailover:           semver.MustParseRange(">=17.0.0"),
+		featureSubscriptionRetainDeadTuples:   semver.MustParseRange(">=18.0.0"),
+		featureSubscriptionWalReceiverTimeout: semver.MustParseRange(">=19.0.0"),
 	}
 )
 
