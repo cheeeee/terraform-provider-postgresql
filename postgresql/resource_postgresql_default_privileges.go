@@ -183,6 +183,10 @@ func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.Resou
 	// Needed in order to set the owner of the db if the connection user is not a superuser
 	if err := withRolesGranted(txn, []string{owner}, func() error {
 
+		if err = checkDefaultPrivilegesRevokeHasEffect(txn, d); err != nil {
+			return err
+		}
+
 		// Revoke all privileges before granting otherwise reducing privileges will not work.
 		// We just have to revoke them in the same transaction so role will not lose its privileges
 		// between revoke and grant.
@@ -269,30 +273,9 @@ func readRoleDefaultPrivileges(txn *sql.Tx, db *DBConnection, d *schema.Resource
 		return err
 	}
 
-	// PostgreSQL stores a default ACL only when it differs from the built-in default
-	// (acldefault): a schema entry takes precedence over the global one, and when neither
-	// exists the built-in default applies. This query reads the effective ACL of the owner,
-	// so the privileges granted to PUBLIC by default (e.g. EXECUTE on functions) are seen too.
-	// The grant option is true only if every privilege is granted WITH GRANT OPTION.
-	query := `SELECT array_agg(prtype), bool_and(grantable) FROM (
-		SELECT (aclexplode(acl)).* FROM (
-			SELECT COALESCE(
-				(SELECT defaclacl FROM pg_default_acl WHERE defaclrole = $3 AND defaclobjtype = $1
-					AND defaclnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2)),
-				(SELECT defaclacl FROM pg_default_acl WHERE defaclrole = $3 AND defaclobjtype = $1
-					AND defaclnamespace = 0),
-				acldefault($1::"char", $3)
-			) AS acl
-		) AS acls
-	) AS t (grantor_oid, grantee_oid, prtype, grantable)
-	WHERE grantee_oid = $4 AND grantor_oid = $3;`
-
-	var privileges pq.ByteaArray
-	var grantOption sql.NullBool
-	if err := txn.QueryRow(
-		query, defaultPrivilegesObjectClasses[objectType].defacl, pgSchema, ownerOID, roleOID,
-	).Scan(&privileges, &grantOption); err != nil {
-		return fmt.Errorf("could not read default privileges: %w", err)
+	privileges, grantOption, err := readDefaultPrivilegesACL(txn, objectType, pgSchema, ownerOID, roleOID)
+	if err != nil {
+		return err
 	}
 
 	// We consider no privileges as "not exists" unless no privileges were provided as input
@@ -316,6 +299,93 @@ func readRoleDefaultPrivileges(txn *sql.Tx, db *DBConnection, d *schema.Resource
 	d.SetId(generateDefaultPrivilegesID(d))
 
 	return nil
+}
+
+// readDefaultPrivilegesACL returns the privileges granted by the owner to the role in one
+// row of pg_default_acl, and whether all of them are WITH GRANT OPTION.
+//
+// Per-schema default privileges are ADDED to the global ones, they do not replace them
+// (ALTER DEFAULT PRIVILEGES, Description). A schema row starts empty, so a schema-scoped
+// resource reads only its own schema row, and nothing when there is none. The global row
+// starts from the built-in default (acldefault) and PostgreSQL stores it only when it
+// differs from it: a global resource reads the global row, or acldefault when there is none,
+// so that the built-in privileges of PUBLIC (e.g. EXECUTE on functions) and of the owner are seen.
+// The grant option is true only if every privilege is granted WITH GRANT OPTION.
+func readDefaultPrivilegesACL(txn *sql.Tx, objectType, pgSchema string, ownerOID, roleOID uint32) (pq.ByteaArray, sql.NullBool, error) {
+	defacl := defaultPrivilegesObjectClasses[objectType].defacl
+
+	var query string
+	args := []interface{}{defacl, ownerOID, roleOID}
+	if pgSchema != "" {
+		query = `SELECT array_agg(prtype), bool_and(grantable) FROM (
+			SELECT (aclexplode(defaclacl)).* FROM pg_default_acl
+			WHERE defaclrole = $2 AND defaclobjtype = $1
+				AND defaclnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $4)
+		) AS t (grantor_oid, grantee_oid, prtype, grantable)
+		WHERE grantee_oid = $3 AND grantor_oid = $2;`
+		args = append(args, pgSchema)
+	} else {
+		query = `SELECT array_agg(prtype), bool_and(grantable) FROM (
+			SELECT (aclexplode(COALESCE(
+				(SELECT defaclacl FROM pg_default_acl WHERE defaclrole = $2 AND defaclobjtype = $1
+					AND defaclnamespace = 0),
+				acldefault($1::"char", $2)
+			))).*
+		) AS t (grantor_oid, grantee_oid, prtype, grantable)
+		WHERE grantee_oid = $3 AND grantor_oid = $2;`
+	}
+
+	var privileges pq.ByteaArray
+	var grantOption sql.NullBool
+	if err := txn.QueryRow(query, args...).Scan(&privileges, &grantOption); err != nil {
+		return nil, grantOption, fmt.Errorf("could not read default privileges: %w", err)
+	}
+	return privileges, grantOption, nil
+}
+
+// checkDefaultPrivilegesRevokeHasEffect refuses a schema-scoped resource with no privileges
+// when the role has default privileges only globally or by built-in default: the REVOKE
+// IN SCHEMA would be a silent no-op in PostgreSQL, which says in ALTER DEFAULT PRIVILEGES:
+// "This means you cannot revoke privileges per-schema if they are granted globally (either by
+// default or according to an ALTER DEFAULT PRIVILEGES command that does not specify a schema)."
+func checkDefaultPrivilegesRevokeHasEffect(txn *sql.Tx, d *schema.ResourceData) error {
+	pgSchema := d.Get("schema").(string)
+	if pgSchema == "" || d.Get("privileges").(*schema.Set).Len() != 0 {
+		return nil
+	}
+	objectType := d.Get("object_type").(string)
+
+	roleOID, err := getRoleOID(txn, d.Get("role").(string))
+	if err != nil {
+		return err
+	}
+	ownerOID, err := getRoleOID(txn, d.Get("owner").(string))
+	if err != nil {
+		return err
+	}
+
+	inSchema, _, err := readDefaultPrivilegesACL(txn, objectType, pgSchema, ownerOID, roleOID)
+	if err != nil {
+		return err
+	}
+	if len(inSchema) != 0 {
+		return nil
+	}
+	global, _, err := readDefaultPrivilegesACL(txn, objectType, "", ownerOID, roleOID)
+	if err != nil {
+		return err
+	}
+	if len(global) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"role %q has default privileges on %s created by %q which are not granted in schema %q "+
+			"(they are granted globally or by the built-in default): a revoke IN SCHEMA has no effect on them, "+
+			"because PostgreSQL adds the privileges of a schema to the global ones and \"cannot revoke privileges per-schema "+
+			"if they are granted globally\". Use a postgresql_default_privileges resource without `schema` to change them",
+		d.Get("role").(string), defaultPrivilegesObjectClasses[objectType].class, d.Get("owner").(string), pgSchema,
+	)
 }
 
 func grantRoleDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
