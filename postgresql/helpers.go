@@ -410,7 +410,9 @@ func quoteIdentifyIdent(ident string) string {
 	// https://en.wikipedia.org/wiki/Function_overloading
 	// https://stackoverflow.com/a/48640797
 
-	s := strings.Split(ident, "(")
+	// Only the first "(" ends the name: the argument types may contain parentheses and commas
+	// themselves, e.g. "f(varchar(10), numeric(10,2))".
+	s := strings.SplitN(ident, "(", 2)
 
 	functionArgTypes := ""
 

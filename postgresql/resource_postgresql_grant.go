@@ -54,7 +54,6 @@ var objectTypes = map[string]string{
 	"sequence": "S",
 	"function": "f",
 	"routine":  "f",
-	"type":     "T",
 	"schema":   "n",
 }
 
@@ -115,6 +114,12 @@ func resourcePostgreSQLGrant() *schema.Resource {
 				Elem:        &schema.Schema{Type: schema.TypeString},
 				Set:         schema.HashString,
 				Description: "The list of privileges to grant",
+			},
+			"granted_by": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				ForceNew:    true,
+				Description: "The role recorded as the grantor of the privileges (PostgreSQL 19 or above); only the privileges granted by this role are managed",
 			},
 			"with_grant_option": {
 				Type:        schema.TypeBool,
@@ -305,7 +310,7 @@ SELECT array_agg(privilege_type)
 FROM (
 	SELECT (aclexplode(datacl)).* FROM pg_database WHERE datname=$1
 ) as privileges
-WHERE grantee = $2
+WHERE grantee = $2` + grantorClause(d, "") + `
 `
 
 	var privileges pq.ByteaArray
@@ -326,7 +331,7 @@ SELECT array_agg(privilege_type)
 FROM (
 	SELECT (aclexplode(nspacl)).* FROM pg_namespace WHERE nspname=$1
 ) as privileges
-WHERE grantee = $2
+WHERE grantee = $2` + grantorClause(d, "") + `
 `
 
 	var privileges pq.ByteaArray
@@ -349,7 +354,7 @@ SELECT pg_catalog.array_agg(privilege_type)
 FROM (
 	SELECT (pg_catalog.aclexplode(fdwacl)).* FROM pg_catalog.pg_foreign_data_wrapper WHERE fdwname=$1
 ) as privileges
-WHERE grantee = $2
+WHERE grantee = $2` + grantorClause(d, "") + `
 `
 
 	var privileges pq.ByteaArray
@@ -372,7 +377,7 @@ SELECT pg_catalog.array_agg(privilege_type)
 FROM (
 	SELECT (pg_catalog.aclexplode(srvacl)).* FROM pg_catalog.pg_foreign_server WHERE srvname=$1
 ) as privileges
-WHERE grantee = $2
+WHERE grantee = $2` + grantorClause(d, "") + `
 `
 
 	var privileges pq.ByteaArray
@@ -407,7 +412,7 @@ FROM (SELECT relname, attname, (aclexplode(attacl)).*
         AND relkind = $4)
          AS col_privs
          LEFT JOIN pg_roles ON pg_roles.oid = col_privs.grantee
-WHERE COALESCE(rolname, 'public') = $1
+WHERE COALESCE(rolname, 'public') = $1` + grantorClause(d, "col_privs.") + `
 GROUP BY col_privs.relname, col_privs.attname
 ORDER BY col_privs.attname
 ;`
@@ -491,6 +496,10 @@ func readRolePrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData) e
 		return readForeignServerRolePrivileges(txn, db, d, roleOID)
 
 	case "function", "procedure", "routine":
+		// The objects given with their argument types are read one by one, by their OID.
+		if drifted, err := readFunctionSignaturesPrivileges(txn, db, d, roleOID); err != nil || drifted {
+			return err
+		}
 		query = `
 SELECT pg_proc.proname, array_remove(array_agg(privilege_type), NULL)
 FROM pg_proc
@@ -500,7 +509,7 @@ LEFT JOIN (
     from (
              SELECT proname, pronamespace, (aclexplode(proacl)).* FROM pg_proc
          ) acls
-    WHERE grantee = $1
+    WHERE grantee = $1` + grantorClause(d, "") + `
 ) privs
 USING (proname, pronamespace)
       WHERE nspname = $2
@@ -519,7 +528,7 @@ SELECT pg_type.typname, array_remove(array_agg(privs.privilege_type), NULL)
 FROM pg_type
 JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
 LEFT JOIN (SELECT oid, (aclexplode(typacl)).* FROM pg_type) privs
-	ON privs.oid = pg_type.oid AND privs.grantee = $1
+	ON privs.oid = pg_type.oid AND privs.grantee = $1` + grantorClause(d, "privs.") + `
 WHERE pg_namespace.nspname = $2 AND pg_type.typname = ANY($3)
 GROUP BY pg_type.oid, pg_type.typname
 `
@@ -530,7 +539,7 @@ GROUP BY pg_type.oid, pg_type.typname
 SELECT pg_language.lanname, array_remove(array_agg(privs.privilege_type), NULL)
 FROM pg_language
 LEFT JOIN (SELECT lanname, (aclexplode(lanacl)).* FROM pg_language) privs
-	ON privs.lanname = pg_language.lanname AND privs.grantee = $1
+	ON privs.lanname = pg_language.lanname AND privs.grantee = $1` + grantorClause(d, "privs.") + `
 WHERE pg_language.lanname = ANY($2)
 GROUP BY pg_language.oid, pg_language.lanname
 `
@@ -541,7 +550,7 @@ GROUP BY pg_language.oid, pg_language.lanname
 SELECT pg_tablespace.spcname, array_remove(array_agg(privs.privilege_type), NULL)
 FROM pg_tablespace
 LEFT JOIN (SELECT spcname, (aclexplode(spcacl)).* FROM pg_tablespace) privs
-	ON privs.spcname = pg_tablespace.spcname AND privs.grantee = $1
+	ON privs.spcname = pg_tablespace.spcname AND privs.grantee = $1` + grantorClause(d, "privs.") + `
 WHERE pg_tablespace.spcname = ANY($2)
 GROUP BY pg_tablespace.oid, pg_tablespace.spcname
 `
@@ -552,7 +561,7 @@ GROUP BY pg_tablespace.oid, pg_tablespace.spcname
 SELECT pg_largeobject_metadata.oid::text, array_remove(array_agg(privs.privilege_type), NULL)
 FROM pg_largeobject_metadata
 LEFT JOIN (SELECT oid, (aclexplode(lomacl)).* FROM pg_largeobject_metadata) privs
-	ON privs.oid = pg_largeobject_metadata.oid AND privs.grantee = $1
+	ON privs.oid = pg_largeobject_metadata.oid AND privs.grantee = $1` + grantorClause(d, "privs.") + `
 WHERE pg_largeobject_metadata.oid::text = ANY($2)
 GROUP BY pg_largeobject_metadata.oid
 `
@@ -564,7 +573,7 @@ GROUP BY pg_largeobject_metadata.oid
 SELECT params.name, array_remove(array_agg(privs.privilege_type), NULL)
 FROM unnest($2::text[]) AS params(name)
 LEFT JOIN (SELECT parname, (aclexplode(paracl)).* FROM pg_parameter_acl) privs
-	ON privs.parname = params.name AND privs.grantee = $1
+	ON privs.parname = params.name AND privs.grantee = $1` + grantorClause(d, "privs.") + `
 GROUP BY params.name
 `
 		rows, err = txn.Query(query, roleOID, pq.StringArray(setToStrings(objects)))
@@ -578,7 +587,7 @@ LEFT JOIN (
     SELECT acls.* FROM (
         SELECT relname, relnamespace, relkind, (aclexplode(relacl)).* FROM pg_class c
     ) as acls
-    WHERE grantee=$1
+    WHERE grantee=$1` + grantorClause(d, "") + `
 ) privs
 USING (relname, relnamespace, relkind)
 WHERE nspname = $2 AND relkind = $3
@@ -624,6 +633,184 @@ GROUP BY pg_class.relname
 	}
 
 	return nil
+}
+
+// grantorClause restricts the ACL entries of a query to the ones of the grantor `granted_by`, when it is set:
+// the entries recorded for another grantor are not managed by the resource. prefix is the alias of the exploded ACL.
+func grantorClause(d *schema.ResourceData, prefix string) string {
+	grantedBy := d.Get("granted_by").(string)
+	if grantedBy == "" {
+		return ""
+	}
+	return fmt.Sprintf(" AND %sgrantor = (SELECT oid FROM pg_roles WHERE rolname = %s)", prefix, pq.QuoteLiteral(grantedBy))
+}
+
+// readFunctionSignaturesPrivileges compares the privileges of the objects of `objects` which are given with
+// their argument types, e.g. f(integer), with the ones of the state. The catalog only knows the bare name of a
+// function, which cannot tell two overloads apart, so each signature is resolved to the OID of exactly one
+// function and the ACL of this function is read. It returns true when the privileges of an object differ,
+// after having set them in the state. The objects given by their name only are read by readRolePrivileges.
+func readFunctionSignaturesPrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, roleOID uint32) (bool, error) {
+	query := `
+SELECT array_remove(array_agg(privilege_type), NULL)
+FROM (SELECT (aclexplode(proacl)).* FROM pg_proc WHERE oid = $1::oid) AS privileges
+WHERE grantee = $2` + grantorClause(d, "") + `
+`
+	for _, object := range d.Get("objects").(*schema.Set).List() {
+		signature := object.(string)
+		if !strings.Contains(signature, "(") {
+			continue
+		}
+		oid, err := resolveFunctionSignature(txn, d.Get("schema").(string), d.Get("object_type").(string), signature)
+		if err != nil {
+			return false, err
+		}
+		if oid == "" {
+			log.Printf("[DEBUG] %s %s of schema %s does not exist or could not be resolved", d.Get("object_type"), signature, d.Get("schema"))
+			continue
+		}
+
+		var privileges pq.ByteaArray
+		if err := txn.QueryRow(query, oid, roleOID).Scan(&privileges); err != nil {
+			return false, fmt.Errorf("could not read privileges for %s %s: %w", d.Get("object_type"), signature, err)
+		}
+		granted := pgArrayToSet(privileges)
+		if !resourcePrivilegesEqual(granted, db, d) {
+			log.Printf("[DEBUG] %s %s has not the expected privileges %v for role %s", d.Get("object_type"), signature, privileges, d.Get("role"))
+			return true, d.Set("privileges", granted)
+		}
+	}
+	return false, nil
+}
+
+// resolveFunctionSignature returns the OID (as a string) of the function, procedure or routine written
+// `name(argument list)` in the schema, or "" when there is none. The argument list is what a GRANT accepts:
+// argument modes and names are dropped and PostgreSQL resolves the types, ignoring their modifiers.
+func resolveFunctionSignature(txn *sql.Tx, schemaName, objectType, signature string) (string, error) {
+	signature = strings.TrimSpace(signature)
+	open := strings.Index(signature, "(")
+	if open < 0 || !strings.HasSuffix(signature, ")") {
+		return "", nil
+	}
+	name := signature[:open]
+
+	// The OUT arguments are not part of the identity of a function, but they are one of a procedure
+	// (PostgreSQL 14 and above): a procedure is looked for with them, then without them.
+	withOut := []string{}
+	withoutOut := []string{}
+	for _, arg := range splitTopLevel(signature[open+1 : len(signature)-1]) {
+		mode, argType, err := parseFunctionArgument(txn, arg)
+		if err != nil {
+			return "", err
+		}
+		if argType == "" {
+			continue
+		}
+		withOut = append(withOut, argType)
+		if mode != "OUT" {
+			withoutOut = append(withoutOut, argType)
+		}
+	}
+
+	candidates := [][]string{withoutOut}
+	if objectType != "function" && len(withOut) != len(withoutOut) {
+		candidates = [][]string{withOut, withoutOut}
+	}
+	for _, types := range candidates {
+		qualified := fmt.Sprintf("%s.%s(%s)", pq.QuoteIdentifier(schemaName), pq.QuoteIdentifier(name), strings.Join(types, ","))
+		oid, ok, err := softQueryString(txn, "SELECT to_regprocedure($1)::oid::text", qualified)
+		if err != nil {
+			return "", err
+		}
+		if ok && oid != "" {
+			return oid, nil
+		}
+	}
+	return "", nil
+}
+
+// splitTopLevel splits a list at the commas which are neither in parentheses or brackets nor in a quoted identifier.
+func splitTopLevel(list string) []string {
+	var parts []string
+	depth, start, quoted := 0, 0, false
+	for i, c := range list {
+		switch {
+		case c == '"':
+			quoted = !quoted
+		case quoted:
+		case c == '(' || c == '[':
+			depth++
+		case c == ')' || c == ']':
+			depth--
+		case c == ',' && depth == 0:
+			parts = append(parts, list[start:i])
+			start = i + 1
+		}
+	}
+	if strings.TrimSpace(list[start:]) != "" || len(parts) > 0 {
+		parts = append(parts, list[start:])
+	}
+	return parts
+}
+
+// firstTokenEnd returns the index of the end of the first word of s, which may be a quoted identifier or
+// contain parentheses.
+func firstTokenEnd(s string) int {
+	depth, quoted := 0, false
+	for i, c := range s {
+		switch {
+		case c == '"':
+			quoted = !quoted
+		case quoted:
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case (c == ' ' || c == '\t' || c == '\n') && depth == 0:
+			return i
+		}
+	}
+	return len(s)
+}
+
+// parseFunctionArgument splits `[mode] [name] type` into the upper-cased mode (empty for none) and the type.
+func parseFunctionArgument(txn *sql.Tx, arg string) (mode, argType string, err error) {
+	arg = strings.TrimSpace(arg)
+	if end := firstTokenEnd(arg); end < len(arg) {
+		switch word := strings.ToUpper(arg[:end]); word {
+		case "IN", "OUT", "INOUT", "VARIADIC":
+			mode, arg = word, strings.TrimSpace(arg[end:])
+		}
+	}
+	end := firstTokenEnd(arg)
+	if end == len(arg) {
+		return mode, arg, nil
+	}
+	// Two words: either a name and a type, or a type of several words (double precision...).
+	if _, ok, err := softQueryString(txn, "SELECT to_regtype($1)::oid::text", arg); err != nil || ok {
+		return mode, arg, err
+	}
+	return mode, strings.TrimSpace(arg[end:]), nil
+}
+
+// softQueryString runs a query with one parameter which returns a string, inside a savepoint: ok is
+// false when the statement fails, which does not abort the transaction (to_regtype and to_regprocedure raise an
+// error for a malformed name).
+func softQueryString(txn *sql.Tx, query, arg string) (value string, ok bool, err error) {
+	if _, err := txn.Exec("SAVEPOINT tfpg_resolve"); err != nil {
+		return "", false, err
+	}
+	var result sql.NullString
+	if qerr := txn.QueryRow(query, arg).Scan(&result); qerr != nil {
+		if _, err := txn.Exec("ROLLBACK TO SAVEPOINT tfpg_resolve"); err != nil {
+			return "", false, err
+		}
+		return "", false, nil
+	}
+	if _, err := txn.Exec("RELEASE SAVEPOINT tfpg_resolve"); err != nil {
+		return "", false, err
+	}
+	return result.String, result.Valid, nil
 }
 
 // namedObjectsClause returns the keyword and the objects of a GRANT or REVOKE statement for the
@@ -723,6 +910,9 @@ func createGrantQuery(d *schema.ResourceData, privileges []string) string {
 	if d.Get("with_grant_option").(bool) {
 		query = query + " WITH GRANT OPTION"
 	}
+	if grantedBy := d.Get("granted_by").(string); grantedBy != "" {
+		query = query + " GRANTED BY " + pq.QuoteIdentifier(grantedBy)
+	}
 
 	return query
 }
@@ -820,6 +1010,10 @@ func createRevokeQuery(getter ResourceSchemeGetter) string {
 				pq.QuoteIdentifier(getter("role").(string)),
 			)
 		}
+	}
+
+	if grantedBy := getter("granted_by").(string); grantedBy != "" && query != "SELECT NULL" {
+		query = query + " GRANTED BY " + pq.QuoteIdentifier(grantedBy)
 	}
 
 	return query
@@ -926,6 +1120,75 @@ WHERE pg_largeobject_metadata.oid::text = ANY($1)`
 	return owners, rows.Err()
 }
 
+// getRelationsOrFunctionsOwners returns the owners of the named tables, sequences (and the table of column
+// grants), functions, procedures and routines: they are not always the owners of the tables of the schema, which
+// are the only ones looked for otherwise. A function given with its argument types is resolved to its OID.
+func getRelationsOrFunctionsOwners(txn *sql.Tx, objectType, schemaName string, objects *schema.Set) ([]string, error) {
+	owners := []string{}
+	switch objectType {
+	case "table", "sequence", "column":
+		rows, err := txn.Query(`
+SELECT DISTINCT pg_roles.rolname
+FROM pg_class
+JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+JOIN pg_roles ON pg_roles.oid = pg_class.relowner
+WHERE pg_namespace.nspname = $1 AND pg_class.relname = ANY($2)`, schemaName, pq.StringArray(setToStrings(objects)))
+		if err != nil {
+			return nil, fmt.Errorf("error while looking for the owners of %s objects: %w", objectType, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var owner string
+			if err := rows.Scan(&owner); err != nil {
+				return nil, fmt.Errorf("could not scan the owner of a %s object: %w", objectType, err)
+			}
+			owners = append(owners, owner)
+		}
+		return owners, rows.Err()
+	case "function", "procedure", "routine":
+		for _, object := range objects.List() {
+			name := object.(string)
+			query := `
+SELECT rolname FROM pg_proc
+JOIN pg_namespace ON pg_namespace.oid = pronamespace
+JOIN pg_roles ON pg_roles.oid = proowner
+WHERE nspname = $1 AND proname = $2`
+			args := []any{schemaName, name}
+			if strings.Contains(name, "(") {
+				oid, err := resolveFunctionSignature(txn, schemaName, objectType, name)
+				if err != nil {
+					return nil, err
+				}
+				if oid == "" {
+					continue
+				}
+				query = "SELECT rolname FROM pg_proc JOIN pg_roles ON pg_roles.oid = proowner WHERE pg_proc.oid = $1::oid"
+				args = []any{oid}
+			}
+			rows, err := txn.Query(query, args...)
+			if err != nil {
+				return nil, fmt.Errorf("error while looking for the owner of %s %s: %w", objectType, name, err)
+			}
+			for rows.Next() {
+				var owner string
+				if err := rows.Scan(&owner); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("could not scan the owner of %s %s: %w", objectType, name, err)
+				}
+				if !sliceContainsStr(owners, owner) {
+					owners = append(owners, owner)
+				}
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return owners, nil
+}
+
 func checkRoleDBSchemaExists(db *DBConnection, d *schema.ResourceData) (bool, error) {
 	// Check the database exists
 	database := d.Get("database").(string)
@@ -1018,6 +1281,18 @@ func getRolesToGrant(txn *sql.Tx, d *schema.ResourceData) ([]string, error) {
 		}
 	}
 
+	if objects := d.Get("objects").(*schema.Set); objects.Len() > 0 {
+		objectOwners, err := getRelationsOrFunctionsOwners(txn, objectType, schemaName, objects)
+		if err != nil {
+			return nil, err
+		}
+		for _, owner := range objectOwners {
+			if !sliceContainsStr(owners, owner) {
+				owners = append(owners, owner)
+			}
+		}
+	}
+
 	if objectType == "type" || objectType == "domain" {
 		typeOwners, err := getNamedObjectsOwners(txn, objectType, schemaName, d.Get("objects").(*schema.Set))
 		if err != nil {
@@ -1058,6 +1333,12 @@ func validateFeatureSupport(db *DBConnection, d *schema.ResourceData) error {
 	if d.Get("object_type") == "routine" && !db.featureSupported(featureRoutine) {
 		return fmt.Errorf(
 			"object type ROUTINE is not supported for this Postgres version (%s)",
+			db.version,
+		)
+	}
+	if d.Get("granted_by").(string) != "" && !db.featureSupported(featureGrantedBy) {
+		return fmt.Errorf(
+			"granted_by is not supported for this Postgres version (%s): GRANTED BY needs PostgreSQL 19 or above",
 			db.version,
 		)
 	}

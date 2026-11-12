@@ -2549,3 +2549,640 @@ resource "postgresql_grant" "test" {
 		},
 	})
 }
+
+func TestQuoteIdentifyIdent(t *testing.T) {
+	for in, want := range map[string]string{
+		"table1":                           `"table1"`,
+		`we"ird`:                           `"we""ird"`,
+		"f(text, char)":                    `"f"(text, char)`,
+		"f(varchar(10), numeric(10,2))":    `"f"(varchar(10), numeric(10,2))`,
+		"f(integer[], public.\"My Type\")": `"f"(integer[], public."My Type")`,
+		"f()":                              `"f"()`,
+	} {
+		if got := quoteIdentifyIdent(in); got != want {
+			t.Errorf("quoteIdentifyIdent(%q) = %s, want %s", in, got, want)
+		}
+	}
+}
+
+// testFunctionPrivilege checks, in the catalog, whether role can execute the function with this exact signature.
+func testFunctionPrivilege(t *testing.T, role, signature string, want bool) error {
+	var got bool
+	db, err := sql.Open("postgres", testPostgresDSN(t))
+	if err != nil {
+		return err
+	}
+	defer closeDB(t, db)
+	if err := db.QueryRow("SELECT has_function_privilege($1, $2::regprocedure, 'EXECUTE')", role, signature).Scan(&got); err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("role %s can execute %s: %v, expected %v", role, signature, got, want)
+	}
+	return nil
+}
+
+// TestAccPostgresqlGrantFunctionSignatures grants EXECUTE on functions given with every kind of argument
+// list: type modifiers (with commas), argument names and modes, a schema-qualified type, an array type, a type
+// whose name needs quoting, and one overload among two with the same name.
+func TestAccPostgresqlGrantFunctionSignatures(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dsn := testPostgresDSN(t)
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_sig_role LOGIN PASSWORD '%s'", testRolePassword))
+	dbExecute(t, dsn, "CREATE SCHEMA test_sig_schema")
+	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_sig_schema TO test_sig_role")
+	dbExecute(t, dsn, `CREATE TYPE test_sig_schema.mytype AS ENUM ('a')`)
+	dbExecute(t, dsn, `CREATE TYPE test_sig_schema."My Type" AS ENUM ('a')`)
+	for _, f := range []string{
+		"f_typmod(a varchar(10), b numeric(10,2))",
+		"f_named(IN a text, b double precision)",
+		"f_qualified(a test_sig_schema.mytype)",
+		"f_array(a integer[])",
+		`f_quoted(a test_sig_schema."My Type")`,
+		"f_over(a integer)",
+		"f_over(a text)",
+	} {
+		dbExecute(t, dsn, fmt.Sprintf("CREATE FUNCTION test_sig_schema.%s RETURNS int AS $$ select 1 $$ LANGUAGE SQL", f))
+	}
+	dbExecute(t, dsn, "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA test_sig_schema FROM PUBLIC")
+	defer func() {
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_sig_schema CASCADE")
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_sig_role")
+	}()
+
+	// each function is granted by its own resource: Read keeps the privileges of the first object which differs
+	cases := []struct{ object, canonical string }{
+		{"f_typmod(varchar(10), numeric(10,2))", "test_sig_schema.f_typmod(character varying,numeric)"},
+		{"f_named(IN a text, b double precision)", "test_sig_schema.f_named(text,double precision)"},
+		{"f_qualified(test_sig_schema.mytype)", "test_sig_schema.f_qualified(test_sig_schema.mytype)"},
+		{"f_array(integer[])", "test_sig_schema.f_array(integer[])"},
+		{`f_quoted(test_sig_schema.\"My Type\")`, `test_sig_schema.f_quoted(test_sig_schema."My Type")`},
+		{"f_over(integer)", "test_sig_schema.f_over(integer)"},
+	}
+	tfConfig := ""
+	for i, c := range cases {
+		tfConfig += fmt.Sprintf(`
+resource "postgresql_grant" "test%d" {
+  database    = "postgres"
+  role        = "test_sig_role"
+  schema      = "test_sig_schema"
+  object_type = "function"
+  privileges  = ["EXECUTE"]
+  objects     = ["%s"]
+}
+`, i, c.object)
+	}
+	checkAll := func(*terraform.State) error {
+		for _, c := range cases {
+			if err := testFunctionPrivilege(t, "test_sig_role", c.canonical, true); err != nil {
+				return err
+			}
+		}
+		// the other overload of f_over
+		return testFunctionPrivilege(t, "test_sig_role", "test_sig_schema.f_over(text)", false)
+	}
+
+	steps := []resource.TestStep{{Config: tfConfig, Check: checkAll}}
+	for _, c := range cases {
+		canonical := c.canonical
+		steps = append(steps,
+			resource.TestStep{
+				// a privilege revoked outside of Terraform is detected, whatever the form of the signature
+				PreConfig: func() {
+					dbExecute(t, dsn, "REVOKE EXECUTE ON FUNCTION "+canonical+" FROM test_sig_role")
+				},
+				Config:             tfConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			resource.TestStep{Config: tfConfig, Check: checkAll},
+		)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps:     steps,
+	})
+}
+
+// testSetupOverloads creates test_ov_role and the two overloads test_ov_schema.f_ov(integer) and
+// test_ov_schema.f_ov(text), which only the owner can execute. The returned function drops all of it.
+func testSetupOverloads(t *testing.T) func() {
+	dsn := testPostgresDSN(t)
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_ov_role LOGIN PASSWORD '%s'", testRolePassword))
+	dbExecute(t, dsn, "CREATE SCHEMA test_ov_schema")
+	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_ov_schema TO test_ov_role")
+	dbExecute(t, dsn, "CREATE FUNCTION test_ov_schema.f_ov(a integer) RETURNS int AS $$ select 1 $$ LANGUAGE SQL")
+	dbExecute(t, dsn, "CREATE FUNCTION test_ov_schema.f_ov(a text) RETURNS int AS $$ select 1 $$ LANGUAGE SQL")
+	dbExecute(t, dsn, "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA test_ov_schema FROM PUBLIC")
+	return func() {
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_ov_schema CASCADE")
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_ov_role")
+	}
+}
+
+func testCheckOverloads(t *testing.T, wantInt, wantText bool) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		if err := testFunctionPrivilege(t, "test_ov_role", "test_ov_schema.f_ov(integer)", wantInt); err != nil {
+			return err
+		}
+		return testFunctionPrivilege(t, "test_ov_role", "test_ov_schema.f_ov(text)", wantText)
+	}
+}
+
+// TestAccPostgresqlGrantFunctionSignatureDrift revokes, outside of Terraform, the privilege on one overload of a
+// function which the configuration grants with its signature: the plan must see it, for this overload only.
+func TestAccPostgresqlGrantFunctionSignatureDrift(t *testing.T) {
+	skipIfNotAcc(t)
+	defer testSetupOverloads(t)()
+
+	grant := func(name, signature string) string {
+		return fmt.Sprintf(`
+resource "postgresql_grant" "%s" {
+  database    = "postgres"
+  role        = "test_ov_role"
+  schema      = "test_ov_schema"
+  object_type = "function"
+  privileges  = ["EXECUTE"]
+  objects     = ["%s"]
+}
+`, name, signature)
+	}
+	both := grant("int", "f_ov(a integer)") + grant("text", "f_ov(text)")
+	revoke := func(signature string) func() {
+		return func() {
+			dbExecute(t, testPostgresDSN(t), "REVOKE EXECUTE ON FUNCTION test_ov_schema."+signature+" FROM test_ov_role")
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: both,
+				Check:  testCheckOverloads(t, true, true),
+			},
+			{
+				// one overload loses its privilege: the plan shows a change
+				PreConfig:          revoke("f_ov(text)"),
+				Config:             both,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				// the apply restores it, and only it
+				Config: both,
+				Check:  testCheckOverloads(t, true, true),
+			},
+			{
+				PreConfig:          revoke("f_ov(integer)"),
+				Config:             both,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: both,
+				Check:  testCheckOverloads(t, true, true),
+			},
+			{
+				// the other overload is not in the configuration of this resource: no change
+				Config: grant("int", "f_ov(integer)"),
+				Check:  testCheckOverloads(t, true, false),
+			},
+			{
+				PreConfig:          revoke("f_ov(text)"),
+				Config:             grant("int", "f_ov(integer)"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: false,
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantFunctionBareName checks that a function given by its name only keeps being read by name
+// (PostgreSQL refuses a bare name which is ambiguous, so the function is not overloaded).
+func TestAccPostgresqlGrantFunctionBareName(t *testing.T) {
+	skipIfNotAcc(t)
+	defer testSetupOverloads(t)()
+	dbExecute(t, testPostgresDSN(t), "CREATE FUNCTION test_ov_schema.f_one() RETURNS int AS $$ select 1 $$ LANGUAGE SQL")
+	dbExecute(t, testPostgresDSN(t), "REVOKE ALL ON FUNCTION test_ov_schema.f_one() FROM PUBLIC")
+
+	config := `
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_ov_role"
+  schema      = "test_ov_schema"
+  object_type = "function"
+  privileges  = ["EXECUTE"]
+  objects     = ["f_one"]
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: func(*terraform.State) error {
+					return testFunctionPrivilege(t, "test_ov_role", "test_ov_schema.f_one()", true)
+				},
+			},
+			{
+				PreConfig: func() {
+					dbExecute(t, testPostgresDSN(t), "REVOKE EXECUTE ON FUNCTION test_ov_schema.f_one() FROM test_ov_role")
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+// testGrantorsQuery returns the grantor and privilege of the ACL entries of an object for a role, as
+// "grantor:PRIVILEGE" sorted, e.g. {"test_own_owner:SELECT"}.
+func testCheckGrantors(t *testing.T, aclQuery string, want []string) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		db, err := sql.Open("postgres", testPostgresDSN(t))
+		if err != nil {
+			return err
+		}
+		defer closeDB(t, db)
+		var got pq.StringArray
+		if err := db.QueryRow(aclQuery).Scan(&got); err != nil {
+			return fmt.Errorf("could not read the ACL: %w", err)
+		}
+		sort.Strings(got)
+		sort.Strings(want)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			return fmt.Errorf("ACL entries (grantor:privilege) are %v, expected %v", got, want)
+		}
+		return nil
+	}
+}
+
+// TestAccPostgresqlGrantObjectsOfAnotherOwner grants privileges on named objects which belong to a role which
+// is neither the connected user nor a superuser. A superuser grants them in the name of the owner; a user who
+// is not a superuser has to be made a member of the owner by the provider. In both cases the grantor
+// recorded in the ACL is the owner of the object.
+func TestAccPostgresqlGrantObjectsOfAnotherOwner(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dsn := testPostgresDSN(t)
+	dbExecute(t, dsn, "CREATE ROLE test_own_owner NOLOGIN")
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_own_grantee LOGIN PASSWORD '%s'", testRolePassword))
+	dbExecute(t, dsn, "CREATE SCHEMA test_own_schema")
+	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_own_schema TO test_own_grantee")
+	// A second schema without any table: the owners of its objects cannot be found from its tables.
+	dbExecute(t, dsn, "CREATE SCHEMA test_own_schema2")
+	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_own_schema2 TO test_own_grantee")
+	defer func() {
+		dbExecute(t, dsn, "GRANT test_own_owner TO CURRENT_USER")
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_own_schema CASCADE")
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_own_schema2 CASCADE")
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_own_grantee")
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_own_owner")
+	}()
+
+	// The objects are created by their owner. A user who is not a superuser becomes a member of the owner
+	// for this, and leaves the role afterwards.
+	script := `
+SET ROLE test_own_owner;
+CREATE TABLE test_own_schema.t (a int);
+CREATE SEQUENCE test_own_schema.s;
+CREATE FUNCTION test_own_schema.f() RETURNS int AS $$ select 1 $$ LANGUAGE SQL;
+CREATE FUNCTION test_own_schema.g(a integer) RETURNS int AS $$ select 1 $$ LANGUAGE SQL;
+REVOKE ALL ON FUNCTION test_own_schema.f() FROM PUBLIC;
+REVOKE ALL ON FUNCTION test_own_schema.g(integer) FROM PUBLIC;
+CREATE TYPE test_own_schema2.ty AS ENUM ('a');
+CREATE DOMAIN test_own_schema2.dom AS integer;
+REVOKE ALL ON TYPE test_own_schema2.ty FROM PUBLIC;
+REVOKE ALL ON DOMAIN test_own_schema2.dom FROM PUBLIC;
+CREATE SEQUENCE test_own_schema2.s;
+CREATE FUNCTION test_own_schema2.f() RETURNS int AS $$ select 1 $$ LANGUAGE SQL;
+CREATE FUNCTION test_own_schema2.g(a integer) RETURNS int AS $$ select 1 $$ LANGUAGE SQL;
+REVOKE ALL ON FUNCTION test_own_schema2.f() FROM PUBLIC;
+REVOKE ALL ON FUNCTION test_own_schema2.g(integer) FROM PUBLIC;
+RESET ROLE;
+`
+	dbExecute(t, dsn, "GRANT test_own_owner TO CURRENT_USER")
+	dbExecute(t, dsn, "GRANT USAGE, CREATE ON SCHEMA test_own_schema, test_own_schema2 TO test_own_owner")
+	dbExecute(t, dsn, script+"REVOKE test_own_owner FROM CURRENT_USER;")
+
+	grantors := func(schemaName, catalog, nameColumn, aclColumn, name string) string {
+		return fmt.Sprintf(`SELECT coalesce(array_agg(pg_get_userbyid(p.grantor) || ':' || p.privilege_type), '{}')
+FROM %[1]s o JOIN pg_namespace n ON n.oid = o.%[5]s, aclexplode(o.%[3]s) p
+WHERE n.nspname = '%[6]s' AND o.%[2]s = '%[4]s' AND p.grantee = 'test_own_grantee'::regrole`,
+			catalog, nameColumn, aclColumn, name, map[string]string{"pg_class": "relnamespace", "pg_proc": "pronamespace", "pg_type": "typnamespace"}[catalog], schemaName)
+	}
+
+	cases := []struct {
+		name       string
+		schema     string
+		objectType string
+		objects    string
+		privileges string
+		acl        string
+		want       []string
+	}{
+		{"table", "test_own_schema", "table", `["t"]`, `["SELECT", "INSERT"]`, grantors("test_own_schema", "pg_class", "relname", "relacl", "t"), []string{"test_own_owner:SELECT", "test_own_owner:INSERT"}},
+		{"sequence", "test_own_schema", "sequence", `["s"]`, `["USAGE"]`, grantors("test_own_schema", "pg_class", "relname", "relacl", "s"), []string{"test_own_owner:USAGE"}},
+		{"function", "test_own_schema", "function", `["f"]`, `["EXECUTE"]`, grantors("test_own_schema", "pg_proc", "proname", "proacl", "f"), []string{"test_own_owner:EXECUTE"}},
+		{"function with arguments", "test_own_schema", "function", `["g(integer)"]`, `["EXECUTE"]`, grantors("test_own_schema", "pg_proc", "proname", "proacl", "g"), []string{"test_own_owner:EXECUTE"}},
+		{"type", "test_own_schema2", "type", `["ty"]`, `["USAGE"]`, grantors("test_own_schema2", "pg_type", "typname", "typacl", "ty"), []string{"test_own_owner:USAGE"}},
+		{"domain", "test_own_schema2", "domain", `["dom"]`, `["USAGE"]`, grantors("test_own_schema2", "pg_type", "typname", "typacl", "dom"), []string{"test_own_owner:USAGE"}},
+		{"sequence in a schema without table", "test_own_schema2", "sequence", `["s"]`, `["USAGE"]`, grantors("test_own_schema2", "pg_class", "relname", "relacl", "s"), []string{"test_own_owner:USAGE"}},
+		{"function in a schema without table", "test_own_schema2", "function", `["f"]`, `["EXECUTE"]`, grantors("test_own_schema2", "pg_proc", "proname", "proacl", "f"), []string{"test_own_owner:EXECUTE"}},
+		{"function with arguments in a schema without table", "test_own_schema2", "function", `["g(integer)"]`, `["EXECUTE"]`, grantors("test_own_schema2", "pg_proc", "proname", "proacl", "g"), []string{"test_own_owner:EXECUTE"}},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			tfConfig := fmt.Sprintf(`
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_own_grantee"
+  schema      = "%s"
+  object_type = "%s"
+  objects     = %s
+  privileges  = %s
+}
+`, c.schema, c.objectType, c.objects, c.privileges)
+			resource.Test(t, resource.TestCase{
+				PreCheck: func() {
+					testAccPreCheck(t)
+					testCheckCompatibleVersion(t, featurePrivileges)
+				},
+				Providers: testAccProviders,
+				Steps: []resource.TestStep{
+					{
+						Config: tfConfig,
+						Check:  testCheckGrantors(t, c.acl, c.want),
+					},
+					{
+						Config:  tfConfig,
+						Destroy: true,
+						Check:   testCheckGrantors(t, c.acl, []string{}),
+					},
+				},
+			})
+		})
+	}
+}
+
+// TestAccPostgresqlGrantMaintainBefore17 checks that the privilege MAINTAIN, which tables have since PostgreSQL 17,
+// is refused with a clear error by the older versions (the test is skipped from version 17, where
+// TestAccPostgresqlGrantPrivilegeMatrix grants it).
+func TestAccPostgresqlGrantMaintainBefore17(t *testing.T) {
+	skipIfNotAcc(t)
+
+	for _, objects := range []string{"", `objects = ["t"]`} {
+		resource.Test(t, resource.TestCase{
+			PreCheck: func() {
+				testAccPreCheck(t)
+				db, err := testAccProvider.Meta().(*Client).Connect()
+				if err != nil {
+					t.Fatalf("could not connect to database: %v", err)
+				}
+				if db.featureSupported(featureMaintainPrivilege) {
+					t.Skipf("MAINTAIN exists in PostgreSQL %s", db.version)
+				}
+			},
+			Providers: testAccProviders,
+			Steps: []resource.TestStep{
+				{
+					Config: fmt.Sprintf(`
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "public"
+  schema      = "public"
+  object_type = "table"
+  privileges  = ["SELECT", "MAINTAIN"]
+  %s
+}
+`, objects),
+					ExpectError: regexp.MustCompile("MAINTAIN is not an allowed privilege for object type table"),
+				},
+			},
+		})
+	}
+}
+
+func TestGrantedByQueries(t *testing.T) {
+	d := schema.TestResourceDataRaw(t, resourcePostgreSQLGrant().Schema, map[string]any{
+		"object_type":       "table",
+		"schema":            "public",
+		"objects":           []any{"t"},
+		"role":              "r",
+		"granted_by":        "g",
+		"privileges":        []any{"SELECT"},
+		"with_grant_option": true,
+	})
+	if got, want := createGrantQuery(d, []string{"SELECT"}), `GRANT SELECT ON TABLE "public"."t" TO "r" WITH GRANT OPTION GRANTED BY "g"`; got != want {
+		t.Errorf("grant query is %s, expected %s", got, want)
+	}
+	if got, want := createRevokeQuery(d.Get), `REVOKE SELECT ON TABLE "public"."t" FROM "r" GRANTED BY "g"`; got != want {
+		t.Errorf("revoke query is %s, expected %s", got, want)
+	}
+}
+
+// testSkipUnlessGrantedBy skips the test before PostgreSQL 19, where GRANTED BY is only accepted for the current user.
+func testSkipUnlessGrantedBy(t *testing.T) {
+	db, err := testAccProvider.Meta().(*Client).Connect()
+	if err != nil {
+		t.Fatalf("could not connect to database: %v", err)
+	}
+	if !db.featureSupported(featureGrantedBy) {
+		t.Skipf("GRANTED BY is a clause of the object privileges since PostgreSQL 19, not of %s", db.version)
+	}
+}
+
+// testSetupGrantedBy creates test_gb_owner, test_gb_grantor and test_gb_grantee, and the table
+// test_gb_schema.t, owned by test_gb_owner. As the connected user is perhaps not a superuser, it joins the owner
+// for the time of the setup, as the provider does.
+func testSetupGrantedBy(t *testing.T) func() {
+	dsn := testPostgresDSN(t)
+	for _, role := range []string{"test_gb_owner", "test_gb_grantor", "test_gb_grantee"} {
+		dbExecute(t, dsn, "CREATE ROLE "+role+" NOLOGIN")
+	}
+	dbExecute(t, dsn, "CREATE SCHEMA test_gb_schema")
+	dbExecute(t, dsn, "GRANT USAGE, CREATE ON SCHEMA test_gb_schema TO test_gb_owner")
+	dbExecute(t, dsn, "GRANT test_gb_owner TO CURRENT_USER")
+	dbExecute(t, dsn, `
+SET ROLE test_gb_owner;
+CREATE TABLE test_gb_schema.t (a int);
+RESET ROLE;
+REVOKE test_gb_owner FROM CURRENT_USER;`)
+	return func() {
+		dbExecute(t, dsn, "GRANT test_gb_owner TO CURRENT_USER")
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_gb_schema CASCADE")
+		for _, role := range []string{"test_gb_grantee", "test_gb_grantor", "test_gb_owner"} {
+			dbExecute(t, dsn, "DROP ROLE IF EXISTS "+role)
+		}
+	}
+}
+
+// testGrantedByACL checks the ACL entries "grantor:PRIVILEGE" of test_gb_grantee on test_gb_schema.t.
+func testGrantedByACL(t *testing.T, want ...string) resource.TestCheckFunc {
+	return testCheckGrantors(t, `SELECT coalesce(array_agg(pg_get_userbyid(p.grantor) || ':' || p.privilege_type), '{}')
+FROM pg_class c, aclexplode(c.relacl) p
+WHERE c.oid = 'test_gb_schema.t'::regclass AND p.grantee = 'test_gb_grantee'::regrole`, want)
+}
+
+func testGrantedByConfig(grantedBy string, privileges string) string {
+	return fmt.Sprintf(`
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_gb_grantee"
+  schema      = "test_gb_schema"
+  object_type = "table"
+  objects     = ["t"]
+  privileges  = %s
+  granted_by  = "%s"
+}
+`, privileges, grantedBy)
+}
+
+// TestAccPostgresqlGrantGrantedByUnsupported checks the error of the versions where GRANTED BY is not a real clause.
+func TestAccPostgresqlGrantGrantedByUnsupported(t *testing.T) {
+	skipIfNotAcc(t)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			db, err := testAccProvider.Meta().(*Client).Connect()
+			if err != nil {
+				t.Fatalf("could not connect to database: %v", err)
+			}
+			if db.featureSupported(featureGrantedBy) {
+				t.Skipf("GRANTED BY is supported by PostgreSQL %s", db.version)
+			}
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config:      testGrantedByConfig("postgres", `["SELECT"]`),
+				ExpectError: regexp.MustCompile("granted_by is not supported for this Postgres version"),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantGrantedByOwner grants as the owner of the table, in both modes (a user who is not a
+// superuser joins the owner during the change), and removes the grant with REVOKE ... GRANTED BY.
+func TestAccPostgresqlGrantGrantedByOwner(t *testing.T) {
+	skipIfNotAcc(t)
+
+	revokeOutside := func() {
+		dsn := testPostgresDSN(t)
+		dbExecute(t, dsn, "GRANT test_gb_owner TO CURRENT_USER")
+		dbExecute(t, dsn, "REVOKE SELECT ON test_gb_schema.t FROM test_gb_grantee GRANTED BY test_gb_owner")
+		dbExecute(t, dsn, "REVOKE test_gb_owner FROM CURRENT_USER")
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testSkipUnlessGrantedBy(t)
+			t.Cleanup(testSetupGrantedBy(t))
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: testGrantedByConfig("test_gb_owner", `["SELECT"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:SELECT"),
+			},
+			{
+				Config: testGrantedByConfig("test_gb_owner", `["SELECT", "INSERT"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:SELECT", "test_gb_owner:INSERT"),
+			},
+			{
+				PreConfig:          revokeOutside,
+				Config:             testGrantedByConfig("test_gb_owner", `["SELECT", "INSERT"]`),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: testGrantedByConfig("test_gb_owner", `["SELECT", "INSERT"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:SELECT", "test_gb_owner:INSERT"),
+			},
+			{
+				Config:  testGrantedByConfig("test_gb_owner", `["SELECT", "INSERT"]`),
+				Destroy: true,
+				Check:   testGrantedByACL(t),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantGrantedByOtherRole uses a grantor which is not the owner: a role which holds the grant
+// option. Only the entries of this grantor are read, changed and removed; the privileges which the owner
+// granted to the same role are left alone.
+func TestAccPostgresqlGrantGrantedByOtherRole(t *testing.T) {
+	skipIfNotAcc(t)
+	skipIfNotSuperuser(t)
+
+	dsn := testPostgresDSN(t)
+	config := func(privileges string) string { return testGrantedByConfig("test_gb_grantor", privileges) }
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testSkipUnlessGrantedBy(t)
+			t.Cleanup(testSetupGrantedBy(t))
+			dbExecute(t, dsn, "GRANT SELECT, INSERT, UPDATE ON test_gb_schema.t TO test_gb_grantor WITH GRANT OPTION")
+			// granted by the owner, not by the grantor of the resource
+			dbExecute(t, dsn, "GRANT INSERT ON test_gb_schema.t TO test_gb_grantee")
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: config(`["SELECT"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:INSERT", "test_gb_grantor:SELECT"),
+			},
+			{
+				Config: config(`["SELECT", "UPDATE"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:INSERT", "test_gb_grantor:SELECT", "test_gb_grantor:UPDATE"),
+			},
+			{
+				// the owner grants the same privilege: it is not the one of the resource, the revoke is seen
+				PreConfig: func() {
+					dbExecute(t, dsn, "GRANT SELECT ON test_gb_schema.t TO test_gb_grantee")
+					dbExecute(t, dsn, "REVOKE SELECT ON test_gb_schema.t FROM test_gb_grantee GRANTED BY test_gb_grantor")
+				},
+				Config:             config(`["SELECT", "UPDATE"]`),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config(`["SELECT", "UPDATE"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:INSERT", "test_gb_owner:SELECT", "test_gb_grantor:SELECT", "test_gb_grantor:UPDATE"),
+			},
+			{
+				// what the owner grants is not managed: no change
+				PreConfig: func() {
+					dbExecute(t, dsn, "GRANT UPDATE ON test_gb_schema.t TO test_gb_grantee GRANTED BY test_gb_owner")
+				},
+				Config:   config(`["SELECT", "UPDATE"]`),
+				PlanOnly: true,
+			},
+			{
+				Config:  config(`["SELECT", "UPDATE"]`),
+				Destroy: true,
+				Check:   testGrantedByACL(t, "test_gb_owner:INSERT", "test_gb_owner:SELECT", "test_gb_owner:UPDATE"),
+			},
+		},
+	})
+}
