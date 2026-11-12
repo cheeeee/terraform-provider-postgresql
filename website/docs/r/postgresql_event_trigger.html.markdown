@@ -47,13 +47,13 @@ resource "postgresql_event_trigger" "event_trigger" {
 
 * `name` - (Required) The name of the event trigger.
 
-* `on` - (Required) The name of the on event the trigger will listen to. The allowed names are "ddl_command_start", "ddl_command_end", "sql_drop" or "table_rewrite".
+* `on` - (Required) The name of the on event the trigger will listen to. The allowed names are "ddl_command_start", "ddl_command_end", "sql_drop", "table_rewrite" or "login". The "login" event requires PostgreSQL 17 or above.
 
 * `function` - (Required) A function that is declared as taking no argument and returning type event_trigger.
 
 * `function_schema` - (Required) Schema where the function is located.
 
-* `filter` - (Optional) Lists of filter variables to restrict the firing of the trigger.  Currently the only supported filter_variable is TAG.
+* `filter` - (Optional) Filter to restrict the firing of the trigger. Currently the only supported filter_variable is TAG, and only one `filter` block is allowed because PostgreSQL does not accept the same filter variable twice.
   * `variable` - (Required) The name of a variable used to filter events. Currently the only supported value is TAG.
   * `values` - (Required) The name of the filter variable name. For TAG, this means a list of command tags (e.g., 'DROP FUNCTION').
 
@@ -62,7 +62,9 @@ resource "postgresql_event_trigger" "event_trigger" {
 
 * `status` - (Optional) These configure the firing of event triggers. The allowed names are "disable", "enable", "enable_replica" or "enable_always". Default is "enable".
 
-* `owner` - (Required) The user name of the owner of the event trigger. You can't use 'current_role', 'current_user' or 'session_user' in order to avoid drifts.
+* `owner` - (Required) The user name of the owner of the event trigger. You can't use 'current_role', 'current_user' or 'session_user' in order to avoid drifts. On PostgreSQL, the owner of an event trigger must be a superuser.
+
+* `drop_cascade` - (Optional) Automatically drop objects that depend on the event trigger, and in turn all objects that depend on those objects. Drop RESTRICT is the default. (Default: false)
 
 ## Import Example
 

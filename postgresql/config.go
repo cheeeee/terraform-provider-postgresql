@@ -53,6 +53,10 @@ const (
 	featureMaintainPrivilege
 	featureScramSHA256
 	featureScramIterations
+	featureEventTriggerLogin
+	featureLogicalSlotTwoPhase
+	featureLogicalSlotFailover
+	featureDefaultPrivilegesLargeObjects
 )
 
 var (
@@ -138,6 +142,14 @@ var (
 
 		// scram_iterations setting
 		featureScramIterations: semver.MustParseRange(">=16.0.0"),
+		// Event triggers on the login event (PG 17+)
+		featureEventTriggerLogin: semver.MustParseRange(">=17.0.0"),
+		// twophase argument of pg_create_logical_replication_slot (PG 14+)
+		featureLogicalSlotTwoPhase: semver.MustParseRange(">=14.0.0"),
+		// failover argument of pg_create_logical_replication_slot (PG 17+)
+		featureLogicalSlotFailover: semver.MustParseRange(">=17.0.0"),
+		// ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS (PG 18+)
+		featureDefaultPrivilegesLargeObjects: semver.MustParseRange(">=18.0.0"),
 	}
 )
 

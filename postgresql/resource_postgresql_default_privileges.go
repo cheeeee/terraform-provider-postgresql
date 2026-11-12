@@ -56,8 +56,9 @@ func resourcePostgreSQLDefaultPrivileges() *schema.Resource {
 					"routine",
 					"type",
 					"schema",
+					"large_object",
 				}, false),
-				Description: "The PostgreSQL object type to set the default privileges on (one of: table, sequence, function, routine, type, schema)",
+				Description: "The PostgreSQL object type to set the default privileges on (one of: table, sequence, function, routine, type, schema, large_object)",
 			},
 			"privileges": {
 				Type:        schema.TypeSet,
@@ -77,15 +78,35 @@ func resourcePostgreSQLDefaultPrivileges() *schema.Resource {
 	}
 }
 
-func resourcePostgreSQLDefaultPrivilegesRead(db *DBConnection, d *schema.ResourceData) error {
+// defaultPrivilegesObjectClasses maps object_type to the class keyword of
+// ALTER DEFAULT PRIVILEGES and to the pg_default_acl.defaclobjtype code.
+var defaultPrivilegesObjectClasses = map[string]struct {
+	class  string
+	defacl string
+}{
+	"table":        {"TABLES", "r"},
+	"sequence":     {"SEQUENCES", "S"},
+	"function":     {"FUNCTIONS", "f"},
+	"routine":      {"ROUTINES", "f"},
+	"type":         {"TYPES", "T"},
+	"schema":       {"SCHEMAS", "n"},
+	"large_object": {"LARGE OBJECTS", "L"},
+}
+
+// validateDefaultPrivilegesObjectType refuses the object types and schema
+// combinations which this Postgres version or PostgreSQL itself does not support.
+func validateDefaultPrivilegesObjectType(db *DBConnection, d *schema.ResourceData) error {
 	pgSchema := d.Get("schema").(string)
 	objectType := d.Get("object_type").(string)
 
-	if pgSchema != "" && objectType == "schema" && !db.featureSupported(featurePrivilegesOnSchemas) {
-		return fmt.Errorf(
-			"changing default privileges for schemas is not supported for this Postgres version (%s)",
-			db.version,
-		)
+	if objectType == "schema" && pgSchema != "" {
+		if !db.featureSupported(featurePrivilegesOnSchemas) {
+			return fmt.Errorf(
+				"changing default privileges for schemas is not supported for this Postgres version (%s)",
+				db.version,
+			)
+		}
+		return fmt.Errorf("cannot specify `schema` when `object_type` is `schema`: PostgreSQL has no default privileges for schemas inside a schema")
 	}
 
 	if objectType == "routine" && !db.featureSupported(featureRoutine) {
@@ -93,6 +114,26 @@ func resourcePostgreSQLDefaultPrivilegesRead(db *DBConnection, d *schema.Resourc
 			"object type ROUTINE is not supported for this Postgres version (%s)",
 			db.version,
 		)
+	}
+
+	if objectType == "large_object" {
+		if !db.featureSupported(featureDefaultPrivilegesLargeObjects) {
+			return fmt.Errorf(
+				"object type LARGE OBJECTS is not supported for this Postgres version (%s)",
+				db.version,
+			)
+		}
+		if pgSchema != "" {
+			return fmt.Errorf("cannot specify `schema` when `object_type` is `large_object`: large objects have no schema")
+		}
+	}
+
+	return nil
+}
+
+func resourcePostgreSQLDefaultPrivilegesRead(db *DBConnection, d *schema.ResourceData) error {
+	if err := validateDefaultPrivilegesObjectType(db, d); err != nil {
+		return err
 	}
 
 	exists, err := checkRoleDBSchemaExists(db, d)
@@ -114,24 +155,8 @@ func resourcePostgreSQLDefaultPrivilegesRead(db *DBConnection, d *schema.Resourc
 }
 
 func resourcePostgreSQLDefaultPrivilegesCreate(db *DBConnection, d *schema.ResourceData) error {
-	pgSchema := d.Get("schema").(string)
-	objectType := d.Get("object_type").(string)
-
-	if pgSchema != "" && objectType == "schema" {
-		if !db.featureSupported(featurePrivilegesOnSchemas) {
-			return fmt.Errorf(
-				"changing default privileges for schemas is not supported for this Postgres version (%s)",
-				db.version,
-			)
-		}
-		return fmt.Errorf("cannot specify `schema` when `object_type` is `schema`")
-	}
-
-	if objectType == "routine" && !db.featureSupported(featureRoutine) {
-		return fmt.Errorf(
-			"object type ROUTINE is not supported for this Postgres version (%s)",
-			db.version,
-		)
+	if err := validateDefaultPrivilegesObjectType(db, d); err != nil {
+		return err
 	}
 
 	if d.Get("with_grant_option").(bool) && strings.ToLower(d.Get("role").(string)) == "public" {
@@ -239,37 +264,34 @@ func readRoleDefaultPrivileges(txn *sql.Tx, db *DBConnection, d *schema.Resource
 	if err != nil {
 		return err
 	}
-
-	var query string
-	var queryArgs []any
-
-	if pgSchema != "" {
-		query = `SELECT array_agg(prtype) FROM (
-		SELECT defaclnamespace, (aclexplode(defaclacl)).* FROM pg_default_acl
-		WHERE defaclobjtype = $3
-	) AS t (namespace, grantor_oid, grantee_oid, prtype, grantable)
-	JOIN pg_namespace ON pg_namespace.oid = namespace
-	WHERE grantee_oid = $1 AND nspname = $2 AND pg_get_userbyid(grantor_oid) = $4;
-`
-		queryArgs = []any{roleOID, pgSchema, objectTypes[objectType], owner}
-	} else {
-		query = `SELECT array_agg(prtype) FROM (
-		SELECT defaclnamespace, (aclexplode(defaclacl)).* FROM pg_default_acl
-		WHERE defaclobjtype = $2
-	) AS t (namespace, grantor_oid, grantee_oid, prtype, grantable)
-	WHERE grantee_oid = $1 AND namespace = 0 AND pg_get_userbyid(grantor_oid) = $3;
-`
-		queryArgs = []any{roleOID, objectTypes[objectType], owner}
+	ownerOID, err := getRoleOID(txn, owner)
+	if err != nil {
+		return err
 	}
 
-	// This query aggregates the list of default privileges type (prtype)
-	// for the role (grantee), owner (grantor), schema (namespace name)
-	// and the specified object type (defaclobjtype).
+	// PostgreSQL stores a default ACL only when it differs from the built-in default
+	// (acldefault): a schema entry takes precedence over the global one, and when neither
+	// exists the built-in default applies. This query reads the effective ACL of the owner,
+	// so the privileges granted to PUBLIC by default (e.g. EXECUTE on functions) are seen too.
+	// The grant option is true only if every privilege is granted WITH GRANT OPTION.
+	query := `SELECT array_agg(prtype), bool_and(grantable) FROM (
+		SELECT (aclexplode(acl)).* FROM (
+			SELECT COALESCE(
+				(SELECT defaclacl FROM pg_default_acl WHERE defaclrole = $3 AND defaclobjtype = $1
+					AND defaclnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2)),
+				(SELECT defaclacl FROM pg_default_acl WHERE defaclrole = $3 AND defaclobjtype = $1
+					AND defaclnamespace = 0),
+				acldefault($1::"char", $3)
+			) AS acl
+		) AS acls
+	) AS t (grantor_oid, grantee_oid, prtype, grantable)
+	WHERE grantee_oid = $4 AND grantor_oid = $3;`
 
 	var privileges pq.ByteaArray
+	var grantOption sql.NullBool
 	if err := txn.QueryRow(
-		query, queryArgs...,
-	).Scan(&privileges); err != nil {
+		query, defaultPrivilegesObjectClasses[objectType].defacl, pgSchema, ownerOID, roleOID,
+	).Scan(&privileges, &grantOption); err != nil {
 		return fmt.Errorf("could not read default privileges: %w", err)
 	}
 
@@ -287,6 +309,9 @@ func readRoleDefaultPrivileges(txn *sql.Tx, db *DBConnection, d *schema.Resource
 
 	if !privilegesEqual {
 		d.Set("privileges", privilegesSet)
+	}
+	if len(privileges) != 0 {
+		d.Set("with_grant_option", grantOption.Bool)
 	}
 	d.SetId(generateDefaultPrivilegesID(d))
 
@@ -314,11 +339,11 @@ func grantRoleDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
 		inSchema = fmt.Sprintf("IN SCHEMA %s", pq.QuoteIdentifier(pgSchema))
 	}
 
-	query := fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s %s GRANT %s ON %sS TO %s",
+	query := fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s %s GRANT %s ON %s TO %s",
 		pq.QuoteIdentifier(d.Get("owner").(string)),
 		inSchema,
 		strings.Join(privileges, ","),
-		strings.ToUpper(d.Get("object_type").(string)),
+		defaultPrivilegesObjectClasses[d.Get("object_type").(string)].class,
 		pq.QuoteIdentifier(role),
 	)
 
@@ -346,10 +371,10 @@ func revokeRoleDefaultPrivileges(txn *sql.Tx, d *schema.ResourceData) error {
 		inSchema = fmt.Sprintf("IN SCHEMA %s", pq.QuoteIdentifier(pgSchema))
 	}
 	query := fmt.Sprintf(
-		"ALTER DEFAULT PRIVILEGES FOR ROLE %s %s REVOKE ALL ON %sS FROM %s",
+		"ALTER DEFAULT PRIVILEGES FOR ROLE %s %s REVOKE ALL ON %s FROM %s",
 		pq.QuoteIdentifier(d.Get("owner").(string)),
 		inSchema,
-		strings.ToUpper(d.Get("object_type").(string)),
+		defaultPrivilegesObjectClasses[d.Get("object_type").(string)].class,
 		pq.QuoteIdentifier(d.Get("role").(string)),
 	)
 

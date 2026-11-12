@@ -3,6 +3,8 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
+	"log"
+
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
@@ -22,6 +24,18 @@ func resourcePostgreSQLPhysicalReplicationSlot() *schema.Resource {
 				Required: true,
 				ForceNew: true,
 			},
+			"immediately_reserve": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Computed:    true,
+				ForceNew:    true,
+				Description: "Reserves the WAL immediately at creation, so that a standby can always catch up. Read back as whether the slot has reserved WAL",
+				// WAL which is reserved cannot be released without dropping the slot: a configuration
+				// which sets false does not replace a slot which has reserved WAL.
+				DiffSuppressFunc: func(_, old, new string, _ *schema.ResourceData) bool {
+					return old == "true" && new == "false"
+				},
+			},
 		},
 	}
 }
@@ -29,12 +43,17 @@ func resourcePostgreSQLPhysicalReplicationSlot() *schema.Resource {
 func resourcePostgreSQLPhysicalReplicationSlotCreate(db *DBConnection, d *schema.ResourceData) error {
 	name := d.Get("name").(string)
 	sql := "SELECT FROM pg_create_physical_replication_slot($1)"
-	if _, err := db.Exec(sql, name); err != nil {
+	args := []interface{}{name}
+	if d.Get("immediately_reserve").(bool) {
+		sql = "SELECT FROM pg_create_physical_replication_slot($1, $2)"
+		args = append(args, true)
+	}
+	if _, err := db.Exec(sql, args...); err != nil {
 		return fmt.Errorf("could not create physical ReplicationSlot %s: %w", name, err)
 	}
 	d.SetId(name)
 
-	return nil
+	return resourcePostgreSQLPhysicalReplicationSlotRead(db, d)
 }
 
 func resourcePostgreSQLPhysicalReplicationSlotExists(db *DBConnection, d *schema.ResourceData) (bool, error) {
@@ -52,7 +71,20 @@ func resourcePostgreSQLPhysicalReplicationSlotExists(db *DBConnection, d *schema
 }
 
 func resourcePostgreSQLPhysicalReplicationSlotRead(db *DBConnection, d *schema.ResourceData) error {
+	var reserved bool
+	query := "SELECT restart_lsn IS NOT NULL FROM pg_catalog.pg_replication_slots WHERE slot_name = $1 AND slot_type = 'physical'"
+	err := db.QueryRow(query, d.Id()).Scan(&reserved)
+	switch {
+	case err == sql.ErrNoRows:
+		log.Printf("[WARN] PostgreSQL physical ReplicationSlot (%s) not found", d.Id())
+		d.SetId("")
+		return nil
+	case err != nil:
+		return fmt.Errorf("error reading physical ReplicationSlot: %w", err)
+	}
+
 	d.Set("name", d.Id())
+	d.Set("immediately_reserve", reserved)
 	return nil
 }
 

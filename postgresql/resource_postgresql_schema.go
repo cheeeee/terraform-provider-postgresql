@@ -372,11 +372,27 @@ func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) er
 	}
 	defer deferredRollback(txn)
 
-	if err := setSchemaName(txn, d, databaseName); err != nil {
-		return err
+	// If the authenticated user is not a superuser, it needs to be a member of
+	// the old and the new owners to change the owner of the schema (see
+	// resourcePostgreSQLSchemaCreate).
+	var rolesToGrant []string
+	if d.HasChange(schemaOwnerAttr) {
+		oldOwner, newOwner := d.GetChange(schemaOwnerAttr)
+		if newOwner.(string) != "" {
+			rolesToGrant = append(rolesToGrant, newOwner.(string))
+		}
+		if oldOwner.(string) != "" && oldOwner.(string) != newOwner.(string) {
+			rolesToGrant = append(rolesToGrant, oldOwner.(string))
+		}
 	}
 
-	if err := setSchemaOwner(txn, d); err != nil {
+	if err := withRolesGranted(txn, rolesToGrant, func() error {
+		if err := setSchemaName(txn, d, databaseName); err != nil {
+			return err
+		}
+
+		return setSchemaOwner(txn, d)
+	}); err != nil {
 		return err
 	}
 
@@ -462,7 +478,7 @@ func setSchemaPolicy(txn *sql.Tx, d *schema.ResourceData) error {
 			case err != nil:
 				return fmt.Errorf("error reading schema: %w", err)
 			default:
-				queries = append(queries, rolePolicy.Revokes(schemaName)...)
+				queries = append(queries, revokeAllSchemaPolicy(rolePolicy, schemaName)...)
 			}
 		}
 	}
@@ -482,7 +498,7 @@ func setSchemaPolicy(txn *sql.Tx, d *schema.ResourceData) error {
 		{
 			oldPolicies := policies[0].(map[string]any)
 			rolePolicy := schemaPolicyToACL(oldPolicies)
-			queries = append(queries, rolePolicy.Revokes(schemaName)...)
+			queries = append(queries, revokeAllSchemaPolicy(rolePolicy, schemaName)...)
 		}
 
 		{
@@ -505,6 +521,14 @@ func setSchemaPolicy(txn *sql.Tx, d *schema.ResourceData) error {
 		}
 		return nil
 	})
+}
+
+// revokeAllSchemaPolicy returns the queries which remove the privileges of the
+// policy completely. Revokes alone would only remove the grant option of the
+// privileges granted WITH GRANT OPTION (REVOKE GRANT OPTION FOR).
+func revokeAllSchemaPolicy(rolePolicy acl.Schema, schemaName string) []string {
+	rolePolicy.GrantOptions = 0
+	return rolePolicy.Revokes(schemaName)
 }
 
 // schemaChangedPolicies walks old and new to create a set of queries that can
