@@ -1098,6 +1098,75 @@ WHERE pg_largeobject_metadata.oid::text = ANY($1)`
 	return owners, rows.Err()
 }
 
+// getRelationsOrFunctionsOwners returns the owners of the named tables, sequences (and the table of column
+// grants), functions, procedures and routines: they are not always the owners of the tables of the schema, which
+// are the only ones looked for otherwise. A function given with its argument types is resolved to its OID.
+func getRelationsOrFunctionsOwners(txn *sql.Tx, objectType, schemaName string, objects *schema.Set) ([]string, error) {
+	owners := []string{}
+	switch objectType {
+	case "table", "sequence", "column":
+		rows, err := txn.Query(`
+SELECT DISTINCT pg_roles.rolname
+FROM pg_class
+JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+JOIN pg_roles ON pg_roles.oid = pg_class.relowner
+WHERE pg_namespace.nspname = $1 AND pg_class.relname = ANY($2)`, schemaName, pq.StringArray(setToStrings(objects)))
+		if err != nil {
+			return nil, fmt.Errorf("error while looking for the owners of %s objects: %w", objectType, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var owner string
+			if err := rows.Scan(&owner); err != nil {
+				return nil, fmt.Errorf("could not scan the owner of a %s object: %w", objectType, err)
+			}
+			owners = append(owners, owner)
+		}
+		return owners, rows.Err()
+	case "function", "procedure", "routine":
+		for _, object := range objects.List() {
+			name := object.(string)
+			query := `
+SELECT rolname FROM pg_proc
+JOIN pg_namespace ON pg_namespace.oid = pronamespace
+JOIN pg_roles ON pg_roles.oid = proowner
+WHERE nspname = $1 AND proname = $2`
+			args := []any{schemaName, name}
+			if strings.Contains(name, "(") {
+				oid, err := resolveFunctionSignature(txn, schemaName, objectType, name)
+				if err != nil {
+					return nil, err
+				}
+				if oid == "" {
+					continue
+				}
+				query = "SELECT rolname FROM pg_proc JOIN pg_roles ON pg_roles.oid = proowner WHERE pg_proc.oid = $1::oid"
+				args = []any{oid}
+			}
+			rows, err := txn.Query(query, args...)
+			if err != nil {
+				return nil, fmt.Errorf("error while looking for the owner of %s %s: %w", objectType, name, err)
+			}
+			for rows.Next() {
+				var owner string
+				if err := rows.Scan(&owner); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("could not scan the owner of %s %s: %w", objectType, name, err)
+				}
+				if !sliceContainsStr(owners, owner) {
+					owners = append(owners, owner)
+				}
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return owners, nil
+}
+
 func checkRoleDBSchemaExists(db *DBConnection, d *schema.ResourceData) (bool, error) {
 	// Check the database exists
 	database := d.Get("database").(string)
@@ -1187,6 +1256,18 @@ func getRolesToGrant(txn *sql.Tx, d *schema.ResourceData) ([]string, error) {
 		owners, err = getTablesOwner(txn, schemaName)
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	if objects := d.Get("objects").(*schema.Set); objects.Len() > 0 {
+		objectOwners, err := getRelationsOrFunctionsOwners(txn, objectType, schemaName, objects)
+		if err != nil {
+			return nil, err
+		}
+		for _, owner := range objectOwners {
+			if !sliceContainsStr(owners, owner) {
+				owners = append(owners, owner)
+			}
 		}
 	}
 

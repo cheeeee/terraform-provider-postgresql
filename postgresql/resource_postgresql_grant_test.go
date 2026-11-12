@@ -2810,3 +2810,134 @@ resource "postgresql_grant" "test" {
 		},
 	})
 }
+
+// testGrantorsQuery returns the grantor and privilege of the ACL entries of an object for a role, as
+// "grantor:PRIVILEGE" sorted, e.g. {"test_own_owner:SELECT"}.
+func testCheckGrantors(t *testing.T, aclQuery string, want []string) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		db, err := sql.Open("postgres", testPostgresDSN(t))
+		if err != nil {
+			return err
+		}
+		defer closeDB(t, db)
+		var got pq.StringArray
+		if err := db.QueryRow(aclQuery).Scan(&got); err != nil {
+			return fmt.Errorf("could not read the ACL: %w", err)
+		}
+		sort.Strings(got)
+		sort.Strings(want)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			return fmt.Errorf("ACL entries (grantor:privilege) are %v, expected %v", got, want)
+		}
+		return nil
+	}
+}
+
+// TestAccPostgresqlGrantObjectsOfAnotherOwner grants privileges on named objects which belong to a role which
+// is neither the connected user nor a superuser. A superuser grants them in the name of the owner; a user who
+// is not a superuser has to be made a member of the owner by the provider. In both cases the grantor
+// recorded in the ACL is the owner of the object.
+func TestAccPostgresqlGrantObjectsOfAnotherOwner(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dsn := testPostgresDSN(t)
+	dbExecute(t, dsn, "CREATE ROLE test_own_owner NOLOGIN")
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_own_grantee LOGIN PASSWORD '%s'", testRolePassword))
+	dbExecute(t, dsn, "CREATE SCHEMA test_own_schema")
+	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_own_schema TO test_own_grantee")
+	// A second schema without any table: the owners of its objects cannot be found from its tables.
+	dbExecute(t, dsn, "CREATE SCHEMA test_own_schema2")
+	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_own_schema2 TO test_own_grantee")
+	defer func() {
+		dbExecute(t, dsn, "GRANT test_own_owner TO CURRENT_USER")
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_own_schema CASCADE")
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_own_schema2 CASCADE")
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_own_grantee")
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_own_owner")
+	}()
+
+	// The objects are created by their owner. A user who is not a superuser becomes a member of the owner
+	// for this, and leaves the role afterwards.
+	script := `
+SET ROLE test_own_owner;
+CREATE TABLE test_own_schema.t (a int);
+CREATE SEQUENCE test_own_schema.s;
+CREATE FUNCTION test_own_schema.f() RETURNS int AS $$ select 1 $$ LANGUAGE SQL;
+CREATE FUNCTION test_own_schema.g(a integer) RETURNS int AS $$ select 1 $$ LANGUAGE SQL;
+REVOKE ALL ON FUNCTION test_own_schema.f() FROM PUBLIC;
+REVOKE ALL ON FUNCTION test_own_schema.g(integer) FROM PUBLIC;
+CREATE TYPE test_own_schema2.ty AS ENUM ('a');
+CREATE DOMAIN test_own_schema2.dom AS integer;
+REVOKE ALL ON TYPE test_own_schema2.ty FROM PUBLIC;
+REVOKE ALL ON DOMAIN test_own_schema2.dom FROM PUBLIC;
+CREATE SEQUENCE test_own_schema2.s;
+CREATE FUNCTION test_own_schema2.f() RETURNS int AS $$ select 1 $$ LANGUAGE SQL;
+CREATE FUNCTION test_own_schema2.g(a integer) RETURNS int AS $$ select 1 $$ LANGUAGE SQL;
+REVOKE ALL ON FUNCTION test_own_schema2.f() FROM PUBLIC;
+REVOKE ALL ON FUNCTION test_own_schema2.g(integer) FROM PUBLIC;
+RESET ROLE;
+`
+	dbExecute(t, dsn, "GRANT test_own_owner TO CURRENT_USER")
+	dbExecute(t, dsn, "GRANT USAGE, CREATE ON SCHEMA test_own_schema, test_own_schema2 TO test_own_owner")
+	dbExecute(t, dsn, script+"REVOKE test_own_owner FROM CURRENT_USER;")
+
+	grantors := func(schemaName, catalog, nameColumn, aclColumn, name string) string {
+		return fmt.Sprintf(`SELECT coalesce(array_agg(pg_get_userbyid(p.grantor) || ':' || p.privilege_type), '{}')
+FROM %[1]s o JOIN pg_namespace n ON n.oid = o.%[5]s, aclexplode(o.%[3]s) p
+WHERE n.nspname = '%[6]s' AND o.%[2]s = '%[4]s' AND p.grantee = 'test_own_grantee'::regrole`,
+			catalog, nameColumn, aclColumn, name, map[string]string{"pg_class": "relnamespace", "pg_proc": "pronamespace", "pg_type": "typnamespace"}[catalog], schemaName)
+	}
+
+	cases := []struct {
+		name       string
+		schema     string
+		objectType string
+		objects    string
+		privileges string
+		acl        string
+		want       []string
+	}{
+		{"table", "test_own_schema", "table", `["t"]`, `["SELECT", "INSERT"]`, grantors("test_own_schema", "pg_class", "relname", "relacl", "t"), []string{"test_own_owner:SELECT", "test_own_owner:INSERT"}},
+		{"sequence", "test_own_schema", "sequence", `["s"]`, `["USAGE"]`, grantors("test_own_schema", "pg_class", "relname", "relacl", "s"), []string{"test_own_owner:USAGE"}},
+		{"function", "test_own_schema", "function", `["f"]`, `["EXECUTE"]`, grantors("test_own_schema", "pg_proc", "proname", "proacl", "f"), []string{"test_own_owner:EXECUTE"}},
+		{"function with arguments", "test_own_schema", "function", `["g(integer)"]`, `["EXECUTE"]`, grantors("test_own_schema", "pg_proc", "proname", "proacl", "g"), []string{"test_own_owner:EXECUTE"}},
+		{"type", "test_own_schema2", "type", `["ty"]`, `["USAGE"]`, grantors("test_own_schema2", "pg_type", "typname", "typacl", "ty"), []string{"test_own_owner:USAGE"}},
+		{"domain", "test_own_schema2", "domain", `["dom"]`, `["USAGE"]`, grantors("test_own_schema2", "pg_type", "typname", "typacl", "dom"), []string{"test_own_owner:USAGE"}},
+		{"sequence in a schema without table", "test_own_schema2", "sequence", `["s"]`, `["USAGE"]`, grantors("test_own_schema2", "pg_class", "relname", "relacl", "s"), []string{"test_own_owner:USAGE"}},
+		{"function in a schema without table", "test_own_schema2", "function", `["f"]`, `["EXECUTE"]`, grantors("test_own_schema2", "pg_proc", "proname", "proacl", "f"), []string{"test_own_owner:EXECUTE"}},
+		{"function with arguments in a schema without table", "test_own_schema2", "function", `["g(integer)"]`, `["EXECUTE"]`, grantors("test_own_schema2", "pg_proc", "proname", "proacl", "g"), []string{"test_own_owner:EXECUTE"}},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			tfConfig := fmt.Sprintf(`
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_own_grantee"
+  schema      = "%s"
+  object_type = "%s"
+  objects     = %s
+  privileges  = %s
+}
+`, c.schema, c.objectType, c.objects, c.privileges)
+			resource.Test(t, resource.TestCase{
+				PreCheck: func() {
+					testAccPreCheck(t)
+					testCheckCompatibleVersion(t, featurePrivileges)
+				},
+				Providers: testAccProviders,
+				Steps: []resource.TestStep{
+					{
+						Config: tfConfig,
+						Check:  testCheckGrantors(t, c.acl, c.want),
+					},
+					{
+						Config:  tfConfig,
+						Destroy: true,
+						Check:   testCheckGrantors(t, c.acl, []string{}),
+					},
+				},
+			})
+		})
+	}
+}
