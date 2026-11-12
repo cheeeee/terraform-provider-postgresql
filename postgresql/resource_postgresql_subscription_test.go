@@ -3,6 +3,7 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -134,9 +135,16 @@ func testAccCheckPostgresqlSubscriptionExists(n string) resource.TestCheckFunc {
 func getConnInfo(t *testing.T, dbName string) string {
 	dbConfig := getTestConfig(t)
 
+	// The publisher is the server itself. TEST_PUBLISHER_HOST is the address it
+	// can use to connect to itself, when it is not the one used by the tests.
+	host := dbConfig.Host
+	if v := os.Getenv("TEST_PUBLISHER_HOST"); v != "" {
+		host = v
+	}
+
 	return fmt.Sprintf(
 		`host=%s port=%d dbname=%s user=%s password=%s`,
-		dbConfig.Host,
+		host,
 		5432,
 		dbName,
 		dbConfig.Username,
@@ -190,7 +198,7 @@ func TestAccPostgresqlSubscription_Basic(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
-			testSuperuserPreCheck(t)
+			testCheckCanCreateSubscription(t, conninfo)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
@@ -271,7 +279,7 @@ func TestAccPostgresqlSubscription_CustomSlotName(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
-			testSuperuserPreCheck(t)
+			testCheckCanCreateSubscription(t, conninfo)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,

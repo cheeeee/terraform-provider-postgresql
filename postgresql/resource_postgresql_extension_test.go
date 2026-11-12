@@ -16,7 +16,7 @@ func TestAccPostgresqlExtension_Basic(t *testing.T) {
 			testCheckCompatibleVersion(t, featureExtension)
 			// TODO: Need to check how RDS manage to allow `rds_superuser` to create extension
 			// even it's not a real superuser
-			testSuperuserPreCheck(t)
+			testCheckCanCreateExtension(t, "pg_trgm")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
@@ -119,7 +119,7 @@ func TestAccPostgresqlExtension_SchemaRename(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureExtension)
-			testSuperuserPreCheck(t)
+			testCheckCanCreateExtension(t, "pg_trgm")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
@@ -186,7 +186,7 @@ func TestAccPostgresqlExtension_Database(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureExtension)
-			testSuperuserPreCheck(t)
+			testCheckCanCreateExtension(t, "pg_trgm")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
@@ -222,7 +222,7 @@ resource "postgresql_extension" "cascade" {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureExtension)
-			testSuperuserPreCheck(t)
+			testCheckCanCreateExtension(t, "pgcrypto")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,
@@ -271,7 +271,7 @@ resource "postgresql_extension" "cascade" {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureExtension)
-			testSuperuserPreCheck(t)
+			testCheckCanCreateExtension(t, "earthdistance")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,

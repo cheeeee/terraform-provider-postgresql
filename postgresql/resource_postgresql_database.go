@@ -156,6 +156,9 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 
 		// Needed in order to set the owner of the db if the connection user is not a
 		// superuser
+		if err := checkIAMRoleMembership(db, owner, currentUser); err != nil {
+			return err
+		}
 		ownerGranted, err := grantRoleMembership(db, owner, currentUser)
 		if err != nil {
 			return err
@@ -265,6 +268,9 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 
 		// Needed in order to set the owner of the db if the connection user is not a
 		// superuser
+		if err := checkIAMRoleMembership(db, owner, currentUser); err != nil {
+			return err
+		}
 		ownerGranted, err := grantRoleMembership(db, owner, currentUser)
 		if err != nil {
 			return err
@@ -495,6 +501,9 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 	defer deferredRollback(lockTxn)
 
 	//needed in order to set the owner of the db if the connection user is not a superuser
+	if err := checkIAMRoleMembership(db, owner, currentUser); err != nil {
+		return err
+	}
 	ownerGranted, err := grantRoleMembership(db, owner, currentUser)
 	if err != nil {
 		return err
@@ -549,6 +558,9 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 		return nil
 	}
 
+	if err := checkIAMRoleMembership(db, currentOwner, currentUser); err != nil {
+		return err
+	}
 	currentOwnerGranted, err := grantRoleMembership(db, currentOwner, currentUser)
 	if err != nil {
 		return err

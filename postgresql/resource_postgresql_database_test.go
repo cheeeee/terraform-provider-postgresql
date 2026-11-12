@@ -227,6 +227,139 @@ resource postgresql_database "test_db" {
 	})
 }
 
+// On AWS RDS, a member of rds_iam can only log in with an IAM token: the owner of
+// a database must not be granted to a user which is connected with a password.
+func TestAccPostgresqlDatabase_OwnerMemberOfRDSIAM(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	// rds_iam only exists on AWS RDS, where the test is skipped: it would lock the connected user out.
+	var exists bool
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("could not open SQL connection: %v", err)
+	}
+	if err := db.QueryRow("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_iam')").Scan(&exists); err != nil {
+		t.Fatalf("could not check if rds_iam exists: %v", err)
+	}
+	closeDB(t, db)
+	if exists {
+		t.Skip("Skip test: the role rds_iam already exists")
+	}
+
+	dbExecute(t, dsn, "CREATE ROLE rds_iam")
+	defer func() {
+		dbExecute(t, dsn, "DROP ROLE rds_iam")
+	}()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_role" "iam_owner" {
+  name  = "iam_owner"
+  roles = ["rds_iam"]
+}
+resource "postgresql_database" "iam_db" {
+  name  = "iam_db"
+  owner = postgresql_role.iam_owner.name
+}
+`,
+				ExpectError: regexp.MustCompile(`role iam_owner is a member of rds_iam: it cannot be granted to`),
+			},
+			// rds_iam itself cannot be the owner either
+			{
+				Config: `
+resource "postgresql_database" "iam_db" {
+  name  = "iam_db"
+  owner = "rds_iam"
+}
+`,
+				ExpectError: regexp.MustCompile(`role rds_iam is a member of rds_iam: it cannot be granted to`),
+			},
+			// The owner is a group which is not a member of rds_iam, the role which logs in is a member of both.
+			{
+				Config: `
+resource "postgresql_role" "iam_owner" {
+  name = "iam_owner"
+}
+resource "postgresql_role" "iam_login" {
+  name        = "iam_login"
+  login       = true
+  roles       = ["rds_iam", postgresql_role.iam_owner.name]
+  assume_role = postgresql_role.iam_owner.name
+}
+resource "postgresql_database" "iam_db" {
+  name  = "iam_db"
+  owner = postgresql_role.iam_owner.name
+}
+`,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.iam_db"),
+					resource.TestCheckResourceAttr("postgresql_database.iam_db", "owner", "iam_owner"),
+					checkUserMembership(t, config.Username, "rds_iam", false),
+				),
+			},
+		},
+	})
+}
+
+// A user which logs in with an IAM token is already a member of rds_iam:
+// it can create a database owned by another member of rds_iam.
+func TestAccPostgresqlDatabase_OwnerMemberOfRDSIAMWithIAMUser(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	var exists bool
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("could not open SQL connection: %v", err)
+	}
+	if err := db.QueryRow("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_iam')").Scan(&exists); err != nil {
+		t.Fatalf("could not check if rds_iam exists: %v", err)
+	}
+	closeDB(t, db)
+	if exists {
+		t.Skip("Skip test: the role rds_iam already exists")
+	}
+
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE rds_iam; GRANT rds_iam TO %s", config.Username))
+	defer func() {
+		dbExecute(t, dsn, "DROP ROLE rds_iam")
+	}()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_role" "iam_owner" {
+  name  = "iam_owner"
+  roles = ["rds_iam"]
+}
+resource "postgresql_database" "iam_db" {
+  name  = "iam_db"
+  owner = postgresql_role.iam_owner.name
+}
+`,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.iam_db"),
+					resource.TestCheckResourceAttr("postgresql_database.iam_db", "owner", "iam_owner"),
+				),
+			},
+		},
+	})
+}
+
 // Test the case where the connected user is already a member of the owner.
 // There were a bug which was revoking the owner anyway.
 func TestAccPostgresqlDatabase_GrantOwnerNotNeeded(t *testing.T) {

@@ -21,6 +21,9 @@ export PGUSER=$RDS_USER
 export PGSSLMODE=require
 # The master user of an RDS instance is not a superuser.
 export PGSUPERUSER=false
+# The instance cannot connect to its own public address: for the subscription
+# tests, where the publisher is the instance itself, it uses its local address.
+export TEST_PUBLISHER_HOST=127.0.0.1
 
 cd "$HERE/.."
 go test ./postgresql -count=1 -v -timeout 60m -run "${RDS_TESTS:-Parameter}"

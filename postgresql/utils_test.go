@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/lib/pq"
 )
 
 const (
@@ -42,6 +43,92 @@ func testSuperuserPreCheck(t *testing.T) {
 	if !client.config.Superuser {
 		t.Skip("Skip test: This test can be run only with a real superuser")
 	}
+}
+
+// testCheckCanExecute skips the test if the connected user cannot execute the
+// statements, which are rolled back. It is used by the tests which need privileges
+// that depend on the environment (e.g.: the master user of a managed service is not
+// a superuser but is allowed to do most of what a superuser does).
+func testCheckCanExecute(t *testing.T, what string, statements ...string) {
+	client := testAccProvider.Meta().(*Client)
+	db, err := client.Connect()
+	if err != nil {
+		t.Fatalf("could not connect to database: %v", err)
+	}
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatalf("could not start transaction: %v", err)
+	}
+	defer func() {
+		_ = txn.Rollback()
+	}()
+
+	for _, statement := range statements {
+		if _, err := txn.Exec(statement); err != nil {
+			t.Skipf("Skip test: the connected user cannot %s: %v", what, err)
+		}
+	}
+}
+
+// testCheckCanCreateExtension skips the test if the connected user cannot create the extensions.
+func testCheckCanCreateExtension(t *testing.T, names ...string) {
+	for _, name := range names {
+		testCheckCanExecute(
+			t, fmt.Sprintf("create the extension %s", name),
+			fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s CASCADE", pq.QuoteIdentifier(name)),
+		)
+	}
+}
+
+// testCheckCanCreatePublication skips the test if the connected user cannot create a publication.
+func testCheckCanCreatePublication(t *testing.T, allTables bool) {
+	statement := "CREATE PUBLICATION tf_probe_publication"
+	what := "create a publication"
+	if allTables {
+		statement += " FOR ALL TABLES"
+		what += " for all tables"
+	}
+	testCheckCanExecute(t, what, statement)
+}
+
+// testCheckCanCreateSubscription skips the test if the connected user cannot create
+// a subscription which connects to the server with conninfo.
+func testCheckCanCreateSubscription(t *testing.T, conninfo string) {
+	testCheckCanExecute(
+		t, "create a subscription",
+		fmt.Sprintf(
+			"CREATE SUBSCRIPTION tf_probe_subscription CONNECTION %s PUBLICATION tf_probe_publication WITH (create_slot = false, enabled = false, slot_name = NONE)",
+			pq.QuoteLiteral(conninfo),
+		),
+	)
+}
+
+// testCheckCanCreateLogicalReplicationSlot skips the test if the connected user
+// cannot create a logical replication slot.
+func testCheckCanCreateLogicalReplicationSlot(t *testing.T) {
+	client := testAccProvider.Meta().(*Client)
+	db, err := client.Connect()
+	if err != nil {
+		t.Fatalf("could not connect to database: %v", err)
+	}
+
+	if _, err := db.Exec("SELECT FROM pg_create_logical_replication_slot('tf_probe_slot', 'test_decoding')"); err != nil {
+		t.Skipf("Skip test: the connected user cannot create a logical replication slot: %v", err)
+	}
+	if _, err := db.Exec("SELECT pg_drop_replication_slot('tf_probe_slot')"); err != nil {
+		t.Fatalf("could not drop the replication slot: %v", err)
+	}
+}
+
+// testCheckCanSetSecurityLabel skips the test if the dummy label provider is not
+// loaded or if the connected user cannot set a label.
+func testCheckCanSetSecurityLabel(t *testing.T) {
+	testCheckCanExecute(
+		t, "set a security label of the dummy provider",
+		"CREATE ROLE tf_probe_label",
+		"SECURITY LABEL FOR dummy ON ROLE tf_probe_label IS 'classified'",
+	)
 }
 
 func getTestConfig(t *testing.T) Config {

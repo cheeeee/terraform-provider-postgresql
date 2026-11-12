@@ -111,14 +111,25 @@ func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceD
 	}
 	defer deferredRollback(txn)
 
+	// information_schema._pg_user_mappings can only be read by a superuser:
+	// the savepoint keeps the transaction usable for the fallback query.
+	if _, err := txn.Exec("SAVEPOINT user_mapping"); err != nil {
+		return fmt.Errorf("error reading user mapping: %w", err)
+	}
+
 	var userMappingOptions []string
+	optionsReadable := true
 	query := "SELECT umoptions FROM information_schema._pg_user_mappings WHERE authorization_identifier = $1 and foreign_server_name = $2"
 	err = txn.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
 
 	if err != sql.ErrNoRows && err != nil {
-		// Fallback to pg_user_mappings table if information_schema._pg_user_mappings is not available
-		query := "SELECT umoptions FROM pg_user_mappings WHERE usename = $1 and srvname = $2"
-		err = txn.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
+		if _, err := txn.Exec("ROLLBACK TO SAVEPOINT user_mapping"); err != nil {
+			return fmt.Errorf("error reading user mapping: %w", err)
+		}
+		// Fallback to pg_user_mappings table if information_schema._pg_user_mappings is not available.
+		// The options are hidden (NULL) in this view if the connected user is not allowed to see them.
+		query := "SELECT umoptions, umoptions IS NOT NULL FROM pg_user_mappings WHERE usename = $1 and srvname = $2"
+		err = txn.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions), &optionsReadable)
 	}
 
 	switch {
@@ -130,15 +141,19 @@ func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceD
 		return fmt.Errorf("error reading user mapping: %w", err)
 	}
 
-	mappedOptions := make(map[string]any)
-	for _, v := range userMappingOptions {
-		pair := strings.SplitN(v, "=", 2)
-		mappedOptions[pair[0]] = pair[1]
-	}
-
 	d.Set(userMappingUserNameAttr, username)
 	d.Set(userMappingServerNameAttr, serverName)
-	d.Set(userMappingOptionsAttr, mappedOptions)
+	if optionsReadable {
+		mappedOptions := make(map[string]any)
+		for _, v := range userMappingOptions {
+			pair := strings.SplitN(v, "=", 2)
+			mappedOptions[pair[0]] = pair[1]
+		}
+		d.Set(userMappingOptionsAttr, mappedOptions)
+	} else {
+		// The options of the state are kept: a change made outside of Terraform cannot be detected.
+		log.Printf("[WARN] The options of the PostgreSQL user mapping (%s) for server (%s) cannot be read by the connected user", username, serverName)
+	}
 	d.SetId(generateUserMappingID(d))
 
 	return nil

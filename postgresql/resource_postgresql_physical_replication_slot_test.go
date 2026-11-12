@@ -72,7 +72,7 @@ func TestAccPostgresqlPhysicalReplicationSlot_NotLogical(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
-			testSuperuserPreCheck(t)
+			testCheckCanCreateLogicalReplicationSlot(t)
 			testCheckCanCreatePhysicalReplicationSlot(t)
 		},
 		Providers:    testAccProviders,

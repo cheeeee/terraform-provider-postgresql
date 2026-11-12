@@ -181,10 +181,11 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 		return err
 	}
 
-	if objectType == "database" {
-		if err := pgLockDatabase(txn, database); err != nil {
-			return err
-		}
+	// The privileges of an object are stored in the row of the object: granting
+	// privileges on the same object to several roles at the same time fails with
+	// "tuple concurrently updated", so the grants of a database are serialized.
+	if err := pgLockDatabase(txn, database); err != nil {
+		return err
 	}
 
 	owners, err := getRolesToGrant(txn, d)
@@ -238,11 +239,9 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 		return err
 	}
 
-	objectType := d.Get("object_type").(string)
-	if objectType == "database" {
-		if err := pgLockDatabase(txn, database); err != nil {
-			return err
-		}
+	// See the creation: the grants of a database are serialized.
+	if err := pgLockDatabase(txn, database); err != nil {
+		return err
 	}
 
 	owners, err := getRolesToGrant(txn, d)

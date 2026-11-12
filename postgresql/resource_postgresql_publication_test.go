@@ -96,9 +96,16 @@ func TestAccPostgresqlPublication_Database(t *testing.T) {
 	resource "postgresql_role" "test" {
 		name = "test"
 	}
+	# The owner of a publication needs the CREATE privilege on the database
+	resource "postgresql_grant" "test" {
+		database    = "%s"
+		role        = postgresql_role.test.name
+		object_type = "database"
+		privileges  = ["CREATE"]
+	}
 	resource "postgresql_publication" "test" {
 		name     = "publication"
-		database = "%s"
+		database = postgresql_grant.test.database
 		owner = postgresql_role.test.name
 	}
 	`, dbName)
@@ -107,7 +114,7 @@ func TestAccPostgresqlPublication_Database(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePublication)
-			testSuperuserPreCheck(t)
+			testCheckCanCreatePublication(t, false)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
@@ -158,7 +165,7 @@ func TestAccPostgresqlPublication_UpdateTables(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePublication)
-			testSuperuserPreCheck(t)
+			testCheckCanCreatePublication(t, false)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
@@ -230,7 +237,7 @@ func TestAccPostgresqlPublication_UpdatePublishParams(t *testing.T) {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePublication)
 			testCheckCompatibleVersion(t, featurePubTruncate)
-			testSuperuserPreCheck(t)
+			testCheckCanCreatePublication(t, false)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
@@ -306,7 +313,7 @@ func TestAccPostgresqlPublication_UpdatePublishParamsWithoutTruncate(t *testing.
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePublication)
 			testCheckCompatibleVersion(t, featurePubWithoutTruncate)
-			testSuperuserPreCheck(t)
+			testCheckCanCreatePublication(t, false)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
@@ -369,9 +376,16 @@ func TestAccPostgresqlPublication_UpdateOwner(t *testing.T) {
 		name = "%s_2"
 		login = true
 	}
+	# The owner of a publication needs the CREATE privilege on the database
+	resource "postgresql_grant" "test_owner_2" {
+		database    = "%s"
+		role        = postgresql_role.test_owner_2.name
+		object_type = "database"
+		privileges  = ["CREATE"]
+	}
 	resource "postgresql_publication" "test" {
 		name     = "publication"
-		database = "%s"
+		database = postgresql_grant.test_owner_2.database
 		owner = "${postgresql_role.test_owner_2.name}"
 	}
 	`, testOwner, dbName)
@@ -380,7 +394,7 @@ func TestAccPostgresqlPublication_UpdateOwner(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePublication)
-			testSuperuserPreCheck(t)
+			testCheckCanCreatePublication(t, false)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
@@ -391,7 +405,7 @@ func TestAccPostgresqlPublication_UpdateOwner(t *testing.T) {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlPublicationExists("postgresql_publication.test"),
 					resource.TestCheckResourceAttr(
-						"postgresql_publication.test", "owner", "postgres"),
+						"postgresql_publication.test", "owner", getTestConfig(t).Username),
 					resource.TestCheckResourceAttr(
 						"postgresql_publication.test", "name", "publication"),
 					resource.TestCheckResourceAttr(
@@ -442,7 +456,7 @@ func TestAccPostgresqlPublication_UpdateName(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePublication)
-			testSuperuserPreCheck(t)
+			testCheckCanCreatePublication(t, false)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
@@ -523,7 +537,7 @@ resource "postgresql_publication" "test" {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePublication)
 			testCheckCompatibleVersion(t, featurePubTruncate)
-			testSuperuserPreCheck(t)
+			testCheckCanCreatePublication(t, true)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
@@ -592,7 +606,7 @@ resource "postgresql_publication" "test" {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePublication)
 			testCheckCompatibleVersion(t, featurePubWithoutTruncate)
-			testSuperuserPreCheck(t)
+			testCheckCanCreatePublication(t, true)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
@@ -651,7 +665,7 @@ resource "postgresql_publication" "test" {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePublication)
-			testSuperuserPreCheck(t)
+			testCheckCanCreatePublication(t, true)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
@@ -692,7 +706,7 @@ resource "postgresql_publication" "test" {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePublication)
 			testCheckCompatibleVersion(t, featurePublishViaRoot)
-			testSuperuserPreCheck(t)
+			testCheckCanCreatePublication(t, false)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
@@ -772,7 +786,7 @@ resource "postgresql_publication" "test" {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featurePublication)
-			testSuperuserPreCheck(t)
+			testCheckCanCreatePublication(t, false)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,

@@ -13,7 +13,7 @@ func TestAccPostgresqlReplicationSlot_Basic(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
-			testSuperuserPreCheck(t)
+			testCheckCanCreateLogicalReplicationSlot(t)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlReplicationSlotDestroy,
@@ -129,7 +129,7 @@ func TestAccPostgresqlReplicationSlot_Database(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
-			testSuperuserPreCheck(t)
+			testCheckCanCreateLogicalReplicationSlot(t)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlReplicationSlotDestroy,

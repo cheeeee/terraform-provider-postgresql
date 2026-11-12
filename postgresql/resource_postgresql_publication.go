@@ -111,26 +111,52 @@ func resourcePostgreSQLPublicationUpdate(db *DBConnection, d *schema.ResourceDat
 
 	defer deferredRollback(txn)
 
-	if err := setPubOwner(txn, d); err != nil {
-		return fmt.Errorf("could not update publication owner: %w", err)
-	}
+	oldName, _ := d.GetChange(pubNameAttr)
+	err = withPublicationOwnerGranted(txn, oldName.(string), func() error {
+		if err := setPubOwner(txn, d); err != nil {
+			return fmt.Errorf("could not update publication owner: %w", err)
+		}
 
-	if err := setPubTables(txn, d); err != nil {
-		return fmt.Errorf("could not update publication tables: %w", err)
-	}
+		if err := setPubTables(txn, d); err != nil {
+			return fmt.Errorf("could not update publication tables: %w", err)
+		}
 
-	if err := setPubParams(txn, d, db.featureSupported(featurePublishViaRoot)); err != nil {
-		return fmt.Errorf("could not update publication tables: %w", err)
-	}
+		if err := setPubParams(txn, d, db.featureSupported(featurePublishViaRoot)); err != nil {
+			return fmt.Errorf("could not update publication tables: %w", err)
+		}
 
-	if err := setPubName(txn, d); err != nil {
-		return fmt.Errorf("could not update publication name: %w", err)
+		if err := setPubName(txn, d); err != nil {
+			return fmt.Errorf("could not update publication name: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	if err = txn.Commit(); err != nil {
 		return fmt.Errorf("error updating publication: %w", err)
 	}
 	return resourcePostgreSQLPublicationReadImpl(db, d)
+}
+
+// withPublicationOwnerGranted executes fn with the owner of the publication
+// granted to the connected user: a publication can only be altered or dropped
+// by its owner (or by a superuser).
+func withPublicationOwnerGranted(txn *sql.Tx, pubName string, fn func() error) error {
+	var owner string
+	err := txn.QueryRow(
+		"SELECT r.rolname FROM pg_catalog.pg_publication AS p JOIN pg_catalog.pg_roles AS r ON p.pubowner = r.oid WHERE p.pubname = $1",
+		pubName,
+	).Scan(&owner)
+	switch {
+	case err == sql.ErrNoRows:
+		return fn()
+	case err != nil:
+		return fmt.Errorf("could not get the owner of the publication %s: %w", pubName, err)
+	}
+
+	return withRolesGranted(txn, []string{owner}, fn)
 }
 
 func setPubName(txn *sql.Tx, d *schema.ResourceData) error {
@@ -158,8 +184,14 @@ func setPubOwner(txn *sql.Tx, d *schema.ResourceData) error {
 	n := nraw.(string)
 	pubName := d.Get(pubNameAttr).(string)
 
-	sql := fmt.Sprintf("ALTER PUBLICATION %s OWNER TO %s", pubName, n)
-	if _, err := txn.Exec(sql); err != nil {
+	// A user which is not a superuser has to be a member of the new owner
+	// to give it the publication, the role is granted during the change.
+	err := withRolesGranted(txn, []string{n}, func() error {
+		sql := fmt.Sprintf("ALTER PUBLICATION %s OWNER TO %s", pubName, n)
+		_, err := txn.Exec(sql)
+		return err
+	})
+	if err != nil {
 		return fmt.Errorf("error updating publication owner: %w", err)
 	}
 	return nil
@@ -427,8 +459,12 @@ func resourcePostgreSQLPublicationDelete(db *DBConnection, d *schema.ResourceDat
 		dropMode = "CASCADE"
 	}
 
-	sql := fmt.Sprintf("DROP PUBLICATION %s %s", pq.QuoteIdentifier(publicationName), dropMode)
-	if _, err := txn.Exec(sql); err != nil {
+	err = withPublicationOwnerGranted(txn, publicationName, func() error {
+		sql := fmt.Sprintf("DROP PUBLICATION %s %s", pq.QuoteIdentifier(publicationName), dropMode)
+		_, err := txn.Exec(sql)
+		return err
+	})
+	if err != nil {
 		return fmt.Errorf("could not execute sql: %w", err)
 	}
 

@@ -1592,3 +1592,52 @@ func testCheckForeignServerPrivileges(t *testing.T, usage bool) func(*terraform.
 		return nil
 	}
 }
+
+// Privileges granted on the same object to several roles at the same time:
+// the grants are applied in parallel by Terraform and update the same row.
+func TestAccPostgresqlGrant_ConcurrentOnSameObject(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	dbName, _ := getTestDBNames(dbSuffix)
+
+	config := fmt.Sprintf(`
+resource "postgresql_role" "concurrent" {
+  count = 12
+  name  = "concurrent_grant_${count.index}"
+}
+
+resource "postgresql_grant" "schema" {
+  count       = 12
+  database    = "%[1]s"
+  role        = postgresql_role.concurrent[count.index].name
+  schema      = "test_schema"
+  object_type = "schema"
+  privileges  = ["USAGE"]
+}
+
+resource "postgresql_grant" "database" {
+  count       = 12
+  database    = "%[1]s"
+  role        = postgresql_role.concurrent[count.index].name
+  object_type = "database"
+  privileges  = ["CONNECT"]
+}
+`, dbName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:  func() { testAccPreCheck(t) },
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_grant.schema.11", "privileges.#", "1"),
+					resource.TestCheckResourceAttr("postgresql_grant.database.11", "privileges.#", "1"),
+				),
+			},
+		},
+	})
+}

@@ -15,7 +15,7 @@ func TestAccPostgresqlUserMapping_Basic(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureServer)
-			testSuperuserPreCheck(t)
+			testCheckCanCreateExtension(t, "postgres_fdw")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
@@ -45,7 +45,7 @@ func TestAccPostgresqlUserMapping_Update(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureServer)
-			testSuperuserPreCheck(t)
+			testCheckCanCreateExtension(t, "postgres_fdw")
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,

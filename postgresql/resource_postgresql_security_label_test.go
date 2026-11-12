@@ -15,7 +15,7 @@ func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureSecurityLabel)
-			testSuperuserPreCheck(t)
+			testCheckCanSetSecurityLabel(t)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
@@ -31,7 +31,7 @@ func TestAccPostgresqlSecurityLabel_Basic(t *testing.T) {
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "label_provider", "dummy"),
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "label", "secret"),
+						"postgresql_security_label.test_label", "label", "classified"),
 				),
 			},
 		},
@@ -43,7 +43,7 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureSecurityLabel)
-			testSuperuserPreCheck(t)
+			testCheckCanSetSecurityLabel(t)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSecurityLabelDestroy,
@@ -59,7 +59,7 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 					resource.TestCheckResourceAttr(
 						"postgresql_security_label.test_label", "label_provider", "dummy"),
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "label", "secret"),
+						"postgresql_security_label.test_label", "label", "classified"),
 				),
 			},
 			{
@@ -67,7 +67,7 @@ func TestAccPostgresqlSecurityLabel_Update(t *testing.T) {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSecurityLabelExists("postgresql_security_label.test_label"),
 					resource.TestCheckResourceAttr(
-						"postgresql_security_label.test_label", "label", "top secret"),
+						"postgresql_security_label.test_label", "label", "unclassified"),
 				),
 			},
 			{
@@ -181,7 +181,7 @@ resource "postgresql_security_label" "test_label" {
   object_type    = "role"
   object_name    = postgresql_role.test_role.name
   label_provider = "dummy"
-  label          = "secret"
+  label          = "classified"
 }
 `
 
@@ -195,7 +195,7 @@ resource "postgresql_security_label" "test_label" {
   object_type    = "role"
   object_name    = postgresql_role.test_role.name
   label_provider = "dummy"
-  label          = "top secret"
+  label          = "unclassified"
 }
 `
 
@@ -209,6 +209,6 @@ resource "postgresql_security_label" "test_label" {
   object_type    = "role"
   object_name    = postgresql_role.test_role.name
   label_provider = "dummy"
-  label          = "top secret"
+  label          = "unclassified"
 }
 `

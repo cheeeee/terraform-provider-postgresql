@@ -112,6 +112,65 @@ func grantRoleMembership(db QueryAble, role, member string) (bool, error) {
 	return true, nil
 }
 
+// rdsIAMRole is the role of AWS RDS whose members have to log in with an IAM token.
+const rdsIAMRole = "rds_iam"
+
+// checkIAMRoleMembership returns an error if granting role to member would make
+// member a member of rds_iam whereas it is not one yet.
+// On AWS RDS, the members of rds_iam (even indirect ones) can only log in with an
+// IAM token: a user connected with a password which is temporarily granted such a
+// role cannot open a new connection anymore, so it cannot even revoke the role.
+// It has to be checked before a grant which is committed, like the ones needed by
+// the statements which cannot run in a transaction (CREATE DATABASE...). A role
+// granted and revoked in the same transaction is never seen by the other sessions.
+func checkIAMRoleMembership(db QueryAble, role, member string) error {
+	roleUsesIAM, err := isMemberOfRDSIAM(db, role)
+	if err != nil || !roleUsesIAM {
+		return err
+	}
+	memberUsesIAM, err := isMemberOfRDSIAM(db, member)
+	if err != nil || memberUsesIAM {
+		return err
+	}
+
+	return fmt.Errorf(
+		"role %[1]s is a member of %[3]s: it cannot be granted to %[2]s, which would not be able to log in with its password anymore. "+
+			"Use a role which is not a member of %[3]s as the owner of the objects, or connect to the server with IAM authentication",
+		role, member, rdsIAMRole,
+	)
+}
+
+// isMemberOfRDSIAM returns true if the role is rds_iam or one of its members, even an indirect one.
+// The memberships which only give the ADMIN option (the one a role gets on the roles
+// it creates since PostgreSQL 16) are ignored: they do not make it a member.
+func isMemberOfRDSIAM(db QueryAble, role string) (bool, error) {
+	if role == rdsIAMRole {
+		return true, nil
+	}
+
+	// inherit_option and set_option only exist since PostgreSQL 16: before, every membership is usable.
+	const usable = `(COALESCE((to_jsonb(m) ->> 'inherit_option')::bool, true) OR COALESCE((to_jsonb(m) ->> 'set_option')::bool, true))`
+	query := `
+WITH RECURSIVE memberships(roleid) AS (
+    SELECT m.roleid FROM pg_catalog.pg_auth_members AS m
+    JOIN pg_catalog.pg_roles AS r ON r.oid = m.member
+    WHERE r.rolname = $1 AND ` + usable + `
+  UNION
+    SELECT m.roleid FROM pg_catalog.pg_auth_members AS m
+    JOIN memberships AS s ON s.roleid = m.member
+    WHERE ` + usable + `
+)
+SELECT EXISTS (
+    SELECT 1 FROM memberships JOIN pg_catalog.pg_roles AS r ON r.oid = memberships.roleid WHERE r.rolname = $2
+)`
+
+	var isMember bool
+	if err := db.QueryRow(query, role, rdsIAMRole).Scan(&isMember); err != nil {
+		return isMember, fmt.Errorf("could not check if role %s is a member of %s: %w", role, rdsIAMRole, err)
+	}
+	return isMember, nil
+}
+
 // revokeRoleMembership revokes the role *role* from the user *member*.
 // It returns false if the revoke is not needed because the user is not a member of this role.
 func revokeRoleMembership(db QueryAble, role, member string) (bool, error) {

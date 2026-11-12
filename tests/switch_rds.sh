@@ -24,6 +24,25 @@ BEGIN;
 COMMIT;
 EOS
 
+# The master user of a managed service is not a superuser but it is allowed to
+# use the replication, to create subscriptions and to set the parameters of pgaudit
+# (e.g.: with the rds_superuser role on AWS RDS). The roles and privileges which
+# allow it depend on the version of PostgreSQL.
+psql -d postgres > /dev/null <<EOS
+ALTER ROLE rds REPLICATION;
+DO \$\$
+BEGIN
+    -- EXECUTE: these statements are not valid for the older versions
+    IF current_setting('server_version_num')::int >= 160000 THEN
+        EXECUTE 'GRANT pg_create_subscription TO rds';
+    END IF;
+    IF current_setting('server_version_num')::int >= 150000 THEN
+        EXECUTE 'GRANT SET ON PARAMETER pgaudit.log TO rds';
+    END IF;
+END
+\$\$;
+EOS
+
 psql -d template1 > /dev/null <<EOS
 BEGIN;
     ALTER SCHEMA public OWNER TO rds;
