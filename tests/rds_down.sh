@@ -24,6 +24,11 @@ for sg in $("${sg_query[@]}"); do
     aws ec2 delete-security-group --group-id "$sg" > /dev/null
 done
 
+if aws secretsmanager describe-secret --secret-id "$RDS_SECRET" > /dev/null 2>&1; then
+    echo "Deleting secret $RDS_SECRET"
+    aws secretsmanager delete-secret --secret-id "$RDS_SECRET" --force-delete-without-recovery > /dev/null
+fi
+
 rm -f "$RDS_STATE"
 
 # Make sure nothing is left
@@ -38,6 +43,10 @@ if aws rds describe-db-parameter-groups --db-parameter-group-name "$RDS_NAME" > 
 fi
 if [ -n "$("${sg_query[@]}")" ]; then
     echo "Security group $RDS_NAME still exists" >&2
+    left=1
+fi
+if aws secretsmanager describe-secret --secret-id "$RDS_SECRET" --query 'DeletedDate' --output text 2> /dev/null | grep -q None; then
+    echo "Secret $RDS_SECRET still exists" >&2
     left=1
 fi
 [ "$left" -eq 0 ] && echo "Nothing is left of $RDS_NAME"

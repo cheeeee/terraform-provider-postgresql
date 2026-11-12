@@ -33,7 +33,8 @@ aws rds create-db-parameter-group --db-parameter-group-name "$RDS_NAME" --db-par
     --description "terraform-provider-postgresql tests (temporary)" --tags Key=purpose,Value=tfpg-test > /dev/null
 aws rds modify-db-parameter-group --db-parameter-group-name "$RDS_NAME" --parameters \
     "ParameterName=shared_preload_libraries,ParameterValue='pgaudit,pg_stat_statements',ApplyMethod=pending-reboot" \
-    "ParameterName=pgaudit.role,ParameterValue=rds_pgaudit,ApplyMethod=pending-reboot" > /dev/null
+    "ParameterName=pgaudit.role,ParameterValue=rds_pgaudit,ApplyMethod=pending-reboot" \
+    "ParameterName=rds.logical_replication,ParameterValue=1,ApplyMethod=pending-reboot" > /dev/null
 
 password=$(openssl rand -hex 16)
 

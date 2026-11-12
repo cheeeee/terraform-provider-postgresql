@@ -13,3 +13,5 @@ RDS_NAME=${RDS_NAME:-tfpg-test}-pg${PGVERSION}${RDS_SUFFIX:+-$RDS_SUFFIX}
 # File where the connection settings of the instance are stored.
 RDS_STATE=${RDS_STATE:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/${RDS_NAME}.env}
 export RDS_USER=tfadmin
+# Secret of AWS Secrets Manager created by the end-to-end test.
+RDS_SECRET=${RDS_NAME}-reporting

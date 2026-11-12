@@ -17,4 +17,8 @@ export PGPORT=5432
 export PGUSER=$RDS_USER
 export PGSSLMODE=require
 
-exec "$HERE/e2e/run.sh"
+"$HERE/e2e/run.sh"
+
+# What only exists on AWS: IAM authentication and a password from Secrets Manager
+export RDS_SECRET
+"$HERE/e2e/rds_secret.sh"
