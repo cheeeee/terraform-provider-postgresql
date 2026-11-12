@@ -77,6 +77,7 @@ const (
 	featureSubscriptionAlterTwoPhase
 	featureSubscriptionRetainDeadTuples
 	featureRoleMembershipOptions
+	featureParameterPrivilege
 )
 
 var (
@@ -209,6 +210,8 @@ var (
 		featureSubscriptionFailover:         semver.MustParseRange(">=17.0.0"),
 		featureSubscriptionAlterTwoPhase:    semver.MustParseRange(">=18.0.0"),
 		featureSubscriptionRetainDeadTuples: semver.MustParseRange(">=19.0.0"),
+		// GRANT ... ON PARAMETER (PG 15+)
+		featureParameterPrivilege: semver.MustParseRange(">=15.0.0"),
 	}
 )
 

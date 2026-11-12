@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -24,6 +25,28 @@ var allowedObjectTypes = []string{
 	"foreign_data_wrapper",
 	"foreign_server",
 	"column",
+	"domain",
+	"type",
+	"language",
+	"large_object",
+	"parameter",
+	"tablespace",
+}
+
+// objectTypesWithoutSchema are the object types which do not belong to a schema: the statement
+// names them directly (databases, foreign data wrappers, servers, languages, tablespaces, parameters)
+// or by their OID (large objects).
+var objectTypesWithoutSchema = []string{"database", "foreign_data_wrapper", "foreign_server", "language", "large_object", "parameter", "tablespace"}
+
+// namedObjectsKeywords are the object types which have no ALL ... IN SCHEMA form: their objects
+// have to be listed in `objects`, and the keyword of the statement is given here.
+var namedObjectsKeywords = map[string]string{
+	"domain":       "DOMAIN",
+	"language":     "LANGUAGE",
+	"large_object": "LARGE OBJECT",
+	"parameter":    "PARAMETER",
+	"tablespace":   "TABLESPACE",
+	"type":         "TYPE",
 }
 
 var objectTypes = map[string]string{
@@ -143,8 +166,18 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 
 	// Validate parameters.
 	objectType := d.Get("object_type").(string)
-	if d.Get("schema").(string) == "" && !sliceContainsStr([]string{"database", "foreign_data_wrapper", "foreign_server"}, objectType) {
+	if d.Get("schema").(string) == "" && !sliceContainsStr(objectTypesWithoutSchema, objectType) {
 		return fmt.Errorf("parameter 'schema' is mandatory for postgresql_grant resource")
+	}
+	if _, named := namedObjectsKeywords[objectType]; named && d.Get("objects").(*schema.Set).Len() == 0 {
+		return fmt.Errorf("must specify `objects` when `object_type` is `%s`: PostgreSQL has no ALL form for this object type", objectType)
+	}
+	if objectType == "large_object" {
+		for _, oid := range d.Get("objects").(*schema.Set).List() {
+			if _, err := strconv.ParseUint(oid.(string), 10, 32); err != nil {
+				return fmt.Errorf("the `objects` of `object_type` `large_object` must be large object OIDs, not %q", oid)
+			}
+		}
 	}
 	if d.Get("objects").(*schema.Set).Len() > 0 && (objectType == "database" || objectType == "schema") {
 		return fmt.Errorf("cannot specify `objects` when `object_type` is `database` or `schema`")
@@ -166,6 +199,9 @@ func resourcePostgreSQLGrantCreateOrUpdate(db *DBConnection, d *schema.ResourceD
 	}
 	if err := validatePrivileges(db, d); err != nil {
 		return err
+	}
+	if d.Get("role").(string) == publicRole && d.Get("with_grant_option").(bool) {
+		return fmt.Errorf("with_grant_option cannot be used with role %s: PostgreSQL does not allow to grant options to PUBLIC", publicRole)
 	}
 
 	database := d.Get("database").(string)
@@ -351,7 +387,7 @@ WHERE grantee = $2
 	return nil
 }
 
-func readColumnRolePrivileges(txn *sql.Tx, d *schema.ResourceData) error {
+func readColumnRolePrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData) error {
 	objects := d.Get("objects").(*schema.Set)
 
 	missingColumns := d.Get("columns").(*schema.Set) // Getting columns from state.
@@ -370,14 +406,13 @@ FROM (SELECT relname, attname, (aclexplode(attacl)).*
         AND relname = $3
         AND relkind = $4)
          AS col_privs
-         JOIN pg_roles ON pg_roles.oid = col_privs.grantee
-WHERE rolname = $1
-  AND privilege_type = $5
-GROUP BY col_privs.relname, col_privs.attname, col_privs.privilege_type
+         LEFT JOIN pg_roles ON pg_roles.oid = col_privs.grantee
+WHERE COALESCE(rolname, 'public') = $1
+GROUP BY col_privs.relname, col_privs.attname
 ORDER BY col_privs.attname
 ;`
 	rows, err := txn.Query(
-		query, d.Get("role").(string), d.Get("schema"), objects.List()[0], objectTypes["table"], d.Get("privileges").(*schema.Set).List()[0],
+		query, d.Get("role").(string), d.Get("schema"), objects.List()[0], objectTypes["table"],
 	)
 
 	if err != nil {
@@ -403,7 +438,7 @@ ORDER BY col_privs.attname
 
 		privilegesSet := pgArrayToSet(privileges)
 
-		if !privilegesSet.Equal(d.Get("privileges").(*schema.Set)) {
+		if !resourcePrivilegesEqual(privilegesSet, db, d) {
 			// If any object doesn't have the same privileges as saved in the state,
 			// we return its privileges to force an update.
 			log.Printf(
@@ -476,7 +511,63 @@ GROUP BY pg_proc.proname
 		)
 
 	case "column":
-		return readColumnRolePrivileges(txn, d)
+		return readColumnRolePrivileges(txn, db, d)
+
+	case "type", "domain":
+		query = `
+SELECT pg_type.typname, array_remove(array_agg(privs.privilege_type), NULL)
+FROM pg_type
+JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
+LEFT JOIN (SELECT oid, (aclexplode(typacl)).* FROM pg_type) privs
+	ON privs.oid = pg_type.oid AND privs.grantee = $1
+WHERE pg_namespace.nspname = $2 AND pg_type.typname = ANY($3)
+GROUP BY pg_type.oid, pg_type.typname
+`
+		rows, err = txn.Query(query, roleOID, d.Get("schema"), pq.StringArray(setToStrings(objects)))
+
+	case "language":
+		query = `
+SELECT pg_language.lanname, array_remove(array_agg(privs.privilege_type), NULL)
+FROM pg_language
+LEFT JOIN (SELECT lanname, (aclexplode(lanacl)).* FROM pg_language) privs
+	ON privs.lanname = pg_language.lanname AND privs.grantee = $1
+WHERE pg_language.lanname = ANY($2)
+GROUP BY pg_language.oid, pg_language.lanname
+`
+		rows, err = txn.Query(query, roleOID, pq.StringArray(setToStrings(objects)))
+
+	case "tablespace":
+		query = `
+SELECT pg_tablespace.spcname, array_remove(array_agg(privs.privilege_type), NULL)
+FROM pg_tablespace
+LEFT JOIN (SELECT spcname, (aclexplode(spcacl)).* FROM pg_tablespace) privs
+	ON privs.spcname = pg_tablespace.spcname AND privs.grantee = $1
+WHERE pg_tablespace.spcname = ANY($2)
+GROUP BY pg_tablespace.oid, pg_tablespace.spcname
+`
+		rows, err = txn.Query(query, roleOID, pq.StringArray(setToStrings(objects)))
+
+	case "large_object":
+		query = `
+SELECT pg_largeobject_metadata.oid::text, array_remove(array_agg(privs.privilege_type), NULL)
+FROM pg_largeobject_metadata
+LEFT JOIN (SELECT oid, (aclexplode(lomacl)).* FROM pg_largeobject_metadata) privs
+	ON privs.oid = pg_largeobject_metadata.oid AND privs.grantee = $1
+WHERE pg_largeobject_metadata.oid::text = ANY($2)
+GROUP BY pg_largeobject_metadata.oid
+`
+		rows, err = txn.Query(query, roleOID, pq.StringArray(setToStrings(objects)))
+
+	case "parameter":
+		// A parameter without privileges has no row in pg_parameter_acl: the parameters are read from the objects.
+		query = `
+SELECT params.name, array_remove(array_agg(privs.privilege_type), NULL)
+FROM unnest($2::text[]) AS params(name)
+LEFT JOIN (SELECT parname, (aclexplode(paracl)).* FROM pg_parameter_acl) privs
+	ON privs.parname = params.name AND privs.grantee = $1
+GROUP BY params.name
+`
+		rows, err = txn.Query(query, roleOID, pq.StringArray(setToStrings(objects)))
 
 	default:
 		query = `
@@ -535,6 +626,29 @@ GROUP BY pg_class.relname
 	return nil
 }
 
+// namedObjectsClause returns the keyword and the objects of a GRANT or REVOKE statement for the
+// object types of namedObjectsKeywords, e.g. TYPE "sch"."t1","sch"."t2" or LARGE OBJECT 16384.
+func namedObjectsClause(objectType, schemaName string, objects *schema.Set) string {
+	keyword := namedObjectsKeywords[objectType]
+	switch objectType {
+	case "type", "domain":
+		return keyword + " " + setToPgIdentList(schemaName, objects)
+	case "large_object":
+		// Large objects are identified by their OID, which is a number, not an identifier.
+		return keyword + " " + strings.Join(setToStrings(objects), ",")
+	default:
+		return keyword + " " + setToPgIdentListWithoutSchema(objects)
+	}
+}
+
+func setToStrings(set *schema.Set) []string {
+	values := []string{}
+	for _, v := range set.List() {
+		values = append(values, v.(string))
+	}
+	return values
+}
+
 func createGrantQuery(d *schema.ResourceData, privileges []string) string {
 	var query string
 
@@ -576,6 +690,13 @@ func createGrantQuery(d *schema.ResourceData, privileges []string) string {
 			strings.Join(privileges, ","),
 			setToPgIdentListWithoutSchema(d.Get("columns").(*schema.Set)),
 			setToPgIdentList(d.Get("schema").(string), objects),
+			pq.QuoteIdentifier(d.Get("role").(string)),
+		)
+	case "TYPE", "DOMAIN", "LANGUAGE", "LARGE_OBJECT", "PARAMETER", "TABLESPACE":
+		query = fmt.Sprintf(
+			"GRANT %s ON %s TO %s",
+			strings.Join(privileges, ","),
+			namedObjectsClause(d.Get("object_type").(string), d.Get("schema").(string), d.Get("objects").(*schema.Set)),
 			pq.QuoteIdentifier(d.Get("role").(string)),
 		)
 	case "TABLE", "SEQUENCE", "FUNCTION", "PROCEDURE", "ROUTINE":
@@ -649,6 +770,23 @@ func createRevokeQuery(getter ResourceSchemeGetter) string {
 				setToPgIdentSimpleList(privileges),
 				setToPgIdentListWithoutSchema(columns),
 				setToPgIdentList(getter("schema").(string), objects),
+				pq.QuoteIdentifier(getter("role").(string)),
+			)
+		}
+	case "TYPE", "DOMAIN", "LANGUAGE", "LARGE_OBJECT", "PARAMETER", "TABLESPACE":
+		objectsClause := namedObjectsClause(getter("object_type").(string), getter("schema").(string), getter("objects").(*schema.Set))
+		privileges := getter("privileges").(*schema.Set)
+		if privileges.Len() > 0 {
+			query = fmt.Sprintf(
+				"REVOKE %s ON %s FROM %s",
+				setToPgIdentSimpleList(privileges),
+				objectsClause,
+				pq.QuoteIdentifier(getter("role").(string)),
+			)
+		} else {
+			query = fmt.Sprintf(
+				"REVOKE ALL PRIVILEGES ON %s FROM %s",
+				objectsClause,
 				pq.QuoteIdentifier(getter("role").(string)),
 			)
 		}
@@ -729,6 +867,65 @@ func revokeRolePrivileges(txn *sql.Tx, d *schema.ResourceData, usePrevious bool)
 	return nil
 }
 
+// getNamedObjectsOwners returns the owners of the named objects, which are granted to the connected
+// user during the change when it is not a superuser (see withRolesGranted).
+func getNamedObjectsOwners(txn *sql.Tx, objectType, schemaName string, objects *schema.Set) ([]string, error) {
+	names := pq.StringArray(setToStrings(objects))
+
+	var query string
+	var args []any
+	switch objectType {
+	case "type", "domain":
+		query = `
+SELECT DISTINCT pg_roles.rolname
+FROM pg_type
+JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
+JOIN pg_roles ON pg_roles.oid = pg_type.typowner
+WHERE pg_namespace.nspname = $1 AND pg_type.typname = ANY($2)`
+		args = []any{schemaName, names}
+	case "language":
+		query = `
+SELECT DISTINCT pg_roles.rolname
+FROM pg_language
+JOIN pg_roles ON pg_roles.oid = pg_language.lanowner
+WHERE pg_language.lanname = ANY($1)`
+		args = []any{names}
+	case "tablespace":
+		query = `
+SELECT DISTINCT pg_roles.rolname
+FROM pg_tablespace
+JOIN pg_roles ON pg_roles.oid = pg_tablespace.spcowner
+WHERE pg_tablespace.spcname = ANY($1)`
+		args = []any{names}
+	case "large_object":
+		query = `
+SELECT DISTINCT pg_roles.rolname
+FROM pg_largeobject_metadata
+JOIN pg_roles ON pg_roles.oid = pg_largeobject_metadata.lomowner
+WHERE pg_largeobject_metadata.oid::text = ANY($1)`
+		args = []any{names}
+	default:
+		// Parameters are owned by the bootstrap superuser: there is nothing to grant.
+		return []string{}, nil
+	}
+
+	rows, err := txn.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("error while looking for the owners of %s objects: %w", objectType, err)
+	}
+	defer rows.Close()
+
+	owners := []string{}
+	for rows.Next() {
+		var owner string
+		if err := rows.Scan(&owner); err != nil {
+			return nil, fmt.Errorf("could not scan the owner of a %s object: %w", objectType, err)
+		}
+		owners = append(owners, owner)
+	}
+	return owners, rows.Err()
+}
+
 func checkRoleDBSchemaExists(db *DBConnection, d *schema.ResourceData) (bool, error) {
 	// Check the database exists
 	database := d.Get("database").(string)
@@ -762,7 +959,7 @@ func checkRoleDBSchemaExists(db *DBConnection, d *schema.ResourceData) (bool, er
 
 	// Check the schema exists (the SQL connection needs to be on the right database)
 	pgSchema := d.Get("schema").(string)
-	if !sliceContainsStr([]string{"database", "foreign_data_wrapper", "foreign_server"}, d.Get("object_type").(string)) && pgSchema != "" {
+	if !sliceContainsStr(objectTypesWithoutSchema, d.Get("object_type").(string)) && pgSchema != "" {
 		exists, err = schemaExists(txn, pgSchema)
 		if err != nil {
 			return false, err
@@ -780,7 +977,7 @@ func generateGrantID(d *schema.ResourceData) string {
 	parts := []string{d.Get("role").(string), d.Get("database").(string)}
 
 	objectType := d.Get("object_type").(string)
-	if objectType != "database" && objectType != "foreign_data_wrapper" && objectType != "foreign_server" {
+	if !sliceContainsStr(objectTypesWithoutSchema, objectType) {
 		parts = append(parts, d.Get("schema").(string))
 	}
 	parts = append(parts, objectType)
@@ -801,13 +998,17 @@ func getRolesToGrant(txn *sql.Tx, d *schema.ResourceData) ([]string, error) {
 	// we need to grant owner of the schema and owners of tables in the schema
 	// in order to change theirs permissions.
 	owners := []string{}
-	objectType := d.Get("object_type")
-
-	if objectType == "database" || objectType == "foreign_data_wrapper" || objectType == "foreign_server" {
-		return owners, nil
-	}
+	objectType := d.Get("object_type").(string)
 
 	schemaName := d.Get("schema").(string)
+
+	if objectType == "language" || objectType == "large_object" || objectType == "tablespace" {
+		return getNamedObjectsOwners(txn, objectType, schemaName, d.Get("objects").(*schema.Set))
+	}
+
+	if sliceContainsStr(objectTypesWithoutSchema, objectType) {
+		return owners, nil
+	}
 
 	if objectType != "schema" {
 		var err error
@@ -815,6 +1016,14 @@ func getRolesToGrant(txn *sql.Tx, d *schema.ResourceData) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	if objectType == "type" || objectType == "domain" {
+		typeOwners, err := getNamedObjectsOwners(txn, objectType, schemaName, d.Get("objects").(*schema.Set))
+		if err != nil {
+			return nil, err
+		}
+		owners = append(owners, typeOwners...)
 	}
 
 	schemaOwner, err := getSchemaOwner(txn, schemaName)
@@ -849,6 +1058,12 @@ func validateFeatureSupport(db *DBConnection, d *schema.ResourceData) error {
 	if d.Get("object_type") == "routine" && !db.featureSupported(featureRoutine) {
 		return fmt.Errorf(
 			"object type ROUTINE is not supported for this Postgres version (%s)",
+			db.version,
+		)
+	}
+	if d.Get("object_type") == "parameter" && !db.featureSupported(featureParameterPrivilege) {
+		return fmt.Errorf(
+			"object type PARAMETER is not supported for this Postgres version (%s)",
 			db.version,
 		)
 	}

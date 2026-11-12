@@ -321,6 +321,10 @@ var allowedPrivileges = map[string][]string{
 	"foreign_server":       {"ALL", "USAGE"},
 	"column":               {"ALL", "SELECT", "INSERT", "UPDATE", "REFERENCES"},
 	"large_object":         {"ALL", "SELECT", "UPDATE"},
+	"domain":               {"ALL", "USAGE"},
+	"language":             {"ALL", "USAGE"},
+	"parameter":            {"ALL", "SET", "ALTER SYSTEM"},
+	"tablespace":           {"ALL", "CREATE"},
 }
 
 // allowedPrivilegesForObjectType returns the allowed privileges for a given object type,

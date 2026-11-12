@@ -335,14 +335,14 @@ func (t pubTable) clause() string {
 
 func pubTableHash(v any) int {
 	m := v.(map[string]any)
-	columns := setToStrings(m[pubTableColumnsAttr])
+	columns := publicationSetToStrings(m[pubTableColumnsAttr])
 	sort.Strings(columns)
 	return schema.HashString(fmt.Sprintf(
 		"%s|%t|%s|%s", m[pubTableNameAttr], m[pubTableOnlyAttr], strings.Join(columns, ","), m[pubTableRowFilterAttr],
 	))
 }
 
-func setToStrings(v any) []string {
+func publicationSetToStrings(v any) []string {
 	set, ok := v.(*schema.Set)
 	if !ok || set == nil {
 		return nil
@@ -359,7 +359,7 @@ func pubTablesFromBlocks(v any) []pubTable {
 	var tables []pubTable
 	for _, e := range v.(*schema.Set).List() {
 		m := e.(map[string]any)
-		columns := setToStrings(m[pubTableColumnsAttr])
+		columns := publicationSetToStrings(m[pubTableColumnsAttr])
 		sort.Strings(columns)
 		only, _ := m[pubTableOnlyAttr].(bool)
 		filter, _ := m[pubTableRowFilterAttr].(string)
@@ -715,7 +715,7 @@ func pubAllClause(d *schema.ResourceData) string {
 	if d.Get(pubAllTablesAttr).(bool) {
 		part := "ALL TABLES"
 		var except []string
-		for _, t := range setToStrings(d.Get(pubExceptTablesAttr)) {
+		for _, t := range publicationSetToStrings(d.Get(pubExceptTablesAttr)) {
 			except = append(except, "TABLE "+quoteTableName(t))
 		}
 		sort.Strings(except)
@@ -1007,7 +1007,7 @@ func readPubAllTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pub
 			return err
 		}
 		explicit := map[int64]bool{}
-		for _, name := range setToStrings(d.Get(pubExceptTablesAttr)) {
+		for _, name := range publicationSetToStrings(d.Get(pubExceptTablesAttr)) {
 			if oid, err := resolvePubTable(txn, name); err == nil {
 				explicit[oid] = true
 			}
@@ -1029,8 +1029,8 @@ func readPubAllTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pub
 // configuration, when it is the same table, otherwise <schema>.<table>.
 func pubTableDisplayName(txn *sql.Tx, d *schema.ResourceData, t pubTable) string {
 	var names []string
-	names = append(names, setToStrings(d.Get(pubTablesAttr))...)
-	names = append(names, setToStrings(d.Get(pubExceptTablesAttr))...)
+	names = append(names, publicationSetToStrings(d.Get(pubTablesAttr))...)
+	names = append(names, publicationSetToStrings(d.Get(pubExceptTablesAttr))...)
 	for _, b := range pubTablesFromBlocks(d.Get(pubTableAttr)) {
 		names = append(names, b.name)
 	}
@@ -1053,7 +1053,7 @@ func readPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubNam
 	prior := map[int64]pubTable{}
 	// (`tables` is Computed: it keeps the tables of the state when the blocks are used)
 	if !blocksMode {
-		for _, name := range setToStrings(d.Get(pubTablesAttr)) {
+		for _, name := range publicationSetToStrings(d.Get(pubTablesAttr)) {
 			if oid, err := resolvePubTable(txn, name); err == nil {
 				explicit[oid] = true
 			}
@@ -1173,7 +1173,7 @@ func getTablesForPublication(db *DBConnection, d *schema.ResourceData) (string, 
 	if err != nil {
 		return "", err
 	}
-	schemas := setToStrings(d.Get(pubSchemasAttr))
+	schemas := publicationSetToStrings(d.Get(pubSchemasAttr))
 	sort.Strings(schemas)
 	if err := checkPubFeatures(db, tables, schemas); err != nil {
 		return "", err
