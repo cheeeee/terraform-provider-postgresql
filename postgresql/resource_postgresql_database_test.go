@@ -3,6 +3,7 @@ package postgresql
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"regexp"
@@ -10,7 +11,9 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlDatabase_Basic(t *testing.T) {
@@ -94,14 +97,14 @@ func TestAccPostgresqlDatabase_Basic(t *testing.T) {
 						"postgresql_database.pg_default_opts", "name", "pg_defaults_db"),
 					resource.TestCheckResourceAttr(
 						"postgresql_database.pg_default_opts", "template", "DEFAULT"),
-					// resource.TestCheckResourceAttr(
-					// 	"postgresql_database.pg_default_opts", "encoding", "DEFAULT"),
-					// resource.TestCheckResourceAttr(
-					// 	"postgresql_database.pg_default_opts", "lc_collate", "DEFAULT"),
-					// resource.TestCheckResourceAttr(
-					//  "postgresql_database.pg_default_opts", "lc_ctype", "DEFAULT"),
-					// resource.TestCheckResourceAttr(
-					// 	"postgresql_database.pg_default_opts", "tablespace_name", "DEFAULT"),
+					// The state holds what the server stored, never the DEFAULT keyword: DEFAULT
+					// copies the encoding, the collation, the character classification and the
+					// tablespace of the template (template1), which only the catalogs can prove.
+					testCheckDatabaseValue(t, "true", `SELECT (d.encoding = t.encoding AND d.datcollate = t.datcollate
+						AND d.datctype = t.datctype AND d.dattablespace = t.dattablespace)::text
+						FROM pg_database d, pg_database t WHERE d.datname = $1 AND t.datname = 'template1'`, "pg_defaults_db"),
+					resource.TestCheckResourceAttr(
+						"postgresql_database.pg_default_opts", "tablespace_name", "pg_default"),
 					resource.TestCheckResourceAttr(
 						"postgresql_database.pg_default_opts", "connection_limit", "0"),
 					resource.TestCheckResourceAttr(
@@ -133,64 +136,52 @@ func TestAccPostgresqlDatabase_DefaultOwner(t *testing.T) {
 }
 
 func TestAccPostgresqlDatabase_Update(t *testing.T) {
+	skipIfNotAcc(t)
 
-	// Version dependent features values will be set in PreCheck
-	// because we need to access database to check Postgres version.
-
-	// Allow connection depends on Postgres version (needs pg >= 9.5)
-	var allowConnections bool
-
-	resource.Test(t, resource.TestCase{
-		PreCheck: func() {
-			testAccPreCheck(t)
-
-			client := testAccProvider.Meta().(*Client)
-			db, err := client.Connect()
-			if err != nil {
-				t.Fatalf("could not connect to database: %v", err)
-			}
-			allowConnections = db.featureSupported(featureDBAllowConnections)
-
-		},
-		Providers:    testAccProviders,
-		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
-		Steps: []resource.TestStep{
-			{
-				Config: fmt.Sprintf(`
-resource postgresql_database test_db {
-    name = "test_db"
-	allow_connections = "%t"
-}
-`, allowConnections),
-				Check: resource.ComposeTestCheckFunc(
-					testAccCheckPostgresqlDatabaseExists("postgresql_database.test_db"),
-					resource.TestCheckResourceAttr("postgresql_database.test_db", "name", "test_db"),
-					resource.TestCheckResourceAttr("postgresql_database.test_db", "connection_limit", "-1"),
-					resource.TestCheckResourceAttr(
-						"postgresql_database.test_db", "allow_connections",
-						strconv.FormatBool(allowConnections),
-					),
-				),
-			},
-			{
-				Config: `
+	// Both values of allow_connections are tested as the starting point of the update.
+	for _, allowConnections := range []bool{true, false} {
+		t.Run(fmt.Sprintf("allow_connections_%t", allowConnections), func(t *testing.T) {
+			const allowQuery = "SELECT datallowconn::text FROM pg_database WHERE datname = $1"
+			dbConfig := func(allow bool, limit int) string {
+				return fmt.Sprintf(`
 resource postgresql_database test_db {
 	name = "test_db"
-	connection_limit = 2
-	allow_connections = false
+	connection_limit = %d
+	allow_connections = %t
 }
-	`,
-				Check: resource.ComposeTestCheckFunc(
-					testAccCheckPostgresqlDatabaseExists("postgresql_database.test_db"),
-					resource.TestCheckResourceAttr("postgresql_database.test_db", "name", "test_db"),
-					resource.TestCheckResourceAttr("postgresql_database.test_db", "connection_limit", "2"),
-					resource.TestCheckResourceAttr(
-						"postgresql_database.test_db", "allow_connections", "false",
-					),
-				),
-			},
-		},
-	})
+`, limit, allow)
+			}
+
+			resource.Test(t, resource.TestCase{
+				PreCheck:     func() { testAccPreCheck(t) },
+				Providers:    testAccProviders,
+				CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+				Steps: []resource.TestStep{
+					{
+						Config: dbConfig(allowConnections, -1),
+						Check: resource.ComposeTestCheckFunc(
+							testAccCheckPostgresqlDatabaseExists("postgresql_database.test_db"),
+							resource.TestCheckResourceAttr("postgresql_database.test_db", "name", "test_db"),
+							resource.TestCheckResourceAttr("postgresql_database.test_db", "connection_limit", "-1"),
+							resource.TestCheckResourceAttr("postgresql_database.test_db", "allow_connections", strconv.FormatBool(allowConnections)),
+							testCheckDatabaseValue(t, strconv.FormatBool(allowConnections), allowQuery, "test_db"),
+						),
+					},
+					{
+						Config: dbConfig(!allowConnections, 2),
+						Check: resource.ComposeTestCheckFunc(
+							testAccCheckPostgresqlDatabaseExists("postgresql_database.test_db"),
+							resource.TestCheckResourceAttr("postgresql_database.test_db", "name", "test_db"),
+							resource.TestCheckResourceAttr("postgresql_database.test_db", "connection_limit", "2"),
+							resource.TestCheckResourceAttr("postgresql_database.test_db", "allow_connections", strconv.FormatBool(!allowConnections)),
+							testCheckDatabaseValue(t, strconv.FormatBool(!allowConnections), allowQuery, "test_db"),
+							testCheckDatabaseValue(t, "2", "SELECT datconnlimit::text FROM pg_database WHERE datname = $1", "test_db"),
+						),
+					},
+				},
+			})
+		})
+	}
 }
 
 // Test the case where we need to grant the owner to the connected user.
@@ -1161,7 +1152,25 @@ resource "postgresql_database" "rename_db" {
 					checkSameOID("rename_db_2"),
 				),
 			},
-			// A rename made outside of Terraform is seen as a missing database.
+			{
+				// A rename made outside of Terraform is seen as a missing database: it is planned again.
+				PreConfig: func() {
+					config := getTestConfig(t)
+					dbExecute(t, config.connStr("postgres"), `ALTER DATABASE rename_db_2 RENAME TO rename_db_3`)
+				},
+				Config:             dbConfig("rename_db_2"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				// The database moved away is dropped, the configuration creates it again.
+				PreConfig: func() {
+					config := getTestConfig(t)
+					dbExecute(t, config.connStr("postgres"), `DROP DATABASE rename_db_3`)
+				},
+				Config: dbConfig("rename_db_2"),
+				Check:  testAccCheckPostgresqlDatabaseExists("postgresql_database.rename_db"),
+			},
 		},
 	})
 }
@@ -1453,10 +1462,7 @@ resource "postgresql_database" "drop_open_db" {
 				Config: "# the database is removed while a session is connected to it\n",
 				Check: func(*terraform.State) error {
 					defer pool.Close()
-					if err := conn.PingContext(context.Background()); err == nil {
-						return errors.New("the session opened on the database is still connected after DROP DATABASE")
-					}
-					return nil
+					return testCheckSessionTerminated(conn)
 				},
 			},
 		},
@@ -1850,7 +1856,9 @@ resource "postgresql_database" "icu_rules_db" {
 	})
 }
 
-// collation_version is stored in datcollversion (PostgreSQL 15 and above).
+// collation_version is stored in datcollversion (PostgreSQL 15 and above). It is only sent when the
+// database is created: a difference with an existing database (REFRESH COLLATION VERSION on the server,
+// or an edit of the configuration) never plans anything.
 func TestAccPostgresqlDatabase_CollationVersion(t *testing.T) {
 	skipIfNotAcc(t)
 
@@ -1862,26 +1870,96 @@ resource "postgresql_database" "collation_version_db" {
 }
 `, options)
 	}
+	// The ICU provider has a real collation version, so that REFRESH COLLATION VERSION changes it.
+	const icuEN = `locale_provider = "icu"
+  icu_locale      = "en-US"`
+	const icuFR = `locale_provider = "icu"
+  icu_locale      = "fr-FR"`
+	withVersion := func(base, version string) string {
+		return base + "\n  collation_version = " + strconv.Quote(version)
+	}
 	const versionQuery = "SELECT datcollversion FROM pg_database WHERE datname = $1"
+	const oidQuery = "SELECT oid::text FROM pg_database WHERE datname = $1"
+	const resourceName = "postgresql_database.collation_version_db"
+	var oid string
+	recordOID := func(*terraform.State) error {
+		oid = testQueryDatabase(t, oidQuery, "collation_version_db")
+		return nil
+	}
+	checkSameOID := func(*terraform.State) error {
+		if got := testQueryDatabase(t, oidQuery, "collation_version_db"); got != oid {
+			return fmt.Errorf("the database was replaced: its OID changed from %s to %s", oid, got)
+		}
+		return nil
+	}
 
 	steps := []resource.TestStep{
 		{
-			Config: dbConfig(`locale             = "C"
-  collation_version = "1.0"`),
+			Config: dbConfig(withVersion(icuEN, "1.0")),
 			Check: resource.ComposeTestCheckFunc(
-				resource.TestCheckResourceAttr("postgresql_database.collation_version_db", "collation_version", "1.0"),
+				resource.TestCheckResourceAttr(resourceName, "collation_version", "1.0"),
 				testCheckDatabaseValue(t, "1.0", versionQuery, "collation_version_db"),
+				recordOID,
 			),
 		},
 		{
-			ResourceName:            "postgresql_database.collation_version_db",
+			ResourceName:            resourceName,
 			ImportState:             true,
 			ImportStateVerify:       true,
 			ImportStateVerifyIgnore: []string{"template", "alter_object_ownership"},
 		},
 		{
-			Config: dbConfig(`locale = "C"`),
-			Check:  testCheckDatabaseValue(t, "1.0", versionQuery, "collation_version_db"),
+			// The version is removed from the configuration: nothing changes.
+			Config: dbConfig(icuEN),
+			Check: resource.ComposeTestCheckFunc(
+				testCheckDatabaseValue(t, "1.0", versionQuery, "collation_version_db"),
+				checkSameOID,
+			),
+		},
+		{
+			// The server changes the version: the plan stays empty (no replacement, no update).
+			PreConfig: func() {
+				config := getTestConfig(t)
+				dbExecute(t, config.connStr("postgres"), `ALTER DATABASE collation_version_db REFRESH COLLATION VERSION`)
+				if got := testQueryDatabase(t, versionQuery, "collation_version_db"); got == "1.0" {
+					t.Fatalf("REFRESH COLLATION VERSION did not change datcollversion: %q", got)
+				}
+			},
+			Config:   dbConfig(icuEN),
+			PlanOnly: true,
+		},
+		{
+			// The configured version differs from the stored one: the plan is still empty.
+			Config:   dbConfig(withVersion(icuEN, "1.0")),
+			PlanOnly: true,
+		},
+		{
+			// Same, applied: the database is neither replaced nor altered.
+			Config: dbConfig(withVersion(icuEN, "2.0")),
+			Check: resource.ComposeTestCheckFunc(
+				checkSameOID,
+				func(*terraform.State) error {
+					if got := testQueryDatabase(t, versionQuery, "collation_version_db"); got == "2.0" {
+						return errors.New("collation_version was applied to an existing database")
+					}
+					return nil
+				},
+			),
+		},
+		{
+			// Another ForceNew attribute replaces the database, the new one uses the configured version.
+			Config: dbConfig(withVersion(icuFR, "3.0")),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr(resourceName, "collation_version", "3.0"),
+				testCheckDatabaseValue(t, "3.0", versionQuery, "collation_version_db"),
+				testCheckDatabaseValue(t, "fr-FR", fmt.Sprintf("SELECT %s FROM pg_database WHERE datname = $1", testICULocaleColumn(t)), "collation_version_db"),
+				func(*terraform.State) error {
+					if got := testQueryDatabase(t, oidQuery, "collation_version_db"); got == oid {
+						return errors.New("the database was not replaced")
+					}
+					return nil
+				},
+			),
 		},
 	}
 
@@ -1936,4 +2014,172 @@ resource "postgresql_database" "builtin_db" {
 		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
 		Steps:        testDatabaseOptionSteps(t, 170000, "BUILTIN_LOCALE", dbConfig(`builtin_locale = "C.UTF-8"`), steps),
 	})
+}
+
+// testCheckSessionTerminated checks that the session was ended by the server (pg_terminate_backend or
+// DROP DATABASE ... WITH (FORCE) both end it with SQLSTATE 57P01), not by any other failure.
+func testCheckSessionTerminated(conn *sql.Conn) error {
+	var one int
+	err := conn.QueryRowContext(context.Background(), "SELECT 1").Scan(&one)
+	if err == nil {
+		return errors.New("the session opened on the database is still connected")
+	}
+	var pqErr *pq.Error
+	if errors.Is(err, driver.ErrBadConn) {
+		return nil // the server closed the socket before the error message was read
+	}
+	if !errors.As(err, &pqErr) || pqErr.Code != "57P01" {
+		return fmt.Errorf("the session was not terminated by the server (expected SQLSTATE 57P01): %w", err)
+	}
+	return nil
+}
+
+// testOpenSession opens a session on the database and checks it works.
+func testOpenSession(t *testing.T, dbName string) (*sql.DB, *sql.Conn) {
+	config := getTestConfig(t)
+	pool, err := sql.Open("postgres", config.connStr(dbName))
+	if err != nil {
+		t.Fatalf("could not open SQL connection: %v", err)
+	}
+	conn, err := pool.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("could not connect to the database %s: %v", dbName, err)
+	}
+	var one int
+	if err := conn.QueryRowContext(context.Background(), "SELECT 1").Scan(&one); err != nil {
+		t.Fatalf("could not query the database %s: %v", dbName, err)
+	}
+	return pool, conn
+}
+
+// The provider ends the sessions itself (terminateBConnections, before DROP DATABASE) on every version, and
+// DROP DATABASE ... WITH (FORCE) is added on 13 and above: both run on every delete, so the end to end test
+// (_DropWithOpenConnection) cannot tell them apart. Each mechanism is proved on its own here: the provider
+// function alone ends the sessions and blocks new ones, and on 13 and above the server clause alone drops
+// a database which has an open session.
+func TestAccPostgresqlDatabase_DropMechanisms(t *testing.T) {
+	skipIfNotAcc(t)
+	testAccPreCheck(t)
+
+	config := getTestConfig(t)
+	admin := config.connStr("postgres")
+	db, err := testAccProvider.Meta().(*Client).Connect()
+	if err != nil {
+		t.Fatalf("could not connect to database: %v", err)
+	}
+
+	const dbName = "tf_drop_mechanisms"
+	dbExecute(t, admin, "DROP DATABASE IF EXISTS "+dbName)
+	dbExecute(t, admin, "CREATE DATABASE "+dbName)
+	t.Cleanup(func() {
+		if err := terminateBConnections(db, dbName); err == nil {
+			dbExecute(t, admin, "DROP DATABASE IF EXISTS "+dbName)
+		}
+	})
+
+	t.Run("terminateBConnections", func(t *testing.T) {
+		pool, conn := testOpenSession(t, dbName)
+		defer pool.Close()
+
+		if err := terminateBConnections(db, dbName); err != nil {
+			t.Fatalf("terminateBConnections: %v", err)
+		}
+		if err := testCheckSessionTerminated(conn); err != nil {
+			t.Fatal(err)
+		}
+		if got := testQueryDatabase(t, "SELECT datallowconn::text FROM pg_database WHERE datname = $1", dbName); got != "false" {
+			t.Fatalf("new connections are not blocked: datallowconn = %s", got)
+		}
+		if got := testQueryDatabase(t, "SELECT count(*)::text FROM pg_database WHERE datname = $1", dbName); got != "1" {
+			t.Fatalf("the database must still exist after terminateBConnections, count = %s", got)
+		}
+		dbExecute(t, admin, "ALTER DATABASE "+dbName+" ALLOW_CONNECTIONS true")
+	})
+
+	t.Run("with_force", func(t *testing.T) {
+		testSkipIfOlderThan(t, 130000, "DROP DATABASE ... WITH (FORCE)")
+		pool, conn := testOpenSession(t, dbName)
+		defer pool.Close()
+
+		dbExecute(t, admin, "DROP DATABASE "+dbName+" WITH (FORCE)")
+		if err := testCheckSessionTerminated(conn); err != nil {
+			t.Fatal(err)
+		}
+		if got := testQueryDatabase(t, "SELECT count(*)::text FROM pg_database WHERE datname = $1", dbName); got != "0" {
+			t.Fatalf("the database was not dropped, count = %s", got)
+		}
+	})
+}
+
+// A database name with quotes is escaped everywhere: the sessions of the database are terminated with a
+// query parameter, and the identifier is quoted.
+func TestAccPostgresqlDatabase_QuotesInName(t *testing.T) {
+	skipIfNotAcc(t)
+
+	const dbName = `tf_it's "quoted"`
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+resource "postgresql_database" "quoted" {
+  name = %q
+}
+`, dbName),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.quoted"),
+					testCheckDatabaseValue(t, "1", "SELECT count(*)::text FROM pg_database WHERE datname = $1", dbName),
+				),
+			},
+			{
+				Config: "# the database is removed\n",
+				Check:  testCheckDatabaseValue(t, "0", "SELECT count(*)::text FROM pg_database WHERE datname = $1", dbName),
+			},
+		},
+	})
+}
+
+// A connection failure when the provider locks the owner is returned as an error: the transaction used to
+// be nil, and the provider panicked. A closed connection pool makes startTransaction fail without a server.
+func TestDatabaseStartTransactionError(t *testing.T) {
+	config := getTestConfig(t)
+	client := config.NewClient("postgres")
+
+	closed, err := sql.Open("postgres", config.connStr("postgres"))
+	if err != nil {
+		t.Fatalf("could not open SQL connection: %v", err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatalf("could not close the pool: %v", err)
+	}
+	broken := &DBConnection{DB: closed, client: client}
+
+	dsn := config.connStr("postgres")
+	dbRegistryLock.Lock()
+	previous, hadPrevious := dbRegistry[dsn]
+	dbRegistry[dsn] = broken
+	dbRegistryLock.Unlock()
+	defer func() {
+		dbRegistryLock.Lock()
+		defer dbRegistryLock.Unlock()
+		if hadPrevious {
+			dbRegistry[dsn] = previous
+		} else {
+			delete(dbRegistry, dsn)
+		}
+	}()
+
+	d := schema.TestResourceDataRaw(t, resourcePostgreSQLDatabase().Schema, map[string]any{
+		dbNameAttr:  "some_db",
+		dbOwnerAttr: "some_owner",
+	})
+
+	if err := resourcePostgreSQLDatabaseDelete(broken, d); err == nil {
+		t.Error("delete: expected the error of the failed transaction")
+	}
+	if err := setDBOwner(broken, d); err == nil {
+		t.Error("setDBOwner: expected the error of the failed transaction")
+	}
 }

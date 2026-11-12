@@ -109,11 +109,14 @@ resource "postgresql_database" "my_db" {
 
 * `collation_version` - (Optional) The version of the collation of the database
   (`COLLATION_VERSION`, PostgreSQL 15 and above). When unset, PostgreSQL stores the
-  current version of the collation library. Changing this value will force the
-  creation of a new resource. The version changes when the operating system is
-  upgraded: if `collation_version` is set, the new version is seen as a change of
-  the resource and the database is replaced, so only set it to pin a version
-  which is known to be safe for the data of the database.
+  current version of the collation library. It is only used when the database is
+  created: the version stored by the server is kept in the state, and a difference
+  between this value and an existing database never plans anything, neither an
+  update nor a replacement. This is the case when the version changes on the
+  server (`ALTER DATABASE ... REFRESH COLLATION VERSION` after an operating system
+  upgrade) as well as when the value of the configuration is edited. When another
+  attribute which forces a new resource changes, the new database is created with
+  the value of the configuration.
 
 * `strategy` - (Optional) The method used to copy the template database:
   `file_copy` or `wal_log` (`STRATEGY`, PostgreSQL 15 and above). It is only used

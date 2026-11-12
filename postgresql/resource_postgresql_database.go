@@ -127,11 +127,16 @@ func resourcePostgreSQLDatabase() *schema.Resource {
 				Description: "The builtin locale of the new database, used with locale_provider = builtin (BUILTIN_LOCALE, PostgreSQL 17 and above)",
 			},
 			dbCollationVersionAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Computed:    true,
-				ForceNew:    true,
-				Description: "The version of the collation of the new database (COLLATION_VERSION, PostgreSQL 15 and above). Changing the version of the operating system library changes it, which forces a new database: see the documentation",
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+				// The version is only sent when the database is created. The server changes it
+				// (ALTER DATABASE ... REFRESH COLLATION VERSION), so a difference with an existing
+				// database never plans anything.
+				DiffSuppressFunc: func(_, _, _ string, d *schema.ResourceData) bool {
+					return d.Id() != ""
+				},
+				Description: "The version of the collation of the new database (COLLATION_VERSION, PostgreSQL 15 and above). Only used at creation: the version stored by the server is read back and a difference with the configuration of an existing database is ignored",
 			},
 			dbStrategyAttr: {
 				Type:         schema.TypeString,
@@ -230,11 +235,30 @@ func checkDBCreateOptions(db *DBConnection, d *schema.ResourceData) error {
 		{dbBuiltinLocaleAttr, "BUILTIN_LOCALE", featureDBBuiltinLocale},
 	}
 	for _, option := range options {
-		if _, ok := d.GetOk(option.attr); ok && !db.featureSupported(option.feature) {
+		_, ok := d.GetOk(option.attr)
+		if option.attr == dbCollationVersionAttr {
+			ok = configCollationVersion(d) != ""
+		}
+		if ok && !db.featureSupported(option.feature) {
 			return fmt.Errorf("PostgreSQL client is talking with a server (%q) that does not support database %s", db.version.String(), option.clause)
 		}
 	}
 	return nil
+}
+
+// configCollationVersion returns the collation_version of the configuration. The attribute is
+// read from the raw configuration because its difference is suppressed once the database exists:
+// when another attribute replaces the database, the diff does not carry the configured value.
+func configCollationVersion(d *schema.ResourceData) string {
+	raw := d.GetRawConfig()
+	if raw.IsNull() || !raw.IsKnown() {
+		return ""
+	}
+	v := raw.GetAttr(dbCollationVersionAttr)
+	if v.IsNull() || !v.IsKnown() {
+		return ""
+	}
+	return v.AsString()
 }
 
 func createDatabase(db *DBConnection, d *schema.ResourceData) error {
@@ -342,8 +366,8 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	if v, ok := d.GetOk(dbBuiltinLocaleAttr); ok {
 		fmt.Fprintf(b, " BUILTIN_LOCALE '%s' ", pqQuoteLiteral(v.(string)))
 	}
-	if v, ok := d.GetOk(dbCollationVersionAttr); ok {
-		fmt.Fprintf(b, " COLLATION_VERSION '%s' ", pqQuoteLiteral(v.(string)))
+	if v := configCollationVersion(d); v != "" {
+		fmt.Fprintf(b, " COLLATION_VERSION '%s' ", pqQuoteLiteral(v))
 	}
 	if v, ok := d.GetOk(dbStrategyAttr); ok {
 		fmt.Fprint(b, " STRATEGY ", pq.QuoteIdentifier(v.(string)))
@@ -392,6 +416,9 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 	var err error
 	if owner != "" {
 		lockTxn, err := startTransaction(db.client, "")
+		if err != nil {
+			return err
+		}
 		if err := pgLockRole(lockTxn, currentUser); err != nil {
 			return err
 		}
@@ -688,6 +715,9 @@ func setDBOwner(db *DBConnection, d *schema.ResourceData) error {
 	currentUser := db.client.config.getDatabaseUsername()
 
 	lockTxn, err := startTransaction(db.client, "")
+	if err != nil {
+		return err
+	}
 	if err := pgLockRole(lockTxn, currentUser); err != nil {
 		return err
 	}
@@ -907,8 +937,8 @@ func terminateBConnections(db *DBConnection, dbName string) error {
 	if db.featureSupported(featurePid) {
 		pid = "pid"
 	}
-	terminateSql = fmt.Sprintf("SELECT pg_terminate_backend(%s) FROM pg_stat_activity WHERE datname = '%s' AND %s <> pg_backend_pid()", pid, dbName, pid)
-	if _, err := db.Exec(terminateSql); err != nil {
+	terminateSql = fmt.Sprintf("SELECT pg_terminate_backend(%s) FROM pg_stat_activity WHERE datname = $1 AND %s <> pg_backend_pid()", pid, pid)
+	if _, err := db.Exec(terminateSql, dbName); err != nil {
 		return fmt.Errorf("error terminating database connections: %w", err)
 	}
 
