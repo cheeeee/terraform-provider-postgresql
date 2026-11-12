@@ -51,6 +51,7 @@ const (
 	featureCreateRoleSelfGrant
 	featureSecurityLabel
 	featureMaintainPrivilege
+	featureEventTriggerLogin
 )
 
 var (
@@ -130,6 +131,9 @@ var (
 
 		// MAINTAIN privilege on tables (PG 17+)
 		featureMaintainPrivilege: semver.MustParseRange(">=17.0.0"),
+
+		// Event triggers on the login event (PG 17+)
+		featureEventTriggerLogin: semver.MustParseRange(">=17.0.0"),
 	}
 )
 
