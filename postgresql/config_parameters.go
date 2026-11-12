@@ -186,6 +186,20 @@ func parseConfigParameters(config pq.StringArray, reserved map[string]string) ma
 // statements needed to go from the oldParams parameters to the newParams ones.
 // objectType is either ROLE or DATABASE.
 func alterConfigParameters(db QueryAble, objectType, objectName string, oldParams, newParams map[string]any) error {
+	return alterConfigParametersOn(
+		db,
+		fmt.Sprintf("%s %s", objectType, pq.QuoteIdentifier(objectName)),
+		fmt.Sprintf("%s %s", strings.ToLower(objectType), objectName),
+		func() (map[string]any, error) { return readConfigParameters(db, objectType, objectName) },
+		oldParams, newParams,
+	)
+}
+
+// alterConfigParametersOn is alterConfigParameters for any target of an
+// ALTER ... SET / RESET statement: target is what follows ALTER in the SQL
+// (e.g.: ROLE "foo" IN DATABASE "bar"), description is used in the errors and
+// read returns the parameters which are stored for the target.
+func alterConfigParametersOn(db QueryAble, target, description string, read func() (map[string]any, error), oldParams, newParams map[string]any) error {
 	var toReset, toSet []string
 	for name := range oldParams {
 		if _, ok := newParams[name]; !ok {
@@ -202,15 +216,15 @@ func alterConfigParameters(db QueryAble, objectType, objectName string, oldParam
 	sort.Strings(toSet)
 
 	for _, name := range toReset {
-		query := fmt.Sprintf("ALTER %s %s RESET %s", objectType, pq.QuoteIdentifier(objectName), name)
+		query := fmt.Sprintf("ALTER %s RESET %s", target, name)
 		if _, err := db.Exec(query); err != nil {
-			return fmt.Errorf("could not reset parameter %s for %s %s: %w", name, strings.ToLower(objectType), objectName, err)
+			return fmt.Errorf("could not reset parameter %s for %s: %w", name, description, err)
 		}
 	}
 	set := func(name, value string) error {
-		query := fmt.Sprintf("ALTER %s %s SET %s TO %s", objectType, pq.QuoteIdentifier(objectName), name, value)
+		query := fmt.Sprintf("ALTER %s SET %s TO %s", target, name, value)
 		if _, err := db.Exec(query); err != nil {
-			return fmt.Errorf("could not set parameter %s for %s %s: %w", name, strings.ToLower(objectType), objectName, err)
+			return fmt.Errorf("could not set parameter %s for %s: %w", name, description, err)
 		}
 		return nil
 	}
@@ -223,7 +237,7 @@ func alterConfigParameters(db QueryAble, objectType, objectName string, oldParam
 	// PostgreSQL stores the value as it is, except for the list parameters.
 	// If one which is not in listQuoteParameters has been stored as one single
 	// quoted element, its value has to be set again element by element.
-	stored, err := readConfigParameters(db, objectType, objectName)
+	stored, err := read()
 	if err != nil {
 		return err
 	}

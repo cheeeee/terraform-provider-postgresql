@@ -76,6 +76,7 @@ const (
 	featureSubscriptionFailover
 	featureSubscriptionAlterTwoPhase
 	featureSubscriptionRetainDeadTuples
+	featureRoleMembershipOptions
 )
 
 var (
@@ -161,6 +162,9 @@ var (
 
 		// MAINTAIN privilege on tables (PG 17+)
 		featureMaintainPrivilege: semver.MustParseRange(">=17.0.0"),
+
+		// GRANT role ... WITH INHERIT / SET and GRANTED BY, pg_auth_members.{inherit_option,set_option}
+		featureRoleMembershipOptions: semver.MustParseRange(">=16.0.0"),
 
 		// SCRAM-SHA-256 passwords
 		featureScramSHA256: semver.MustParseRange(">=10.0.0"),

@@ -1,12 +1,15 @@
 package postgresql
 
 import (
+	"context"
 	"crypto/md5"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -39,6 +42,7 @@ const (
 	roleStatementTimeoutAttr                = "statement_timeout"
 	roleAssumeRoleAttr                      = "assume_role"
 	roleParametersAttr                      = "parameters"
+	roleDatabaseParametersAttr              = "database_parameters"
 
 	// Deprecated options
 	roleDepEncryptedAttr = "encrypted"
@@ -63,6 +67,7 @@ func resourcePostgreSQLRole() *schema.Resource {
 		Importer: &schema.ResourceImporter{
 			StateContext: schema.ImportStatePassthroughContext,
 		},
+		CustomizeDiff: validateRoleDatabaseParameters,
 
 		Schema: map[string]*schema.Schema{
 			roleNameAttr: {
@@ -211,6 +216,29 @@ func resourcePostgreSQLRole() *schema.Resource {
 				ValidateFunc:     validateConfigParameters(roleReservedParameters),
 				DiffSuppressFunc: suppressConfigParametersDiff,
 				Description:      "Configuration parameters set for this role (ALTER ROLE ... SET)",
+			},
+			roleDatabaseParametersAttr: {
+				Type:        schema.TypeSet,
+				Optional:    true,
+				Computed:    true,
+				Set:         hashRoleDatabaseParameters,
+				Description: "Configuration parameters set for this role in a database (ALTER ROLE ... IN DATABASE ... SET)",
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"database": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "The name of the database",
+						},
+						"parameters": {
+							Type:         schema.TypeMap,
+							Required:     true,
+							Elem:         &schema.Schema{Type: schema.TypeString},
+							ValidateFunc: validateConfigParameters(roleReservedParameters),
+							Description:  "Configuration parameters set for this role in this database",
+						},
+					},
+				},
 			},
 		},
 	}
@@ -398,6 +426,10 @@ func resourcePostgreSQLRoleCreate(db *DBConnection, d *schema.ResourceData) erro
 		return err
 	}
 
+	if err = setRoleDatabaseParameters(txn, d); err != nil {
+		return err
+	}
+
 	if err = txn.Commit(); err != nil {
 		return fmt.Errorf("could not commit transaction: %w", err)
 	}
@@ -547,6 +579,9 @@ func resourcePostgreSQLRoleReadImpl(db *DBConnection, d *schema.ResourceData) er
 	d.Set(roleSearchPathAttr, readSearchPath(roleConfig))
 	d.Set(roleAssumeRoleAttr, readAssumeRole(roleConfig))
 	d.Set(roleParametersAttr, parseConfigParameters(roleConfig, roleReservedParameters))
+	if err := readRoleDatabaseParameters(db, d); err != nil {
+		return err
+	}
 
 	statementTimeout, err := readStatementTimeout(roleConfig)
 	if err != nil {
@@ -675,6 +710,10 @@ func readRolePassword(db *DBConnection, d *schema.ResourceData, roleCanLogin boo
 	case err != nil:
 		return "", fmt.Errorf("error reading role: %w", err)
 	}
+	// "NULL" removes the password: the role has none in the catalog
+	if strings.ToUpper(statePassword) == "NULL" && rolePassword == "" {
+		return statePassword, nil
+	}
 	// If the password isn't already in md5 format, but hashing the input
 	// matches the password in the database for the user, they are the same
 	if statePassword != "" && !strings.HasPrefix(statePassword, "md5") && !strings.HasPrefix(statePassword, "SCRAM-SHA-256") {
@@ -755,12 +794,10 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 		return err
 	}
 
-	// applying roles: let's revoke all / grant the right ones
-	if err = revokeRoles(txn, d); err != nil {
-		return err
-	}
-
-	if err = grantRoles(txn, d); err != nil {
+	// applying roles: revoke the ones which are removed, grant the added ones.
+	// The memberships which are not changed are kept as they are, they can have
+	// options which are managed with postgresql_grant_role.
+	if err = changeRoles(txn, d); err != nil {
 		return err
 	}
 
@@ -781,6 +818,10 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 	}
 
 	if err = setRoleParameters(txn, d); err != nil {
+		return err
+	}
+
+	if err = setRoleDatabaseParameters(txn, d); err != nil {
 		return err
 	}
 
@@ -840,14 +881,16 @@ func setRolePassword(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) erro
 		return nil
 	}
 
-	if db.hashesRolePasswords() {
-		var err error
-		if password, err = hashRolePassword(db, txn, password); err != nil {
-			return err
+	sql := fmt.Sprintf("ALTER ROLE %s PASSWORD NULL", pq.QuoteIdentifier(roleName))
+	if strings.ToUpper(password) != "NULL" {
+		if db.hashesRolePasswords() {
+			var err error
+			if password, err = hashRolePassword(db, txn, password); err != nil {
+				return err
+			}
 		}
+		sql = fmt.Sprintf("ALTER ROLE %s PASSWORD '%s'", pq.QuoteIdentifier(roleName), pqQuoteLiteral(password))
 	}
-
-	sql := fmt.Sprintf("ALTER ROLE %s PASSWORD '%s'", pq.QuoteIdentifier(roleName), pqQuoteLiteral(password))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating role password: %w", err)
 	}
@@ -1071,42 +1114,39 @@ func setRoleValidUntil(txn *sql.Tx, d *schema.ResourceData) error {
 	return nil
 }
 
-func revokeRoles(txn *sql.Tx, d *schema.ResourceData) error {
+// changeRoles revokes the roles which are not in the resource anymore and grants the new ones.
+func changeRoles(txn *sql.Tx, d *schema.ResourceData) error {
+	if !d.HasChange(roleRolesAttr) {
+		return nil
+	}
+
 	role := d.Get(roleNameAttr).(string)
+	oldRoles, newRoles := d.GetChange(roleRolesAttr)
+	removed := oldRoles.(*schema.Set).Difference(newRoles.(*schema.Set)).List()
+	added := newRoles.(*schema.Set).Difference(oldRoles.(*schema.Set)).List()
 
-	query := `SELECT pg_get_userbyid(roleid)
-		FROM pg_catalog.pg_auth_members members
-		JOIN pg_catalog.pg_roles ON members.member = pg_roles.oid
-		WHERE rolname = $1`
-
-	rows, err := txn.Query(query, role)
-	if err != nil {
-		return fmt.Errorf("could not get roles list for role %s: %w", role, err)
-	}
-	defer func() {
-		if err := rows.Close(); err != nil {
-			log.Printf("error closing rows: %v", err)
+	for _, revokedRole := range removed {
+		// The role can have been dropped (with its memberships) in the same apply
+		var member bool
+		err := txn.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members
+			WHERE pg_get_userbyid(roleid) = $1 AND pg_get_userbyid(member) = $2)`, revokedRole, role).Scan(&member)
+		if err != nil {
+			return fmt.Errorf("could not read the membership of %s in %s: %w", role, revokedRole, err)
 		}
-	}()
-
-	grantedRoles := []string{}
-	for rows.Next() {
-		var grantedRole string
-
-		if err = rows.Scan(&grantedRole); err != nil {
-			return fmt.Errorf("could not scan role name for role %s: %w", role, err)
+		if !member {
+			continue
 		}
-		// We cannot revoke directly here as it shares the same cursor (with Tx)
-		// and rows.Next seems to retrieve result row by row.
-		// see: https://github.com/lib/pq/issues/81
-		grantedRoles = append(grantedRoles, grantedRole)
-	}
 
-	for _, grantedRole := range grantedRoles {
-		query = fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(grantedRole), pq.QuoteIdentifier(role))
-
+		query := fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(revokedRole.(string)), pq.QuoteIdentifier(role))
 		if _, err := txn.Exec(query); err != nil {
-			return fmt.Errorf("could not revoke role %s from %s: %w", string(grantedRole), role, err)
+			return fmt.Errorf("could not revoke role %s from %s: %w", revokedRole, role, err)
+		}
+	}
+
+	for _, grantedRole := range added {
+		query := fmt.Sprintf("GRANT %s TO %s", pq.QuoteIdentifier(grantedRole.(string)), pq.QuoteIdentifier(role))
+		if _, err := txn.Exec(query); err != nil {
+			return fmt.Errorf("could not grant role %s to %s: %w", grantedRole, role, err)
 		}
 	}
 
@@ -1238,6 +1278,153 @@ func setRoleParameters(txn *sql.Tx, d *schema.ResourceData) error {
 	oldParams, newParams := d.GetChange(roleParametersAttr)
 
 	return alterConfigParameters(txn, "ROLE", roleName, oldParams.(map[string]any), newParams.(map[string]any))
+}
+
+// roleDatabaseParameters returns the parameters set for the role in each database.
+func roleDatabaseParameters(set *schema.Set) (map[string]map[string]any, error) {
+	result := make(map[string]map[string]any, set.Len())
+	for _, v := range set.List() {
+		block := v.(map[string]any)
+		database := block["database"].(string)
+		if _, ok := result[database]; ok {
+			return nil, fmt.Errorf("%s: the database %q is defined twice", roleDatabaseParametersAttr, database)
+		}
+		parameters, _ := block["parameters"].(map[string]any)
+		if parameters == nil {
+			parameters = map[string]any{}
+		}
+		result[database] = parameters
+	}
+	return result, nil
+}
+
+func validateRoleDatabaseParameters(_ context.Context, d *schema.ResourceDiff, _ any) error {
+	set, ok := d.Get(roleDatabaseParametersAttr).(*schema.Set)
+	if !ok {
+		return nil
+	}
+	_, err := roleDatabaseParameters(set)
+	return err
+}
+
+// hashRoleDatabaseParameters identifies a database_parameters block by its database
+// and its parameters. The lists of the list parameters are compared element by element
+// because PostgreSQL does not store them the way they are written.
+func hashRoleDatabaseParameters(v any) int {
+	block := v.(map[string]any)
+	parameters, _ := block["parameters"].(map[string]any)
+	names := make([]string, 0, len(parameters))
+	for name := range parameters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s;", block["database"])
+	for _, name := range names {
+		value, _ := parameters[name].(string)
+		if listQuoteParameters[name] {
+			value = strings.Join(splitListParameter(value), "\x00")
+		}
+		fmt.Fprintf(&b, "%s=%s;", name, value)
+	}
+	return schema.HashString(b.String())
+}
+
+func readRoleDatabaseConfig(db QueryAble, roleName, database string) (map[string]any, error) {
+	var config pq.StringArray
+	err := db.QueryRow(`SELECT COALESCE((
+		SELECT s.setconfig FROM pg_catalog.pg_db_role_setting AS s
+		JOIN pg_catalog.pg_database AS d ON d.oid = s.setdatabase
+		JOIN pg_catalog.pg_roles AS r ON r.oid = s.setrole
+		WHERE d.datname = $1 AND r.rolname = $2
+	), '{}'::text[])`, database, roleName).Scan(&config)
+	if err != nil {
+		return nil, fmt.Errorf("error reading parameters of role %s in database %s: %w", roleName, database, err)
+	}
+	return parseConfigParameters(config, roleReservedParameters), nil
+}
+
+// readRoleDatabaseParameters reads the parameters of the databases which are in
+// the resource: the other databases are not managed.
+func readRoleDatabaseParameters(db QueryAble, d *schema.ResourceData) error {
+	set, ok := d.Get(roleDatabaseParametersAttr).(*schema.Set)
+	if !ok {
+		return nil
+	}
+	known, err := roleDatabaseParameters(set)
+	if err != nil {
+		return err
+	}
+
+	blocks := make([]any, 0, len(known))
+	for database, previous := range known {
+		stored, err := readRoleDatabaseConfig(db, d.Id(), database)
+		if err != nil {
+			return err
+		}
+		// keep the way a list is written if it is the same list
+		for name, value := range stored {
+			if prev, ok := previous[name].(string); ok && listQuoteParameters[name] {
+				if v, _ := value.(string); slices.Equal(splitListParameter(prev), splitListParameter(v)) {
+					stored[name] = prev
+				}
+			}
+		}
+		blocks = append(blocks, map[string]any{"database": database, "parameters": stored})
+	}
+	return d.Set(roleDatabaseParametersAttr, blocks)
+}
+
+func setRoleDatabaseParameters(txn *sql.Tx, d *schema.ResourceData) error {
+	if !d.HasChange(roleDatabaseParametersAttr) {
+		return nil
+	}
+
+	oldSet, newSet := d.GetChange(roleDatabaseParametersAttr)
+	oldParams, err := roleDatabaseParameters(oldSet.(*schema.Set))
+	if err != nil {
+		return err
+	}
+	newParams, err := roleDatabaseParameters(newSet.(*schema.Set))
+	if err != nil {
+		return err
+	}
+
+	roleName := d.Get(roleNameAttr).(string)
+	databases := make([]string, 0, len(oldParams)+len(newParams))
+	for database := range oldParams {
+		databases = append(databases, database)
+	}
+	for database := range newParams {
+		if _, ok := oldParams[database]; !ok {
+			databases = append(databases, database)
+		}
+	}
+	sort.Strings(databases)
+
+	for _, database := range databases {
+		read := func() (map[string]any, error) { return readRoleDatabaseConfig(txn, roleName, database) }
+		old, ok := oldParams[database]
+		if !ok {
+			// A database which enters the resource: the parameters which are
+			// already set and not in the resource are reset.
+			if old, err = read(); err != nil {
+				return err
+			}
+		}
+		// A database which is not in the resource anymore is not managed anymore: its parameters are reset.
+		err := alterConfigParametersOn(
+			txn,
+			fmt.Sprintf("ROLE %s IN DATABASE %s", pq.QuoteIdentifier(roleName), pq.QuoteIdentifier(database)),
+			fmt.Sprintf("role %s in database %s", roleName, database),
+			read, old, newParams[database],
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func getWO(d *schema.ResourceData, attribute string) (string, bool) {
