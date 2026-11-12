@@ -22,6 +22,7 @@ const (
 	eventTriggerDatabaseAttr       = "database"
 	eventTriggerOwnerAttr          = "owner"
 	eventTriggerStatusAttr         = "status"
+	eventTriggerDropCascadeAttr    = "drop_cascade"
 )
 
 var eventTriggerStatusMap = map[string]string{
@@ -57,6 +58,7 @@ func resourcePostgreSQLEventTrigger() *schema.Resource {
 					"ddl_command_end",
 					"sql_drop",
 					"table_rewrite",
+					"login",
 				}, false),
 			},
 			eventTriggerFunctionAttr: {
@@ -69,6 +71,7 @@ func resourcePostgreSQLEventTrigger() *schema.Resource {
 				Type:     schema.TypeList,
 				Optional: true,
 				ForceNew: true,
+				MaxItems: 1, // PostgreSQL refuses a filter variable specified more than once
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						eventTriggerFilterVariableAttr: {
@@ -119,6 +122,12 @@ func resourcePostgreSQLEventTrigger() *schema.Resource {
 					"enable_always",
 				}, false),
 			},
+			eventTriggerDropCascadeAttr: {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "Automatically drop objects that depend on the event trigger, and in turn all objects that depend on those objects. Drop RESTRICT is the default",
+			},
 			eventTriggerOwnerAttr: {
 				Type:        schema.TypeString,
 				Required:    true,
@@ -136,6 +145,13 @@ func resourcePostgreSQLEventTrigger() *schema.Resource {
 func resourcePostgreSQLEventTriggerCreate(db *DBConnection, d *schema.ResourceData) error {
 	eventTriggerName := d.Get(eventTriggerNameAttr).(string)
 	database := getDatabase(d, db.client.databaseName)
+
+	if d.Get(eventTriggerOnAttr).(string) == "login" && !db.featureSupported(featureEventTriggerLogin) {
+		return fmt.Errorf(
+			"event trigger on the login event is not supported for this Postgres version (%s), it requires version 17 or above",
+			db.version,
+		)
+	}
 
 	b := bytes.NewBufferString("CREATE EVENT TRIGGER ")
 	fmt.Fprint(b, pq.QuoteIdentifier(eventTriggerName))
@@ -284,7 +300,12 @@ func resourcePostgreSQLEventTriggerDelete(db *DBConnection, d *schema.ResourceDa
 
 	d.SetId(generateSchemaID(d, database))
 
-	sql := fmt.Sprintf("DROP EVENT TRIGGER %s", pq.QuoteIdentifier(eventTriggerName))
+	dropMode := "RESTRICT"
+	if d.Get(eventTriggerDropCascadeAttr).(bool) {
+		dropMode = "CASCADE"
+	}
+
+	sql := fmt.Sprintf("DROP EVENT TRIGGER %s %s", pq.QuoteIdentifier(eventTriggerName), dropMode)
 
 	txn, err := startTransaction(db.client, d.Get(eventTriggerDatabaseAttr).(string))
 	if err != nil {
@@ -355,6 +376,8 @@ func resourcePostgreSQLEventTriggerRead(db *DBConnection, d *schema.ResourceData
 	d.Set(eventTriggerOwnerAttr, owner)
 	d.Set(eventTriggerDatabaseAttr, database)
 	d.Set(eventTriggerFunctionSchemaAttr, schema)
+	// drop_cascade is not stored in PostgreSQL: keep the value of the state, which is false after an import.
+	d.Set(eventTriggerDropCascadeAttr, d.Get(eventTriggerDropCascadeAttr).(bool))
 
 	switch status {
 	case "D":
