@@ -22,3 +22,11 @@ export PGSSLMODE=require
 # What only exists on AWS: IAM authentication and a password from Secrets Manager
 export RDS_SECRET
 "$HERE/e2e/rds_secret.sh"
+
+# The provider itself logging in with IAM authentication and an assumed role.
+# It creates an IAM role (and an IAM user when the credentials are the ones of the
+# root user): set RDS_IAM_TEST=0 to skip it when the credentials cannot do that.
+if [ "${RDS_IAM_TEST:-1}" != 0 ]; then
+    export RDS_NAME RDS_IAM_ROLE RDS_IAM_USER
+    "$HERE/e2e/rds_iam.sh"
+fi

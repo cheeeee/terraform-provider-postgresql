@@ -7,6 +7,12 @@
 # variable of the "rds-test" environment (OpenID Connect, no stored key). Protect
 # this environment with a required reviewer to control who can create instances.
 #
+# The end-to-end test also creates a temporary IAM role, to test the IAM authentication
+# of the provider with an assumed role: the credentials need iam:CreateRole, PutRolePolicy,
+# DeleteRolePolicy, DeleteRole, GetRole and sts:AssumeRole on the roles named tfpg-test-*.
+# (With the credentials of the root user of an account, which cannot assume a role, a
+# temporary IAM user is created as well.)
+#
 # It can also be run locally with act, with the AWS credentials of the host:
 #   - access keys in a file (AWS_ACCESS_KEY_ID=... / AWS_SECRET_ACCESS_KEY=...):
 #       act workflow_dispatch -W .github/workflows/rds-test.yml --input pgversion=17 --env-file aws.env
