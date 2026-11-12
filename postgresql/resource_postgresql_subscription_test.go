@@ -124,9 +124,24 @@ func testAccCheckPostgresqlSubscriptionExists(n string) resource.TestCheckFunc {
 			return fmt.Errorf("Subscription not found")
 		}
 
-		streams, err := checkSubscriptionStreams(txn, subName)
-		if err != nil {
-			return fmt.Errorf("error checking subscription %s", err)
+		// the walsender of the publisher takes a moment to start streaming
+		var streams bool
+		for i := 0; i < 30; i++ {
+			streams, err = checkSubscriptionStreams(txn, subName)
+			if err != nil {
+				return fmt.Errorf("error checking subscription %s", err)
+			}
+			if streams {
+				break
+			}
+			time.Sleep(time.Second)
+			if err := txn.Commit(); err != nil {
+				return err
+			}
+			if txn, err = startTransaction(client, databaseName); err != nil {
+				return err
+			}
+			defer deferredRollback(txn)
 		}
 		if !streams {
 			return fmt.Errorf("Subscription not streaming")
@@ -1012,7 +1027,8 @@ func TestAccPostgresqlSubscription_UnsupportedOptions(t *testing.T) {
 	}
 	var steps []resource.TestStep
 	for _, u := range unsupported {
-		if version >= u.minimum {
+		// before 14 the server does not know streaming at all, which the previous step covers
+		if version >= u.minimum || (u.since == "16" && strings.HasPrefix(u.line, "streaming") && version < 140000) {
 			continue
 		}
 		steps = append(steps, resource.TestStep{
@@ -1581,7 +1597,7 @@ func TestAccPostgresqlSubscription_CreateSlotOnRemotePublisher(t *testing.T) {
 	dbNameSub, _ := getTestDBNames(dbSuffixSub)
 	remoteDB := "tf_remote_pub_" + strconv.Itoa(int(time.Now().UnixNano()))
 	dbExecute(t, dsnFor("postgres"), "CREATE DATABASE "+remoteDB)
-	t.Cleanup(func() { dbExecute(t, dsnFor("postgres"), "DROP DATABASE IF EXISTS "+remoteDB+" WITH (FORCE)") })
+	t.Cleanup(func() { dbExecute(t, dsnFor("postgres"), "DROP DATABASE IF EXISTS "+remoteDB+"") })
 	dbExecute(t, dsnFor(remoteDB), "CREATE SCHEMA test_schema")
 	dbExecute(t, dsnFor(remoteDB), "CREATE TABLE test_schema.test_table_1 (val text, test_column_one text, test_column_two text)")
 	dbExecute(t, dsnFor(remoteDB), "CREATE PUBLICATION tf_remote_publication FOR TABLE test_schema.test_table_1")
