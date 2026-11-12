@@ -1462,9 +1462,19 @@ func TestAccPostgresqlSubscription_Replication(t *testing.T) {
 				),
 			},
 			{
+				// the publications of a disabled subscription change without refresh (the server refuses it)
+				Config: s.config(name, []string{"pub1"}, options+"\nenabled = false"),
+				Check: resource.ComposeTestCheckFunc(
+					s.catalog(name, "subenabled", "false"),
+					s.publications(name, "test_publication_1"),
+				),
+			},
+			{
+				// enabled again, with the two publications
 				Config: s.config(name, []string{"pub1", "pub2"}, options+"\nenabled = true"),
 				Check: resource.ComposeTestCheckFunc(
 					s.catalog(name, "subenabled", "true"),
+					s.publications(name, "test_publication_1,test_publication_2"),
 					s.replicated("test_schema.test_table_1", 3),
 				),
 			},
