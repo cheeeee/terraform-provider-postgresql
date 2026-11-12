@@ -4,6 +4,13 @@ HERE=$(dirname $(readlink -f ${BASH_SOURCE:-${(%):-%N}}))
 
 source "$HERE/switch_superuser.sh"
 
+# Use psql from the postgres container if it's not installed locally
+if ! command -v psql > /dev/null; then
+    psql() {
+        docker compose -f "$HERE/docker-compose.yml" exec -T -e PGUSER="$PGUSER" -e PGPASSWORD="$PGPASSWORD" postgres psql "$@"
+    }
+fi
+
 echo "Switching to an RDS-like environment"
 psql -d postgres  > /dev/null <<EOS
 BEGIN;
