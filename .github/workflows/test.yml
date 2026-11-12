@@ -54,6 +54,19 @@ jobs:
             echo "E2E_TERRAFORM=tofu"
           } >> "$GITHUB_ENV"
 
+      # With act all the jobs of the matrix run on the same Docker host:
+      # each one gets its own test database.
+      - name: Use a separate test database (act)
+        if: ${{ env.ACT }}
+        run: |
+          version="${{ matrix.pgversion }}"
+          port=$((25500 + ${version%%[a-z]*} * 2))
+          if [ "${{ matrix.cli }}" = "opentofu" ]; then port=$((port + 1)); fi
+          {
+            echo "COMPOSE_PROJECT_NAME=tfpg-ci-${version}-${{ matrix.cli }}"
+            echo "TEST_PGPORT=${port}"
+          } >> "$GITHUB_ENV"
+
       - name: test
         run: make test
 
