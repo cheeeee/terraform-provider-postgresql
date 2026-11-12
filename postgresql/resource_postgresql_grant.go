@@ -521,7 +521,7 @@ JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
 LEFT JOIN (SELECT oid, (aclexplode(typacl)).* FROM pg_type) privs
 	ON privs.oid = pg_type.oid AND privs.grantee = $1
 WHERE pg_namespace.nspname = $2 AND pg_type.typname = ANY($3)
-GROUP BY pg_type.oid
+GROUP BY pg_type.oid, pg_type.typname
 `
 		rows, err = txn.Query(query, roleOID, d.Get("schema"), pq.StringArray(setToStrings(objects)))
 
@@ -532,7 +532,7 @@ FROM pg_language
 LEFT JOIN (SELECT lanname, (aclexplode(lanacl)).* FROM pg_language) privs
 	ON privs.lanname = pg_language.lanname AND privs.grantee = $1
 WHERE pg_language.lanname = ANY($2)
-GROUP BY pg_language.oid
+GROUP BY pg_language.oid, pg_language.lanname
 `
 		rows, err = txn.Query(query, roleOID, pq.StringArray(setToStrings(objects)))
 
@@ -543,7 +543,7 @@ FROM pg_tablespace
 LEFT JOIN (SELECT spcname, (aclexplode(spcacl)).* FROM pg_tablespace) privs
 	ON privs.spcname = pg_tablespace.spcname AND privs.grantee = $1
 WHERE pg_tablespace.spcname = ANY($2)
-GROUP BY pg_tablespace.oid
+GROUP BY pg_tablespace.oid, pg_tablespace.spcname
 `
 		rows, err = txn.Query(query, roleOID, pq.StringArray(setToStrings(objects)))
 

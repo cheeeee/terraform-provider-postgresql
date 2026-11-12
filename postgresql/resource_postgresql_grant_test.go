@@ -2481,3 +2481,86 @@ func TestAccPostgresqlGrantPrivilegeMatrix(t *testing.T) {
 		}
 	}
 }
+
+// TestAccPostgresqlGrantFunctionWithNamedArgs grants a function given with the names and the modes
+// of its arguments, as PostgreSQL accepts them in the GRANT statement.
+func TestAccPostgresqlGrantFunctionWithNamedArgs(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dsn := testPostgresDSN(t)
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_named_role LOGIN PASSWORD '%s'", testRolePassword))
+	dbExecute(t, dsn, "CREATE SCHEMA test_named_schema")
+	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_named_schema TO test_named_role")
+	dbExecute(t, dsn, "CREATE FUNCTION test_named_schema.test(IN arg1 text, arg2 character) RETURNS text AS $$ select 'foo'::text $$ LANGUAGE SQL")
+	dbExecute(t, dsn, "REVOKE ALL ON FUNCTION test_named_schema.test(text, character) FROM PUBLIC")
+
+	defer func() {
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_named_schema CASCADE")
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_named_role")
+	}()
+
+	tfConfig := `
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_named_role"
+  schema      = "test_named_schema"
+  object_type = "function"
+  privileges  = %s
+  objects     = ["test(IN arg1 text, arg2 character)"]
+}
+`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(tfConfig, `["EXECUTE"]`),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "1"),
+					testCheckFunctionWithArgsExecutable(t, "test_named_role", "test_named_schema.test", []string{pq.QuoteLiteral("value 1"), pq.QuoteLiteral("value 2")}),
+				),
+			},
+			{
+				Config: fmt.Sprintf(tfConfig, `[]`),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "0"),
+					func(*terraform.State) error {
+						db := connectAsTestRole(t, "test_named_role", "postgres")
+						defer closeDB(t, db)
+						return testHasGrantForQuery(db, "SELECT test_named_schema.test('value 1', 'value 2')", false)
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantPublicWithGrantOption checks that a grant option is refused for PUBLIC,
+// which PostgreSQL does not allow.
+func TestAccPostgresqlGrantPublicWithGrantOption(t *testing.T) {
+	skipIfNotAcc(t)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:  func() { testAccPreCheck(t) },
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_grant" "test" {
+  database          = "postgres"
+  role              = "public"
+  schema            = "public"
+  object_type       = "schema"
+  privileges        = ["USAGE"]
+  with_grant_option = true
+}
+`,
+				ExpectError: regexp.MustCompile("with_grant_option cannot be used with role public"),
+			},
+		},
+	})
+}
