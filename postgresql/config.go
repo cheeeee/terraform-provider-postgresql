@@ -51,6 +51,8 @@ const (
 	featureCreateRoleSelfGrant
 	featureSecurityLabel
 	featureMaintainPrivilege
+	featureLogicalSlotTwoPhase
+	featureLogicalSlotFailover
 )
 
 var (
@@ -130,6 +132,11 @@ var (
 
 		// MAINTAIN privilege on tables (PG 17+)
 		featureMaintainPrivilege: semver.MustParseRange(">=17.0.0"),
+
+		// twophase argument of pg_create_logical_replication_slot (PG 14+)
+		featureLogicalSlotTwoPhase: semver.MustParseRange(">=14.0.0"),
+		// failover argument of pg_create_logical_replication_slot (PG 17+)
+		featureLogicalSlotFailover: semver.MustParseRange(">=17.0.0"),
 	}
 )
 
