@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -412,8 +413,20 @@ func fingerprintCapabilities(db *sql.DB) (*semver.Version, error) {
 		return nil, fmt.Errorf("error PostgreSQL version: %w", err)
 	}
 
+	return parseServerVersion(pgVersion)
+}
+
+// serverVersionRegexp matches the numeric part of a version of PostgreSQL,
+// which can be followed by the name of a pre-release (e.g.: 19rc1, 19beta3, 19devel).
+var serverVersionRegexp = regexp.MustCompile(`^\d+(\.\d+)*`)
+
+// parseServerVersion returns the version of the server from the result of VERSION().
+// A pre-release is seen as the release itself (19rc1 is 19.0.0): the version is
+// only used to know which features are supported.
+func parseServerVersion(pgVersion string) (*semver.Version, error) {
 	// PostgreSQL 9.2.21 on x86_64-apple-darwin16.5.0, compiled by Apple LLVM version 8.1.0 (clang-802.0.42), 64-bit
 	// PostgreSQL 9.6.7, compiled by Visual C++ build 1800, 64-bit
+	// PostgreSQL 19rc1 (Debian 19~rc1-1.pgdg13+1) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
 	fields := strings.FieldsFunc(pgVersion, func(c rune) bool {
 		return unicode.IsSpace(c) || c == ','
 	})
@@ -421,7 +434,11 @@ func fingerprintCapabilities(db *sql.DB) (*semver.Version, error) {
 		return nil, fmt.Errorf("error determining the server version: %q", pgVersion)
 	}
 
-	version, err := semver.ParseTolerant(fields[1])
+	number := serverVersionRegexp.FindString(fields[1])
+	if number == "" {
+		number = fields[1]
+	}
+	version, err := semver.ParseTolerant(number)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing version: %w", err)
 	}

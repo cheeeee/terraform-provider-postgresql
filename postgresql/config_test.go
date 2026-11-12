@@ -142,3 +142,40 @@ func TestConnectWithRetryGivesUpAfterMaxConnRetries(t *testing.T) {
 		t.Errorf("expected exactly 4 connection attempts (1 initial + MaxConnRetries), got %d", got)
 	}
 }
+
+func TestParseServerVersion(t *testing.T) {
+	var tests = []struct {
+		pgVersion string
+		expected  string
+	}{
+		{"PostgreSQL 9.2.21 on x86_64-apple-darwin16.5.0, compiled by Apple LLVM version 8.1.0 (clang-802.0.42), 64-bit", "9.2.21"},
+		{"PostgreSQL 9.6.7, compiled by Visual C++ build 1800, 64-bit", "9.6.7"},
+		{"PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit", "17.11.0"},
+		{"PostgreSQL 17.11 on aarch64-unknown-linux-gnu, compiled by aarch64-unknown-linux-gnu-gcc (GCC) 12.4.0, 64-bit", "17.11.0"},
+		// pre-releases
+		{"PostgreSQL 19rc1 (Debian 19~rc1-1.pgdg13+1) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit", "19.0.0"},
+		{"PostgreSQL 19beta3 on x86_64-pc-linux-gnu, compiled by gcc (GCC) 14.2.0, 64-bit", "19.0.0"},
+		{"PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (GCC) 14.2.0, 64-bit", "20.0.0"},
+		// not a version
+		{"PostgreSQL", ""},
+		{"PostgreSQL unknown on x86_64-pc-linux-gnu", ""},
+		{"", ""},
+	}
+
+	for _, test := range tests {
+		version, err := parseServerVersion(test.pgVersion)
+		if test.expected == "" {
+			if err == nil {
+				t.Errorf("parseServerVersion(%q): expected an error, got %s", test.pgVersion, version)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseServerVersion(%q): %v", test.pgVersion, err)
+			continue
+		}
+		if version.String() != test.expected {
+			t.Errorf("parseServerVersion(%q): expected %s, got %s", test.pgVersion, test.expected, version)
+		}
+	}
+}

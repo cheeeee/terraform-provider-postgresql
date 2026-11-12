@@ -13,7 +13,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pgversion: [18, 17, 16, 15, 14, 13, 12]
+        # 19rc1 has to be replaced by 19 as soon as PostgreSQL 19 is released
+        pgversion: [19rc1, 18, 17, 16, 15, 14, 13, 12]
         # Everything which goes through the CLI (acceptance and end-to-end tests)
         # is run the same way with Terraform and with OpenTofu.
         cli: [terraform, opentofu]
