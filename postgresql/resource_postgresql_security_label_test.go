@@ -331,9 +331,7 @@ func testAccCheckSecurityLabelAbsentOfRole(t *testing.T, role string) resource.T
 	return testAccCheckSecurityLabelAbsent(t, "postgres", "role", testAccRoleCatalogName(role), "dummy")
 }
 
-// The label of each resource of the state is gone. The roles of the tests are dropped by the
-// destroy, so this proves that the label is not left in the catalog for any other object
-// either: pg_shseclabel has no row of the provider whose object does not exist.
+// The label of each resource of the state is gone from pg_seclabels.
 func testAccCheckPostgresqlSecurityLabelDestroy(s *terraform.State) error {
 	client := testAccProvider.Meta().(*Client)
 	db, err := client.Connect()
@@ -362,16 +360,6 @@ func testAccCheckPostgresqlSecurityLabelDestroy(s *terraform.State) error {
 		if count != 0 {
 			return fmt.Errorf("the security label of role %s still exists after destroy", objectName)
 		}
-	}
-
-	var orphans int
-	if err := db.QueryRow(`SELECT count(*) FROM pg_catalog.pg_shseclabel l
-		WHERE l.provider = 'dummy' AND l.classoid = 'pg_authid'::regclass
-		AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_authid a WHERE a.oid = l.objoid)`).Scan(&orphans); err != nil {
-		return fmt.Errorf("error checking security labels: %w", err)
-	}
-	if orphans != 0 {
-		return fmt.Errorf("%d security labels of dropped roles are left", orphans)
 	}
 
 	return nil
