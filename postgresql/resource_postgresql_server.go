@@ -155,6 +155,11 @@ func resourcePostgreSQLServerRead(db *DBConnection, d *schema.ResourceData) erro
 		)
 	}
 
+	// After an import, only the ID (the server name) is known.
+	if d.Get(serverNameAttr).(string) == "" {
+		d.Set(serverNameAttr, d.Id())
+	}
+
 	return resourcePostgreSQLServerReadImpl(db, d)
 }
 
@@ -183,7 +188,7 @@ func resourcePostgreSQLServerReadImpl(db *DBConnection, d *schema.ResourceData) 
 
 	mappedOptions := make(map[string]any)
 	for _, v := range serverOptions {
-		pair := strings.Split(v, "=")
+		pair := strings.SplitN(v, "=", 2)
 		mappedOptions[pair[0]] = pair[1]
 	}
 
