@@ -54,6 +54,7 @@ const (
 	featureEventTriggerLogin
 	featureLogicalSlotTwoPhase
 	featureLogicalSlotFailover
+	featureDefaultPrivilegesLargeObjects
 )
 
 var (
@@ -140,6 +141,8 @@ var (
 		featureLogicalSlotTwoPhase: semver.MustParseRange(">=14.0.0"),
 		// failover argument of pg_create_logical_replication_slot (PG 17+)
 		featureLogicalSlotFailover: semver.MustParseRange(">=17.0.0"),
+		// ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS (PG 18+)
+		featureDefaultPrivilegesLargeObjects: semver.MustParseRange(">=18.0.0"),
 	}
 )
 

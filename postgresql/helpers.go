@@ -320,6 +320,7 @@ var allowedPrivileges = map[string][]string{
 	"foreign_data_wrapper": {"ALL", "USAGE"},
 	"foreign_server":       {"ALL", "USAGE"},
 	"column":               {"ALL", "SELECT", "INSERT", "UPDATE", "REFERENCES"},
+	"large_object":         {"ALL", "SELECT", "UPDATE"},
 }
 
 // allowedPrivilegesForObjectType returns the allowed privileges for a given object type,
