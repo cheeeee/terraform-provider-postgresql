@@ -309,6 +309,11 @@ func resourcePostgreSQLRoleCreate(db *DBConnection, d *schema.ResourceData) erro
 			if strings.ToUpper(val) == "NULL" {
 				createOpts = append(createOpts, "PASSWORD NULL")
 			} else {
+				if db.hashesRolePasswords() {
+					if val, err = hashRolePassword(db, txn, val); err != nil {
+						return err
+					}
+				}
 				if d.Get(roleEncryptedPassAttr).(bool) {
 					createOpts = append(createOpts, "ENCRYPTED")
 				} else {
@@ -710,7 +715,7 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 		return err
 	}
 
-	if err := setRolePassword(txn, d); err != nil {
+	if err := setRolePassword(db, txn, d); err != nil {
 		return err
 	}
 
@@ -808,7 +813,7 @@ func setRoleName(txn *sql.Tx, d *schema.ResourceData) error {
 	return nil
 }
 
-func setRolePassword(txn *sql.Tx, d *schema.ResourceData) error {
+func setRolePassword(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
 
 	// Early exit if password WO and version are set, and version has not changed
 	if _, ok := getWO(d, rolePasswordWOAttr); ok {
@@ -835,12 +840,62 @@ func setRolePassword(txn *sql.Tx, d *schema.ResourceData) error {
 		return nil
 	}
 
+	if db.hashesRolePasswords() {
+		var err error
+		if password, err = hashRolePassword(db, txn, password); err != nil {
+			return err
+		}
+	}
+
 	sql := fmt.Sprintf("ALTER ROLE %s PASSWORD '%s'", pq.QuoteIdentifier(roleName), pqQuoteLiteral(password))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating role password: %w", err)
 	}
 
 	return nil
+}
+
+// hashesRolePasswords returns true if the provider hashes the passwords of the
+// roles itself instead of sending them in clear-text.
+// It is the default as soon as the server supports SCRAM-SHA-256; it is refused
+// by hashRolePassword when it is asked for explicitly on a server which does not.
+func (db *DBConnection) hashesRolePasswords() bool {
+	switch db.client.config.PasswordAuthentication {
+	case "password":
+		return false
+	case "scram-sha-256":
+		return true
+	default:
+		return db.featureSupported(featureScramSHA256)
+	}
+}
+
+// hashRolePassword hashes a clear-text password with SCRAM-SHA-256, the way
+// PostgreSQL would hash it, so it is not sent in clear-text in the
+// CREATE ROLE / ALTER ROLE statement (which the server may log).
+// A password which is already hashed is returned as-is.
+func hashRolePassword(db *DBConnection, txn *sql.Tx, password string) (string, error) {
+	if !db.featureSupported(featureScramSHA256) {
+		return "", errors.New(`password_authentication = "scram-sha-256" requires PostgreSQL 10 or later`)
+	}
+
+	if isHashedPassword(password) {
+		return password, nil
+	}
+
+	iterations := scramSHA256DefaultIterations
+	if db.featureSupported(featureScramIterations) {
+		if err := txn.QueryRow("SHOW scram_iterations").Scan(&iterations); err != nil {
+			return "", fmt.Errorf("could not read scram_iterations: %w", err)
+		}
+	}
+
+	salt, err := newScramSHA256Salt()
+	if err != nil {
+		return "", err
+	}
+
+	return scramSHA256Password(password, salt, iterations)
 }
 
 func setRoleBypassRLS(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
