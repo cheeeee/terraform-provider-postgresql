@@ -26,6 +26,14 @@ const (
 	dbTemplateAttr         = "template"
 	dbAlterObjectOwnership = "alter_object_ownership"
 	dbParametersAttr       = "parameters"
+	dbLocaleAttr           = "locale"
+	dbLocaleProviderAttr   = "locale_provider"
+	dbICULocaleAttr        = "icu_locale"
+	dbICURulesAttr         = "icu_rules"
+	dbBuiltinLocaleAttr    = "builtin_locale"
+	dbCollationVersionAttr = "collation_version"
+	dbStrategyAttr         = "strategy"
+	dbOIDAttr              = "oid"
 )
 
 func resourcePostgreSQLDatabase() *schema.Resource {
@@ -66,23 +74,91 @@ func resourcePostgreSQLDatabase() *schema.Resource {
 				Description: "Character set encoding to use in the new database",
 			},
 			dbCollationAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Computed:    true,
-				ForceNew:    true,
-				Description: "Collation order (LC_COLLATE) to use in the new database",
+				Type:          schema.TypeString,
+				Optional:      true,
+				Computed:      true,
+				ForceNew:      true,
+				ConflictsWith: []string{dbLocaleAttr},
+				Description:   "Collation order (LC_COLLATE) to use in the new database",
 			},
 			dbCTypeAttr: {
+				Type:          schema.TypeString,
+				Optional:      true,
+				Computed:      true,
+				ForceNew:      true,
+				ConflictsWith: []string{dbLocaleAttr},
+				Description:   "Character classification (LC_CTYPE) to use in the new database",
+			},
+			dbLocaleAttr: {
+				Type:          schema.TypeString,
+				Optional:      true,
+				Computed:      true,
+				ForceNew:      true,
+				ConflictsWith: []string{dbCollationAttr, dbCTypeAttr},
+				Description:   "Locale (LOCALE) to use in the new database, it sets LC_COLLATE and LC_CTYPE at once (PostgreSQL 13 and above)",
+			},
+			dbLocaleProviderAttr: {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Computed:     true,
+				ForceNew:     true,
+				ValidateFunc: validation.StringInSlice([]string{"libc", "icu", "builtin"}, false),
+				Description:  "The provider of the locale of the new database: libc, icu or builtin (LOCALE_PROVIDER, PostgreSQL 15 and above, builtin on 17 and above)",
+			},
+			dbICULocaleAttr: {
 				Type:        schema.TypeString,
 				Optional:    true,
 				Computed:    true,
 				ForceNew:    true,
-				Description: "Character classification (LC_CTYPE) to use in the new database",
+				Description: "The ICU locale of the new database, used with locale_provider = icu (ICU_LOCALE, PostgreSQL 15 and above)",
 			},
-			dbTablespaceAttr: {
+			dbICURulesAttr: {
 				Type:        schema.TypeString,
 				Optional:    true,
 				Computed:    true,
+				ForceNew:    true,
+				Description: "Additional ICU collation rules of the new database, used with locale_provider = icu (ICU_RULES, PostgreSQL 16 and above)",
+			},
+			dbBuiltinLocaleAttr: {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Computed:    true,
+				ForceNew:    true,
+				Description: "The builtin locale of the new database, used with locale_provider = builtin (BUILTIN_LOCALE, PostgreSQL 17 and above)",
+			},
+			dbCollationVersionAttr: {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Computed:    true,
+				ForceNew:    true,
+				Description: "The version of the collation of the new database (COLLATION_VERSION, PostgreSQL 15 and above). Changing the version of the operating system library changes it, which forces a new database: see the documentation",
+			},
+			dbStrategyAttr: {
+				Type:         schema.TypeString,
+				Optional:     true,
+				ValidateFunc: validation.StringInSlice([]string{"file_copy", "wal_log"}, false),
+				// The strategy is only used when the database is created: it is not read back
+				// and its changes are ignored once the database exists.
+				DiffSuppressFunc: func(_, _, _ string, d *schema.ResourceData) bool {
+					return d.Id() != ""
+				},
+				Description: "The strategy used to copy the template database (STRATEGY, PostgreSQL 15 and above): file_copy or wal_log. Only used at creation, it is not read back and its changes are ignored",
+			},
+			dbOIDAttr: {
+				Type:        schema.TypeInt,
+				Optional:    true,
+				Computed:    true,
+				ForceNew:    true,
+				Description: "The OID of the new database (OID, PostgreSQL 15 and above)",
+			},
+			dbTablespaceAttr: {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+				// DEFAULT is the default tablespace, which is read back as pg_default.
+				DiffSuppressFunc: func(_, old, new string, _ *schema.ResourceData) bool {
+					return strings.EqualFold(new, "DEFAULT") && old == "pg_default"
+				},
 				Description: "The name of the tablespace that will be associated with the new database",
 			},
 			dbConnLimitAttr: {
@@ -137,7 +213,35 @@ func resourcePostgreSQLDatabaseCreate(db *DBConnection, d *schema.ResourceData) 
 	return resourcePostgreSQLDatabaseReadImpl(db, d)
 }
 
+// checkDBCreateOptions returns an error if a CREATE DATABASE option is set but the
+// server is too old to accept it.
+func checkDBCreateOptions(db *DBConnection, d *schema.ResourceData) error {
+	options := []struct {
+		attr, clause string
+		feature      featureName
+	}{
+		{dbLocaleAttr, "LOCALE", featureDBLocale},
+		{dbStrategyAttr, "STRATEGY", featureDBStrategy},
+		{dbOIDAttr, "OID", featureDBOID},
+		{dbLocaleProviderAttr, "LOCALE_PROVIDER", featureDBLocaleProvider},
+		{dbICULocaleAttr, "ICU_LOCALE", featureDBLocaleProvider},
+		{dbCollationVersionAttr, "COLLATION_VERSION", featureDBLocaleProvider},
+		{dbICURulesAttr, "ICU_RULES", featureDBICURules},
+		{dbBuiltinLocaleAttr, "BUILTIN_LOCALE", featureDBBuiltinLocale},
+	}
+	for _, option := range options {
+		if _, ok := d.GetOk(option.attr); ok && !db.featureSupported(option.feature) {
+			return fmt.Errorf("PostgreSQL client is talking with a server (%q) that does not support database %s", db.version.String(), option.clause)
+		}
+	}
+	return nil
+}
+
 func createDatabase(db *DBConnection, d *schema.ResourceData) error {
+	if err := checkDBCreateOptions(db, d); err != nil {
+		return err
+	}
+
 	currentUser := db.client.config.getDatabaseUsername()
 	owner := d.Get(dbOwnerAttr).(string)
 
@@ -219,6 +323,33 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 		fmt.Fprintf(b, " LC_CTYPE DEFAULT")
 	case ok:
 		fmt.Fprintf(b, " LC_CTYPE '%s' ", pqQuoteLiteral(v.(string)))
+	}
+
+	// The options below are only written when they are set: their defaults are the ones
+	// of the server (and of the template database).
+	if v, ok := d.GetOk(dbLocaleAttr); ok {
+		fmt.Fprintf(b, " LOCALE '%s' ", pqQuoteLiteral(v.(string)))
+	}
+	if v, ok := d.GetOk(dbLocaleProviderAttr); ok {
+		fmt.Fprint(b, " LOCALE_PROVIDER ", pq.QuoteIdentifier(v.(string)))
+	}
+	if v, ok := d.GetOk(dbICULocaleAttr); ok {
+		fmt.Fprintf(b, " ICU_LOCALE '%s' ", pqQuoteLiteral(v.(string)))
+	}
+	if v, ok := d.GetOk(dbICURulesAttr); ok {
+		fmt.Fprintf(b, " ICU_RULES '%s' ", pqQuoteLiteral(v.(string)))
+	}
+	if v, ok := d.GetOk(dbBuiltinLocaleAttr); ok {
+		fmt.Fprintf(b, " BUILTIN_LOCALE '%s' ", pqQuoteLiteral(v.(string)))
+	}
+	if v, ok := d.GetOk(dbCollationVersionAttr); ok {
+		fmt.Fprintf(b, " COLLATION_VERSION '%s' ", pqQuoteLiteral(v.(string)))
+	}
+	if v, ok := d.GetOk(dbStrategyAttr); ok {
+		fmt.Fprint(b, " STRATEGY ", pq.QuoteIdentifier(v.(string)))
+	}
+	if v, ok := d.GetOk(dbOIDAttr); ok {
+		fmt.Fprint(b, " OID ", v.(int))
 	}
 
 	switch v, ok := d.GetOk(dbTablespaceAttr); {
@@ -382,6 +513,17 @@ func resourcePostgreSQLDatabaseReadImpl(db *DBConnection, d *schema.ResourceData
 	d.Set(dbEncodingAttr, dbEncoding)
 	d.Set(dbCollationAttr, dbCollation)
 	d.Set(dbCTypeAttr, dbCType)
+	if db.featureSupported(featureDBLocale) {
+		// LOCALE sets LC_COLLATE and LC_CTYPE at once: it is read back when both are the same.
+		dbLocale := ""
+		if dbCollation == dbCType {
+			dbLocale = dbCollation
+		}
+		d.Set(dbLocaleAttr, dbLocale)
+	}
+	if err := readDBLocaleOptions(db, d); err != nil {
+		return err
+	}
 	d.Set(dbTablespaceAttr, dbTablespaceName)
 	d.Set(dbConnLimitAttr, dbConnLimit)
 	dbTemplate := d.Get(dbTemplateAttr).(string)
@@ -417,6 +559,57 @@ func resourcePostgreSQLDatabaseReadImpl(db *DBConnection, d *schema.ResourceData
 		return err
 	}
 	d.Set(dbParametersAttr, dbParameters)
+
+	return nil
+}
+
+// readDBLocaleOptions reads the options of the database which are stored in pg_database.
+// Their columns depend on the version: the ICU locale is in daticulocale up to PostgreSQL 16,
+// and in datlocale (shared with the builtin locale) from PostgreSQL 17.
+func readDBLocaleOptions(db *DBConnection, d *schema.ResourceData) error {
+	provider, icuLocale, icuRules, builtinLocale := "NULL::text", "NULL::text", "NULL::text", "NULL::text"
+	collationVersion, oid := "NULL::text", "NULL::bigint"
+	if db.featureSupported(featureDBLocaleProvider) {
+		provider = "CASE d.datlocprovider WHEN 'c' THEN 'libc' WHEN 'i' THEN 'icu' WHEN 'b' THEN 'builtin' END"
+		collationVersion = "d.datcollversion"
+		icuLocale = "d.daticulocale"
+	}
+	if db.featureSupported(featureDBBuiltinLocale) {
+		icuLocale = "CASE WHEN d.datlocprovider = 'i' THEN d.datlocale END"
+		builtinLocale = "CASE WHEN d.datlocprovider = 'b' THEN d.datlocale END"
+	}
+	if db.featureSupported(featureDBICURules) {
+		icuRules = "d.daticurules"
+	}
+	if db.featureSupported(featureDBOID) {
+		oid = "d.oid::bigint"
+	}
+
+	var dbProvider, dbICULocale, dbICURules, dbBuiltinLocale, dbCollationVersion sql.NullString
+	var dbOID sql.NullInt64
+	dbSQL := fmt.Sprintf(
+		"SELECT %s, %s, %s, %s, %s, %s FROM pg_catalog.pg_database AS d WHERE d.datname = $1",
+		provider, icuLocale, icuRules, builtinLocale, collationVersion, oid,
+	)
+	err := db.QueryRow(dbSQL, d.Id()).Scan(&dbProvider, &dbICULocale, &dbICURules, &dbBuiltinLocale, &dbCollationVersion, &dbOID)
+	if err != nil {
+		return fmt.Errorf("error reading database options: %w", err)
+	}
+
+	if db.featureSupported(featureDBLocaleProvider) {
+		d.Set(dbLocaleProviderAttr, dbProvider.String)
+		d.Set(dbICULocaleAttr, dbICULocale.String)
+		d.Set(dbCollationVersionAttr, dbCollationVersion.String)
+	}
+	if db.featureSupported(featureDBICURules) {
+		d.Set(dbICURulesAttr, dbICURules.String)
+	}
+	if db.featureSupported(featureDBBuiltinLocale) {
+		d.Set(dbBuiltinLocaleAttr, dbBuiltinLocale.String)
+	}
+	if db.featureSupported(featureDBOID) {
+		d.Set(dbOIDAttr, int(dbOID.Int64))
+	}
 
 	return nil
 }
@@ -627,7 +820,9 @@ func setDBTablespace(db QueryAble, d *schema.ResourceData) error {
 	dbName := d.Get(dbNameAttr).(string)
 	var sql string
 	if tbspName == "" || strings.ToUpper(tbspName) == "DEFAULT" {
-		sql = fmt.Sprintf("ALTER DATABASE %s RESET TABLESPACE", pq.QuoteIdentifier(dbName))
+		// RESET TABLESPACE is not a way to move the database: it is read as the reset
+		// of a parameter named "tablespace", so the default tablespace is set explicitly.
+		sql = fmt.Sprintf("ALTER DATABASE %s SET TABLESPACE pg_default", pq.QuoteIdentifier(dbName))
 	} else {
 		sql = fmt.Sprintf("ALTER DATABASE %s SET TABLESPACE %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(tbspName))
 	}

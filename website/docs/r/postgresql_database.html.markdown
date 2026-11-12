@@ -40,8 +40,9 @@ resource "postgresql_database" "my_db" {
 
 * `tablespace_name` - (Optional) The name of the tablespace that will be
   associated with the database, or `DEFAULT` to use the template database's
-  tablespace.  This tablespace will be the default tablespace used for objects
-  created in this database.
+  tablespace at the creation, and the default tablespace (`pg_default`) on an
+  existing database. This tablespace will be the default tablespace used for objects
+  created in this database. Changing it moves the database to the new tablespace.
 
 * `connection_limit` - (Optional) How many concurrent connections can be
   established to this database. `-1` (the default) means no limit.
@@ -82,6 +83,47 @@ resource "postgresql_database" "my_db" {
   classification of the specified `template` database.  Changing this value will
   force the creation of a new resource as this value can only be changed when a
   database is created.
+
+* `locale` - (Optional) The locale of the database, it sets `LC_COLLATE` and
+  `LC_CTYPE` at once (`LOCALE`, PostgreSQL 13 and above). It cannot be used with
+  `lc_collate` or `lc_ctype`. It is read back from the collation and the
+  character classification of the database. Changing this value will force the
+  creation of a new resource.
+
+* `locale_provider` - (Optional) The provider of the locale of the database:
+  `libc`, `icu` or `builtin` (`LOCALE_PROVIDER`, PostgreSQL 15 and above; `builtin`
+  requires PostgreSQL 17 and above). If unset, the provider of the template database
+  is used. Changing this value will force the creation of a new resource.
+
+* `icu_locale` - (Optional) The ICU locale of the database, used with
+  `locale_provider = "icu"` (`ICU_LOCALE`, PostgreSQL 15 and above). Changing this
+  value will force the creation of a new resource.
+
+* `icu_rules` - (Optional) Additional ICU collation rules of the database, used with
+  `locale_provider = "icu"` (`ICU_RULES`, PostgreSQL 16 and above). Changing this
+  value will force the creation of a new resource.
+
+* `builtin_locale` - (Optional) The locale of the database, used with
+  `locale_provider = "builtin"` (`BUILTIN_LOCALE`, PostgreSQL 17 and above).
+  Changing this value will force the creation of a new resource.
+
+* `collation_version` - (Optional) The version of the collation of the database
+  (`COLLATION_VERSION`, PostgreSQL 15 and above). When unset, PostgreSQL stores the
+  current version of the collation library. Changing this value will force the
+  creation of a new resource. The version changes when the operating system is
+  upgraded: if `collation_version` is set, the new version is seen as a change of
+  the resource and the database is replaced, so only set it to pin a version
+  which is known to be safe for the data of the database.
+
+* `strategy` - (Optional) The method used to copy the template database:
+  `file_copy` or `wal_log` (`STRATEGY`, PostgreSQL 15 and above). It is only used
+  when the database is created: it is not stored by PostgreSQL, it is not read back
+  and its changes are ignored once the database exists (they do not produce a diff,
+  nor a new database). It is not imported.
+
+* `oid` - (Optional) The OID of the database (`OID`, PostgreSQL 15 and above). If
+  unset, PostgreSQL chooses it. Changing this value will force the creation of a new
+  resource.
 
 * `alter_object_ownership` - (Optional) If `true`, the change of the database
   `owner` will also include a reassignment of the ownership of preexisting
