@@ -51,6 +51,7 @@ const (
 	featureCreateRoleSelfGrant
 	featureSecurityLabel
 	featureMaintainPrivilege
+	featureDefaultPrivilegesLargeObjects
 )
 
 var (
@@ -130,6 +131,9 @@ var (
 
 		// MAINTAIN privilege on tables (PG 17+)
 		featureMaintainPrivilege: semver.MustParseRange(">=17.0.0"),
+
+		// ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS (PG 18+)
+		featureDefaultPrivilegesLargeObjects: semver.MustParseRange(">=18.0.0"),
 	}
 )
 
