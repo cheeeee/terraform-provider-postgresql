@@ -66,6 +66,18 @@ func testCheckCanExecute(t *testing.T, what string, statements ...string) {
 
 	for _, statement := range statements {
 		if _, err := txn.Exec(statement); err != nil {
+			_ = txn.Rollback()
+			// A superuser is allowed to do everything: if it cannot, the test environment
+			// is broken and the test must not be skipped silently.
+			var superuser bool
+			if qErr := db.QueryRow(
+				"SELECT rolsuper FROM pg_roles WHERE rolname = current_user",
+			).Scan(&superuser); qErr != nil {
+				t.Fatalf("could not check if the connected user is a superuser: %v", qErr)
+			}
+			if superuser {
+				t.Fatalf("the connected user is a superuser and cannot %s: %v", what, err)
+			}
 			t.Skipf("Skip test: the connected user cannot %s: %v", what, err)
 		}
 	}
