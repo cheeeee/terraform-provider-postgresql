@@ -229,6 +229,7 @@ func Provider() *schema.Provider {
 		ResourcesMap: map[string]*schema.Resource{
 			"postgresql_database":                  resourcePostgreSQLDatabase(),
 			"postgresql_default_privileges":        resourcePostgreSQLDefaultPrivileges(),
+			"postgresql_event_trigger":             resourcePostgreSQLEventTrigger(),
 			"postgresql_extension":                 resourcePostgreSQLExtension(),
 			"postgresql_grant":                     resourcePostgreSQLGrant(),
 			"postgresql_grant_role":                resourcePostgreSQLGrantRole(),
