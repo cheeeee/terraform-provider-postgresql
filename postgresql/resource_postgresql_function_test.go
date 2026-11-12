@@ -3,6 +3,7 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
+	"github.com/lib/pq"
 	"regexp"
 	"strings"
 	"testing"
@@ -1184,6 +1185,662 @@ resource "postgresql_function" "window" {
 				Config:             config,
 				PlanOnly:           true,
 				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_Languages(t *testing.T) {
+	config := func(volatility string) string {
+		return fmt.Sprintf(`
+resource "postgresql_function" "sql" {
+    name = "tf_lang_sql"
+    arg {
+        name = "i"
+        type = "integer"
+    }
+    returns = "integer"
+    language = "sql"
+    volatility = "%[1]s"
+    body = "SELECT i * 2"
+}
+
+resource "postgresql_function" "plpgsql" {
+    name = "tf_lang_plpgsql"
+    arg {
+        name = "i"
+        type = "integer"
+    }
+    returns = "integer"
+    language = "plpgsql"
+    volatility = "%[1]s"
+    body = "BEGIN RETURN i * 3; END;"
+}
+`, volatility)
+	}
+	var oid string
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccFunctionPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("IMMUTABLE"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID("postgresql_function.sql", &oid),
+					testAccFunctionProp("postgresql_function.sql", "(SELECT lanname FROM pg_language WHERE oid = p.prolang)", "sql"),
+					testAccFunctionProp("postgresql_function.plpgsql", "(SELECT lanname FROM pg_language WHERE oid = p.prolang)", "plpgsql"),
+					testAccFunctionCall("SELECT public.tf_lang_sql(21)", "42"),
+					testAccFunctionCall("SELECT public.tf_lang_plpgsql(14)", "42"),
+				),
+			},
+			{
+				Config: config("STABLE"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID("postgresql_function.sql", &oid),
+					testAccFunctionProp("postgresql_function.sql", "p.provolatile", "s"),
+				),
+			},
+			{
+				ResourceName:            "postgresql_function.sql",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				ResourceName:            "postgresql_function.plpgsql",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				PreConfig: func() {
+					testAccFunctionExec(t, "CREATE OR REPLACE FUNCTION public.tf_lang_plpgsql(i integer) RETURNS integer LANGUAGE sql STABLE AS 'SELECT i'")
+				},
+				Config:             config("STABLE"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+// The internal and c languages are reserved to superusers.
+func TestAccPostgresqlFunction_InternalAndC(t *testing.T) {
+	config := func(volatility string) string {
+		return fmt.Sprintf(`
+resource "postgresql_function" "internal" {
+    name = "tf_lang_internal"
+    arg {
+        type = "integer"
+    }
+    arg {
+        type = "integer"
+    }
+    returns = "integer"
+    language = "internal"
+    volatility = "IMMUTABLE"
+    strict = true
+    body = "int4pl"
+}
+
+resource "postgresql_function" "c" {
+    name = "tf_lang_c"
+    arg {
+        type = "text"
+    }
+    arg {
+        type = "text"
+    }
+    returns = "boolean"
+    language = "c"
+    obj_file = "$libdir/citext"
+    body = "citext_eq"
+    volatility = "%s"
+    strict = true
+}
+`, volatility)
+	}
+	var cOID string
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			testCheckCanExecute(
+				t, "create functions in the internal and c languages",
+				"CREATE FUNCTION public.tf_probe_internal(integer, integer) RETURNS integer LANGUAGE internal AS 'int4pl'",
+				"CREATE FUNCTION public.tf_probe_c(text, text) RETURNS boolean LANGUAGE c AS '$libdir/citext', 'citext_eq'",
+			)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("IMMUTABLE"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID("postgresql_function.c", &cOID),
+					testAccFunctionProp("postgresql_function.internal", "p.prosrc || '/' || (SELECT lanname FROM pg_language WHERE oid = p.prolang)", "int4pl/internal"),
+					resource.TestCheckResourceAttr("postgresql_function.internal", "body", "int4pl"),
+					testAccFunctionCall("SELECT public.tf_lang_internal(40, 2)", "42"),
+					testAccFunctionProp("postgresql_function.c", "p.probin || ',' || p.prosrc", "$libdir/citext,citext_eq"),
+					resource.TestCheckResourceAttr("postgresql_function.c", "obj_file", "$libdir/citext"),
+					resource.TestCheckResourceAttr("postgresql_function.c", "body", "citext_eq"),
+					testAccFunctionCall("SELECT public.tf_lang_c('Abc', 'aBC')", "true"),
+				),
+			},
+			{
+				// a change in place
+				Config: config("STABLE"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID("postgresql_function.c", &cOID),
+					testAccFunctionProp("postgresql_function.c", "p.provolatile", "s"),
+				),
+			},
+			{
+				ResourceName:            "postgresql_function.internal",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				ResourceName:            "postgresql_function.c",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				PreConfig: func() {
+					testAccFunctionExec(t, "CREATE OR REPLACE FUNCTION public.tf_lang_c(text, text) RETURNS boolean LANGUAGE c STABLE STRICT AS '$libdir/citext', 'citext_ne'")
+				},
+				Config:             config("STABLE"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config("STABLE"),
+				Check:  testAccFunctionCall("SELECT public.tf_lang_c('Abc', 'aBC')", "true"),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_SQLBody(t *testing.T) {
+	config := func(body1, body2 string) string {
+		return fmt.Sprintf(`
+resource "postgresql_function" "ret" {
+    name = "tf_sqlbody_return"
+    arg {
+        name = "i"
+        type = "integer"
+    }
+    returns = "integer"
+    language = "sql"
+    sql_body = %q
+}
+
+resource "postgresql_function" "atomic" {
+    name = "tf_sqlbody_atomic"
+    arg {
+        name = "i"
+        type = "integer"
+    }
+    returns = "SETOF integer"
+    language = "sql"
+    sql_body = %q
+}
+`, body1, body2)
+	}
+	// written as PostgreSQL deparses it
+	deparsed1 := "RETURN (i + 1)"
+	deparsed2 := "BEGIN ATOMIC\n SELECT i AS i;\n SELECT (i + 1);\nEND"
+	var oid string
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			testCheckCompatibleVersion(t, featureFunctionSQLBody)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				// not as PostgreSQL writes it: the plan is empty all the same
+				Config: config("RETURN i+1", "BEGIN ATOMIC SELECT i; SELECT i+1; END"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID("postgresql_function.ret", &oid),
+					testAccFunctionProp("postgresql_function.ret", "p.prosrc", ""),
+					testAccFunctionProp("postgresql_function.ret", "p.prosqlbody IS NOT NULL", "true"),
+					resource.TestCheckResourceAttr("postgresql_function.ret", "body", ""),
+					resource.TestCheckResourceAttr("postgresql_function.ret", "sql_body_deparsed", deparsed1),
+					testAccFunctionCall("SELECT public.tf_sqlbody_return(41)", "42"),
+					testAccFunctionCall("SELECT sum(x) FROM public.tf_sqlbody_atomic(1) AS x", "2"),
+				),
+			},
+			{
+				Config:   config("RETURN i+1", "BEGIN ATOMIC SELECT i; SELECT i+1; END"),
+				PlanOnly: true,
+			},
+			{
+				Config: config("RETURN i + 2", "BEGIN ATOMIC SELECT i; SELECT i+1; END"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID("postgresql_function.ret", &oid),
+					resource.TestCheckResourceAttr("postgresql_function.ret", "sql_body_deparsed", "RETURN (i + 2)"),
+					testAccFunctionCall("SELECT public.tf_sqlbody_return(40)", "42"),
+				),
+			},
+			{
+				Config:   config("RETURN i + 2", "BEGIN ATOMIC SELECT i; SELECT i+1; END"),
+				PlanOnly: true,
+			},
+			{
+				// imported: the body is the one of PostgreSQL
+				Config: config(deparsed1, deparsed2),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionCall("SELECT public.tf_sqlbody_return(41)", "42"),
+				),
+			},
+			{
+				ResourceName:            "postgresql_function.atomic",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				PreConfig: func() {
+					testAccFunctionExec(t, "CREATE OR REPLACE FUNCTION public.tf_sqlbody_return(i integer) RETURNS integer LANGUAGE sql RETURN i + 100")
+				},
+				Config:             config(deparsed1, deparsed2),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config(deparsed1, deparsed2),
+				Check:  testAccFunctionCall("SELECT public.tf_sqlbody_return(41)", "42"),
+			},
+			{
+				PlanOnly: true,
+				Config:   config(deparsed1, deparsed2),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_SQLBodyOldVersion(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			client := testAccProvider.Meta().(*Client)
+			db, err := client.Connect()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if db.featureSupported(featureFunctionSQLBody) {
+				t.Skipf("Skip: PostgreSQL %s has the SQL-standard function bodies", db.version)
+			}
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_function" "old" {
+    name = "tf_sqlbody_old"
+    returns = "integer"
+    language = "sql"
+    sql_body = "RETURN 1"
+}`,
+				ExpectError: regexp.MustCompile("requires PostgreSQL 14 or later"),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_Transform(t *testing.T) {
+	config := func(transform string) string {
+		return fmt.Sprintf(`
+resource "postgresql_function" "tr" {
+    name = "tf_transform"
+    arg {
+        name = "i"
+        type = "integer"
+    }
+    returns = "integer"
+    language = "plpgsql"
+    %s
+    body = "BEGIN RETURN i; END;"
+}
+`, transform)
+	}
+	var oid string
+	const res = "postgresql_function.tr"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			testCheckCanExecute(
+				t, "create a transform",
+				"CREATE TRANSFORM FOR integer LANGUAGE plpgsql (FROM SQL WITH FUNCTION pg_catalog.generate_series_int4_support(internal))",
+			)
+			testAccFunctionExec(t, "CREATE TRANSFORM FOR integer LANGUAGE plpgsql (FROM SQL WITH FUNCTION pg_catalog.generate_series_int4_support(internal))")
+			t.Cleanup(func() { testAccFunctionExec(t, "DROP TRANSFORM IF EXISTS FOR integer LANGUAGE plpgsql CASCADE") })
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(``),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.protrftypes::text", ""),
+				),
+			},
+			{
+				// a change which needs CREATE OR REPLACE
+				Config: config(`transform = ["integer"]`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.protrftypes::regtype[]::text", "{integer}"),
+					resource.TestCheckResourceAttr(res, "transform.#", "1"),
+					resource.TestCheckResourceAttr(res, "transform.0", "integer"),
+					testAccFunctionCall("SELECT public.tf_transform(42)", "42"),
+				),
+			},
+			{
+				ResourceName:            res,
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				PreConfig: func() {
+					testAccFunctionExec(t, "CREATE OR REPLACE FUNCTION public.tf_transform(i integer) RETURNS integer LANGUAGE plpgsql AS $$ BEGIN RETURN i; END; $$")
+				},
+				Config:             config(`transform = ["integer"]`),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config(`transform = ["integer"]`),
+				Check:  testAccFunctionProp(res, "p.protrftypes::regtype[]::text", "{integer}"),
+			},
+			{
+				Config: config(``),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.protrftypes::text", ""),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_RenameMoveOwner(t *testing.T) {
+	config := func(schemaName, name, owner string) string {
+		return fmt.Sprintf(`
+resource "postgresql_schema" "one" {
+    name = "tf_func_one"
+}
+
+resource "postgresql_schema" "two" {
+    name = "tf_func_two"
+}
+
+resource "postgresql_grant" "create1" {
+    database = "postgres"
+    schema = postgresql_schema.one.name
+    role = "tf_func_owner1"
+    object_type = "schema"
+    privileges = ["CREATE"]
+}
+
+resource "postgresql_grant" "create2" {
+    database = "postgres"
+    schema = postgresql_schema.one.name
+    role = "tf_func_owner2"
+    object_type = "schema"
+    privileges = ["CREATE"]
+}
+
+resource "postgresql_function" "move" {
+    schema = postgresql_schema.%[1]s.name
+    name = "%[2]s"
+    %[3]s
+    depends_on = [postgresql_grant.create1, postgresql_grant.create2]
+    arg {
+        name = "i"
+        type = "integer"
+    }
+    returns = "integer"
+    language = "sql"
+    body = "SELECT i + 1"
+}
+`, schemaName, name, owner)
+	}
+	var oid string
+	const res = "postgresql_function.move"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			// the roles are members of the role of the connection, which can then give them the functions
+			user := getTestConfig(t).Username
+			for _, role := range []string{"tf_func_owner1", "tf_func_owner2"} {
+				testAccFunctionExec(t, "CREATE ROLE "+role, fmt.Sprintf("GRANT %s TO %s", role, pq.QuoteIdentifier(user)))
+				t.Cleanup(func() { testAccFunctionExec(t, "DROP OWNED BY "+role, "DROP ROLE "+role) })
+			}
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("one", "tf_move_a", ``),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					resource.TestCheckResourceAttrSet(res, "owner"),
+					testAccFunctionProp(res, "pg_get_userbyid(p.proowner) = current_user", "true"),
+					testAccFunctionCall("SELECT tf_func_one.tf_move_a(1)", "2"),
+				),
+			},
+			{
+				// rename
+				Config: config("one", "tf_move_b", ``),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.proname", "tf_move_b"),
+					resource.TestCheckResourceAttr(res, "id", testAccFunctionID("tf_func_one", "tf_move_b(integer)")),
+					testAccFunctionCall("SELECT tf_func_one.tf_move_b(1)", "2"),
+				),
+			},
+			{
+				// move
+				Config: config("two", "tf_move_b", ``),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.pronamespace::regnamespace::text", "tf_func_two"),
+					resource.TestCheckResourceAttr(res, "id", testAccFunctionID("tf_func_two", "tf_move_b(integer)")),
+					testAccFunctionCall("SELECT tf_func_two.tf_move_b(1)", "2"),
+				),
+			},
+			{
+				// both at once, and a new owner
+				Config: config("one", "tf_move_c", `owner = "tf_func_owner1"`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.pronamespace::regnamespace::text || '.' || p.proname", "tf_func_one.tf_move_c"),
+					testAccFunctionProp(res, "pg_get_userbyid(p.proowner)", "tf_func_owner1"),
+					resource.TestCheckResourceAttr(res, "owner", "tf_func_owner1"),
+				),
+			},
+			{
+				Config: config("one", "tf_move_c", `owner = "tf_func_owner2"`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "pg_get_userbyid(p.proowner)", "tf_func_owner2"),
+				),
+			},
+			{
+				ResourceName:            res,
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				PreConfig: func() {
+					testAccFunctionExec(t, "ALTER FUNCTION tf_func_one.tf_move_c(integer) OWNER TO tf_func_owner1")
+				},
+				Config:             config("one", "tf_move_c", `owner = "tf_func_owner2"`),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				PreConfig: func() {
+					testAccFunctionExec(t, "ALTER FUNCTION tf_func_one.tf_move_c(integer) RENAME TO tf_moved_away")
+				},
+				Config:             config("one", "tf_move_c", `owner = "tf_func_owner2"`),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				// the function which has been renamed is not found any more: it is created again
+				PreConfig: func() {
+					testAccFunctionExec(t, "DROP FUNCTION tf_func_one.tf_moved_away(integer)")
+				},
+				Config: config("one", "tf_move_c", `owner = "tf_func_owner2"`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionProp(res, "pg_get_userbyid(p.proowner)", "tf_func_owner2"),
+					testAccFunctionCall("SELECT tf_func_one.tf_move_c(1)", "2"),
+				),
+			},
+		},
+	})
+}
+
+func testAccFunctionID(schemaName, signature string) string {
+	return fmt.Sprintf("%s.%s.%s", "postgres", schemaName, signature)
+}
+
+func TestAccPostgresqlFunction_DependsOnExtension(t *testing.T) {
+	config := func(extensions string) string {
+		return fmt.Sprintf(`
+resource "postgresql_extension" "trgm" {
+    name = "pg_trgm"
+}
+
+resource "postgresql_extension" "citext" {
+    name = "citext"
+}
+
+resource "postgresql_function" "dep" {
+    name = "tf_depends"
+    returns = "integer"
+    language = "sql"
+    depends_on_extensions = %s
+    body = "SELECT 1"
+}
+`, extensions)
+	}
+	var oid string
+	const res = "postgresql_function.dep"
+	depends := "(SELECT string_agg(e.extname, ',' ORDER BY e.extname) FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid WHERE d.objid = p.oid AND d.classid = 'pg_proc'::regclass AND d.deptype = 'x')"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			testCheckCanCreateExtension(t, "pg_trgm", "citext")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(`[]`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, depends, ""),
+				),
+			},
+			{
+				Config: config(`[postgresql_extension.trgm.name]`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, depends, "pg_trgm"),
+					resource.TestCheckResourceAttr(res, "depends_on_extensions.#", "1"),
+				),
+			},
+			{
+				Config: config(`[postgresql_extension.trgm.name, postgresql_extension.citext.name]`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, depends, "citext,pg_trgm"),
+				),
+			},
+			{
+				ResourceName:            res,
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				// the dependencies survive CREATE OR REPLACE FUNCTION
+				Config: strings.Replace(config(`[postgresql_extension.trgm.name, postgresql_extension.citext.name]`), "SELECT 1", "SELECT 2", 1),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, depends, "citext,pg_trgm"),
+					testAccFunctionCall("SELECT public.tf_depends()", "2"),
+				),
+			},
+			{
+				PreConfig: func() {
+					testAccFunctionExec(t, "ALTER FUNCTION public.tf_depends() NO DEPENDS ON EXTENSION citext")
+				},
+				Config:             strings.Replace(config(`[postgresql_extension.trgm.name, postgresql_extension.citext.name]`), "SELECT 1", "SELECT 2", 1),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: strings.Replace(config(`[postgresql_extension.citext.name]`), "SELECT 1", "SELECT 2", 1),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, depends, "citext"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_DropCascade(t *testing.T) {
+	config := `
+resource "postgresql_function" "cascade" {
+    name = "tf_cascade"
+    returns = "integer"
+    language = "sql"
+    drop_cascade = true
+    body = "SELECT 1"
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck:  func() { testAccFunctionPreCheck(t) },
+		Providers: testAccProviders,
+		CheckDestroy: func(s *terraform.State) error {
+			if err := testAccCheckPostgresqlFunctionDestroy(s); err != nil {
+				return err
+			}
+			// the objects which depend on the function are dropped with it
+			client := testAccProvider.Meta().(*Client)
+			txn, err := startTransaction(client, "")
+			if err != nil {
+				return err
+			}
+			defer deferredRollback(txn)
+			var exists bool
+			if err := txn.QueryRow("SELECT to_regclass('public.tf_cascade_view') IS NOT NULL").Scan(&exists); err != nil {
+				return err
+			}
+			if exists {
+				return fmt.Errorf("the view which depends on the function still exists")
+			}
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: func(s *terraform.State) error {
+					testAccFunctionExec(t, "CREATE VIEW public.tf_cascade_view AS SELECT public.tf_cascade() AS v")
+					return nil
+				},
 			},
 		},
 	})
