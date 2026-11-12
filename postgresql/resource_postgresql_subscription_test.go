@@ -73,7 +73,9 @@ func checkSubscriptionExists(txn *sql.Tx, subName string) (bool, error) {
 
 func checkSubscriptionStreams(txn *sql.Tx, subName string) (bool, error) {
 	var _rez bool
-	err := txn.QueryRow("SELECT TRUE from pg_catalog.pg_stat_replication WHERE application_name=$1 and state='streaming'", subName).Scan(&_rez)
+	// The apply worker of the subscription runs: pg_stat_replication hides the sessions to
+	// the users which are not superusers, pg_stat_subscription does not.
+	err := txn.QueryRow("SELECT TRUE from pg_catalog.pg_stat_subscription WHERE subname=$1 AND relid IS NULL AND pid IS NOT NULL", subName).Scan(&_rez)
 
 	switch {
 	case err == sql.ErrNoRows:
