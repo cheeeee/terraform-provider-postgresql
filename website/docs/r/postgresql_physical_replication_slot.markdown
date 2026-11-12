@@ -24,3 +24,4 @@ resource "postgresql_physical_replication_slot" "my_slot" {
 ## Argument Reference
 
 * `name` - (Required) The name of the replication slot.
+* `immediately_reserve` - (Optional) Reserves the WAL immediately when the slot is created, so that a standby can always catch up. Read back as whether the slot has reserved WAL. Changing it to `true` replaces the slot. The WAL reserved by a slot cannot be released, so setting it to `false` on a slot which has reserved WAL does not replace the slot.
