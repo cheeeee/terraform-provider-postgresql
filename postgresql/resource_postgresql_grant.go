@@ -387,7 +387,7 @@ WHERE grantee = $2
 	return nil
 }
 
-func readColumnRolePrivileges(txn *sql.Tx, d *schema.ResourceData) error {
+func readColumnRolePrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData) error {
 	objects := d.Get("objects").(*schema.Set)
 
 	missingColumns := d.Get("columns").(*schema.Set) // Getting columns from state.
@@ -406,14 +406,13 @@ FROM (SELECT relname, attname, (aclexplode(attacl)).*
         AND relname = $3
         AND relkind = $4)
          AS col_privs
-         JOIN pg_roles ON pg_roles.oid = col_privs.grantee
-WHERE rolname = $1
-  AND privilege_type = $5
-GROUP BY col_privs.relname, col_privs.attname, col_privs.privilege_type
+         LEFT JOIN pg_roles ON pg_roles.oid = col_privs.grantee
+WHERE COALESCE(rolname, 'public') = $1
+GROUP BY col_privs.relname, col_privs.attname
 ORDER BY col_privs.attname
 ;`
 	rows, err := txn.Query(
-		query, d.Get("role").(string), d.Get("schema"), objects.List()[0], objectTypes["table"], d.Get("privileges").(*schema.Set).List()[0],
+		query, d.Get("role").(string), d.Get("schema"), objects.List()[0], objectTypes["table"],
 	)
 
 	if err != nil {
@@ -439,7 +438,7 @@ ORDER BY col_privs.attname
 
 		privilegesSet := pgArrayToSet(privileges)
 
-		if !privilegesSet.Equal(d.Get("privileges").(*schema.Set)) {
+		if !resourcePrivilegesEqual(privilegesSet, db, d) {
 			// If any object doesn't have the same privileges as saved in the state,
 			// we return its privileges to force an update.
 			log.Printf(
@@ -512,7 +511,7 @@ GROUP BY pg_proc.proname
 		)
 
 	case "column":
-		return readColumnRolePrivileges(txn, d)
+		return readColumnRolePrivileges(txn, db, d)
 
 	case "type", "domain":
 		query = `
