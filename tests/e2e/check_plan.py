@@ -5,7 +5,9 @@ usage: terraform show -json <plan> | check_plan.py <name of the check> <expected
 
 The expected changes are a JSON object: for each resource which is expected to
 change, its actions and, optionally, the "parameters" attribute before and
-after the change. Any other change in the plan is an error.
+after the change. Any other change in the plan is an error, unless the "*" key
+is given: it describes the actions of all the changes which are not listed and,
+with "count", the total number of changes of the plan.
 """
 import json
 import sys
@@ -20,8 +22,14 @@ changes = {
 }
 
 errors = []
+others = expected.pop("*", None)
 for address in sorted(set(changes) - set(expected)):
-    errors.append(f"{address}: unexpected change {changes[address]['actions']}")
+    if others is None:
+        errors.append(f"{address}: unexpected change {changes[address]['actions']}")
+    elif changes[address]["actions"] != others["actions"]:
+        errors.append(f"{address}: actions are {changes[address]['actions']}, expected {others['actions']}")
+if others is not None and "count" in others and len(changes) != others["count"]:
+    errors.append(f"{len(changes)} changes are planned, expected {others['count']}: {', '.join(sorted(changes))}")
 for address, exp in sorted(expected.items()):
     change = changes.get(address)
     if change is None:
