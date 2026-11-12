@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
@@ -829,5 +830,216 @@ resource "postgresql_publication" "test" {
 				Config:      testAccPostgresqlPublicationDuplicateKeys,
 				ExpectError: regexp.MustCompile("'insert' is duplicated for attribute `tables`")},
 		},
+	})
+}
+
+// testPubResource is the address of the publication of the configurations below.
+const testPubResource = "postgresql_publication.test"
+
+// testPubConfig returns the configuration of a publication named "pub" in dbName.
+func testPubConfig(dbName, body string) string {
+	return fmt.Sprintf(`
+resource "postgresql_publication" "test" {
+	name     = "pub"
+	database = "%s"
+	%s
+}
+`, dbName, body)
+}
+
+// testPubCatalog queries the catalog of the database of the publication, $1 is its
+// name, and returns the first column of the first row.
+func testPubCatalog(dbName, pubName, query string) (string, error) {
+	client := testAccProvider.Meta().(*Client)
+	txn, err := startTransaction(client, dbName)
+	if err != nil {
+		return "", err
+	}
+	defer deferredRollback(txn)
+
+	var result sql.NullString
+	if err := txn.QueryRow(query, pubName).Scan(&result); err != nil {
+		return "", fmt.Errorf("query %s failed: %w", query, err)
+	}
+	return result.String, nil
+}
+
+// testAccCheckPublicationCatalog checks the first column of the first row of a
+// query on the catalog of the database of the publication ($1 is its name).
+func testAccCheckPublicationCatalog(dbName, pubName, query, want string) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		got, err := testPubCatalog(dbName, pubName, query)
+		if err != nil {
+			return err
+		}
+		if got != want {
+			return fmt.Errorf("publication %s: query %s returned %q, want %q", pubName, query, got, want)
+		}
+		return nil
+	}
+}
+
+const (
+	// the tables of the publication (the excluded tables of PostgreSQL 19 are not listed)
+	testPubRelsQuery = `SELECT COALESCE(string_agg(n.nspname || '.' || c.relname, ',' ORDER BY n.nspname, c.relname), '')
+		FROM pg_catalog.pg_publication_rel r
+		JOIN pg_catalog.pg_publication p ON p.oid = r.prpubid
+		JOIN pg_catalog.pg_class c ON c.oid = r.prrelid
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE p.pubname = $1 AND to_jsonb(r) ->> 'prexcept' IS DISTINCT FROM 'true'`
+	// the column list of a table: table(col,col);...
+	testPubColumnsQuery = `SELECT COALESCE(string_agg(c.relname || '(' || COALESCE((SELECT string_agg(a.attname, ',' ORDER BY a.attnum)
+			FROM pg_catalog.pg_attribute a WHERE a.attrelid = r.prrelid AND a.attnum = ANY(r.prattrs::int2[])), '') || ')', ';' ORDER BY c.relname), '')
+		FROM pg_catalog.pg_publication_rel r
+		JOIN pg_catalog.pg_publication p ON p.oid = r.prpubid
+		JOIN pg_catalog.pg_class c ON c.oid = r.prrelid
+		WHERE p.pubname = $1`
+	// the row filter of a table: table=filter;...
+	testPubFiltersQuery = `SELECT COALESCE(string_agg(c.relname || '=' || COALESCE(pg_catalog.pg_get_expr(r.prqual, r.prrelid), ''), ';' ORDER BY c.relname), '')
+		FROM pg_catalog.pg_publication_rel r
+		JOIN pg_catalog.pg_publication p ON p.oid = r.prpubid
+		JOIN pg_catalog.pg_class c ON c.oid = r.prrelid
+		WHERE p.pubname = $1`
+	testPubSchemasQuery = `SELECT COALESCE(string_agg(n.nspname, ',' ORDER BY n.nspname), '')
+		FROM pg_catalog.pg_publication_namespace pn
+		JOIN pg_catalog.pg_publication p ON p.oid = pn.pnpubid
+		JOIN pg_catalog.pg_namespace n ON n.oid = pn.pnnspid
+		WHERE p.pubname = $1`
+	// the tables which the subscribers get (pg_publication_tables)
+	testPubTablesViewQuery = `SELECT COALESCE(string_agg(schemaname || '.' || tablename, ',' ORDER BY schemaname, tablename), '')
+		FROM pg_catalog.pg_publication_tables WHERE pubname = $1`
+	testPubOwnerQuery   = `SELECT r.rolname FROM pg_catalog.pg_publication p JOIN pg_catalog.pg_roles r ON r.oid = p.pubowner WHERE p.pubname = $1`
+	testPubPublishQuery = `SELECT concat_ws(',', CASE WHEN pubinsert THEN 'insert' END, CASE WHEN pubupdate THEN 'update' END,
+		CASE WHEN pubdelete THEN 'delete' END, CASE WHEN pubtruncate THEN 'truncate' END) FROM pg_catalog.pg_publication WHERE pubname = $1`
+	testPubViaRootQuery  = `SELECT pubviaroot::text FROM pg_catalog.pg_publication WHERE pubname = $1`
+	testPubGenColsQuery  = `SELECT pubgencols::text FROM pg_catalog.pg_publication WHERE pubname = $1`
+	testPubAllTablesQ    = `SELECT puballtables::text FROM pg_catalog.pg_publication WHERE pubname = $1`
+	testPubAllSequencesQ = `SELECT puballsequences::text FROM pg_catalog.pg_publication WHERE pubname = $1`
+	testPubExceptQuery   = `SELECT COALESCE(string_agg(n.nspname || '.' || c.relname, ',' ORDER BY n.nspname, c.relname), '')
+		FROM pg_catalog.pg_publication_rel r
+		JOIN pg_catalog.pg_publication p ON p.oid = r.prpubid
+		JOIN pg_catalog.pg_class c ON c.oid = r.prrelid
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE p.pubname = $1 AND r.prexcept`
+)
+
+// testPubExec executes statements as the administrator in the database, as a change
+// made outside of Terraform.
+func testPubExec(t *testing.T, dbName string, statements ...string) {
+	config := getTestConfig(t)
+	for _, statement := range statements {
+		dbExecute(t, config.connStr(dbName), statement)
+	}
+}
+
+// testPubTestCase is a test case of a publication, which runs its checks on the catalog.
+func testPubTestCase(t *testing.T, precheck func(), steps []resource.TestStep) {
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePublication)
+			testCheckCanCreatePublication(t, false)
+			if precheck != nil {
+				precheck()
+			}
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
+		Steps:        steps,
+	})
+}
+
+// testPubImportStep imports the publication and checks that the state is the one of the previous step.
+func testPubImportStep(ignore ...string) resource.TestStep {
+	return resource.TestStep{
+		ResourceName:            testPubResource,
+		ImportState:             true,
+		ImportStateVerify:       true,
+		ImportStateVerifyIgnore: append([]string{pubDropCascadeAttr}, ignore...),
+	}
+}
+
+// testPubDriftStep checks that a change made outside of Terraform is seen in the plan.
+func testPubDriftStep(t *testing.T, config, dbName string, statements ...string) resource.TestStep {
+	return resource.TestStep{
+		PreConfig:          func() { testPubExec(t, dbName, statements...) },
+		Config:             config,
+		PlanOnly:           true,
+		ExpectNonEmptyPlan: true,
+	}
+}
+
+func TestAccPostgresqlPublication_QuotedNames(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	createTestTables(t, dbSuffix, []string{`test_schema."Quoted-Table-1"`, `test_schema."Quoted-Table-2"`}, "")
+	dbName, _ := getTestDBNames(dbSuffix)
+
+	roles := `
+resource "postgresql_role" "owner1" {
+	name  = "Quoted-Owner-1"
+	login = true
+}
+resource "postgresql_role" "owner2" {
+	name  = "Quoted-Owner-2"
+	login = true
+}
+# The owner of a publication needs the CREATE privilege on the database
+resource "postgresql_grant" "owner1" {
+	database    = "` + dbName + `"
+	role        = postgresql_role.owner1.name
+	object_type = "database"
+	privileges  = ["CREATE"]
+}
+resource "postgresql_grant" "owner2" {
+	database    = "` + dbName + `"
+	role        = postgresql_role.owner2.name
+	object_type = "database"
+	privileges  = ["CREATE"]
+}
+`
+	config := func(name, owner, tables string) string {
+		return roles + fmt.Sprintf(`
+resource "postgresql_publication" "test" {
+	name     = "%s"
+	database = "%s"
+	owner    = postgresql_role.%s.name
+	tables   = [%s]
+	depends_on = [postgresql_grant.owner1, postgresql_grant.owner2]
+}
+`, strings.ReplaceAll(name, `"`, `\"`), dbName, owner, tables)
+	}
+	step1 := config("Quoted-Pub", "owner1", `"test_schema.Quoted-Table-1"`)
+	step2 := config("Quoted-Pub", "owner1", `"test_schema.Quoted-Table-1", "test_schema.Quoted-Table-2"`)
+	step3 := config("Quoted Pub's \"name\"", "owner2", `"test_schema.Quoted-Table-2"`)
+
+	testPubTestCase(t, nil, []resource.TestStep{
+		{
+			Config: step1,
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPostgresqlPublicationExists(testPubResource),
+				testAccCheckPublicationCatalog(dbName, "Quoted-Pub", testPubRelsQuery, "test_schema.Quoted-Table-1"),
+				testAccCheckPublicationCatalog(dbName, "Quoted-Pub", testPubOwnerQuery, "Quoted-Owner-1"),
+			),
+		},
+		testPubImportStep(),
+		{
+			Config: step2,
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "Quoted-Pub", testPubRelsQuery, "test_schema.Quoted-Table-1,test_schema.Quoted-Table-2"),
+			),
+		},
+		{
+			// the name, the owner and the tables change at once
+			Config: step3,
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPostgresqlPublicationExists(testPubResource),
+				testAccCheckPublicationCatalog(dbName, `Quoted Pub's "name"`, testPubRelsQuery, "test_schema.Quoted-Table-2"),
+				testAccCheckPublicationCatalog(dbName, `Quoted Pub's "name"`, testPubOwnerQuery, "Quoted-Owner-2"),
+			),
+		},
+		testPubImportStep(),
 	})
 }
