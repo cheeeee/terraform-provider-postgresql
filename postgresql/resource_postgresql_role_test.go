@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlRole_Basic(t *testing.T) {
@@ -1083,6 +1084,282 @@ resource "postgresql_role" "audited_role" {
 					resource.TestCheckResourceAttr("postgresql_role.audited_role", "parameters.pgaudit.log", "none"),
 					testAccCheckSessionParameter(t, "audited_role", "toto", "postgres", "pgaudit.log", "none"),
 				),
+			},
+		},
+	})
+}
+
+const testRoleDatabaseConfigQuery = `SELECT COALESCE((
+	SELECT s.setconfig FROM pg_catalog.pg_db_role_setting AS s
+	JOIN pg_catalog.pg_database AS d ON d.oid = s.setdatabase
+	JOIN pg_catalog.pg_roles AS r ON r.oid = s.setrole
+	WHERE d.datname = $1 AND r.rolname = $2
+), '{}'::text[])`
+
+// testAccCheckRoleDatabaseConfig checks the settings of a role in a database
+// (pg_db_role_setting) in the catalog.
+func testAccCheckRoleDatabaseConfig(role, database string, expected []string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		client := testAccProvider.Meta().(*Client)
+		db, err := client.Connect()
+		if err != nil {
+			return err
+		}
+
+		var config pq.StringArray
+		if err := db.QueryRow(testRoleDatabaseConfigQuery, database, role).Scan(&config); err != nil {
+			return fmt.Errorf("could not read the parameters of %s in %s: %w", role, database, err)
+		}
+		actual := []string(config)
+		sort.Strings(actual)
+		sort.Strings(expected)
+		if len(actual) == 0 && len(expected) == 0 {
+			return nil
+		}
+		if !reflect.DeepEqual(actual, expected) {
+			return fmt.Errorf("parameters of %s in %s: expected %v, got %v", role, database, expected, actual)
+		}
+		return nil
+	}
+}
+
+// Test the parameters of a role in a database: ALTER ROLE ... IN DATABASE ... SET.
+func TestAccPostgresqlRole_DatabaseParameters(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := func(roleParameters, blocks string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "dbp_one" {
+  name       = "dbp_one"
+  parameters = {
+    work_mem             = "8MB"
+    maintenance_work_mem = "12MB"
+  }
+}
+
+resource "postgresql_database" "dbp_two" {
+  name       = "dbp_two"
+  parameters = {
+    work_mem = "8MB"
+  }
+}
+
+resource "postgresql_role" "dbp_role" {
+  name       = "dbp_role"
+  login      = true
+  password   = "dbp_pass"
+  %s
+  %s
+}
+`, roleParameters, blocks)
+	}
+	roleParameters := `parameters = { work_mem = "16MB" }`
+	block := func(database, parameters string) string {
+		return fmt.Sprintf(`
+  database_parameters {
+    database   = postgresql_database.%s.name
+    parameters = %s
+  }`, database, parameters)
+	}
+
+	session := func(database, parameter, expected string) resource.TestCheckFunc {
+		return testAccCheckSessionParameter(t, "dbp_role", "dbp_pass", database, parameter, expected)
+	}
+
+	configCreate := roleConfig(roleParameters, block("dbp_one", `{ work_mem = "32MB", extra_float_digits = "2" }`))
+	configUpdate := roleConfig(roleParameters,
+		block("dbp_one", `{ work_mem = "64MB" }`)+
+			block("dbp_two", `{ temp_tablespaces = "pg_default,pg_default", application_name = "it's \\ me" }`))
+	configOnlyTwo := roleConfig(roleParameters,
+		block("dbp_two", `{ temp_tablespaces = "pg_default,pg_default", application_name = "it's \\ me" }`))
+	configNoBlock := roleConfig(roleParameters, "")
+	configEmptyBlock := roleConfig(roleParameters, block("dbp_two", `{}`))
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		CheckDestroy: func(s *terraform.State) error {
+			if err := testAccCheckPostgresqlRoleDestroy(s); err != nil {
+				return err
+			}
+			return testAccCheckPostgresqlDatabaseDestroy(s)
+		},
+		Steps: []resource.TestStep{
+			// The setting of the role in the database wins over the one of the role,
+			// which wins over the one of the database.
+			{
+				Config: configCreate,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.dbp_role", "database_parameters.#", "1"),
+					testAccCheckConfigParameters(testRoleConfigQuery, "dbp_role", []string{"work_mem=16MB"}),
+					testAccCheckRoleDatabaseConfig("dbp_role", "dbp_one", []string{"work_mem=32MB", "extra_float_digits=2"}),
+					testAccCheckRoleDatabaseConfig("dbp_role", "dbp_two", []string{}),
+					session("dbp_one", "work_mem", "32MB"),
+					session("dbp_one", "extra_float_digits", "2"),
+					session("dbp_one", "maintenance_work_mem", "12MB"),
+					session("dbp_two", "work_mem", "16MB"),
+					session("postgres", "work_mem", "16MB"),
+				),
+			},
+			// A parameter is changed and another one is removed, a database is added.
+			{
+				Config: configUpdate,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.dbp_role", "database_parameters.#", "2"),
+					testAccCheckConfigParameters(testRoleConfigQuery, "dbp_role", []string{"work_mem=16MB"}),
+					testAccCheckRoleDatabaseConfig("dbp_role", "dbp_one", []string{"work_mem=64MB"}),
+					testAccCheckRoleDatabaseConfig("dbp_role", "dbp_two", []string{
+						"temp_tablespaces=pg_default, pg_default", `application_name=it's \ me`,
+					}),
+					session("dbp_one", "work_mem", "64MB"),
+					session("dbp_one", "extra_float_digits", "1"),
+					session("dbp_two", "temp_tablespaces", "pg_default, pg_default"),
+					session("dbp_two", "application_name", `it's \ me`),
+					session("dbp_two", "work_mem", "16MB"),
+				),
+			},
+			// Changes made outside of Terraform are detected...
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER ROLE dbp_role IN DATABASE dbp_one RESET work_mem")
+					dbExecute(t, dsn, "ALTER ROLE dbp_role IN DATABASE dbp_one SET lock_timeout TO '5s'")
+				},
+				Config:             configUpdate,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			// ...and reverted.
+			{
+				Config: configUpdate,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleDatabaseConfig("dbp_role", "dbp_one", []string{"work_mem=64MB"}),
+					session("dbp_one", "work_mem", "64MB"),
+					session("dbp_one", "lock_timeout", "0"),
+				),
+			},
+			// A database removed from the resource is not managed anymore: its parameters are reset.
+			{
+				Config: configCreate,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleDatabaseConfig("dbp_role", "dbp_one", []string{"work_mem=32MB", "extra_float_digits=2"}),
+					testAccCheckRoleDatabaseConfig("dbp_role", "dbp_two", []string{}),
+					session("dbp_two", "work_mem", "16MB"),
+				),
+			},
+			// The databases which are not in the resource are read-only.
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER ROLE dbp_role IN DATABASE dbp_two SET work_mem TO '1MB'")
+				},
+				Config:   configCreate,
+				PlanOnly: true,
+			},
+			{
+				Config: configOnlyTwo,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleDatabaseConfig("dbp_role", "dbp_one", []string{}),
+					testAccCheckRoleDatabaseConfig("dbp_role", "dbp_two", []string{
+						"temp_tablespaces=pg_default, pg_default", `application_name=it's \ me`,
+					}),
+				),
+			},
+			// Without database_parameters in the resource, the ones of the database are left untouched.
+			{
+				Config: configNoBlock,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.dbp_role", "database_parameters.#", "1"),
+					testAccCheckRoleDatabaseConfig("dbp_role", "dbp_two", []string{
+						"temp_tablespaces=pg_default, pg_default", `application_name=it's \ me`,
+					}),
+				),
+			},
+			// The existing parameters of the databases are not read by the import.
+			{
+				ResourceName:            "postgresql_role.dbp_role",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"database_parameters", "password"},
+			},
+			// An empty map resets all the parameters of the database.
+			{
+				Config: configEmptyBlock,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.dbp_role", "database_parameters.#", "1"),
+					testAccCheckRoleDatabaseConfig("dbp_role", "dbp_two", []string{}),
+					testAccCheckConfigParameters(testRoleConfigQuery, "dbp_role", []string{"work_mem=16MB"}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlRole_DatabaseParametersRejected(t *testing.T) {
+	roleConfig := func(blocks string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "dbp_rejected" {
+  name = "dbp_rejected"
+  %s
+}
+`, blocks)
+	}
+	block := func(database, parameters string) string {
+		return fmt.Sprintf(`
+  database_parameters {
+    database   = "%s"
+    parameters = %s
+  }`, database, parameters)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config:      roleConfig(block("postgres", `{ search_path = "public" }`)),
+				ExpectError: regexp.MustCompile(`"search_path" cannot be set here, use the "search_path" attribute instead`),
+			},
+			{
+				Config:      roleConfig(block("postgres", `{ statement_timeout = "1" }`)),
+				ExpectError: regexp.MustCompile(`"statement_timeout" cannot be set here`),
+			},
+			{
+				Config:      roleConfig(block("postgres", `{ role = "foo" }`)),
+				ExpectError: regexp.MustCompile(`"role" cannot be set here`),
+			},
+			{
+				Config:      roleConfig(block("postgres", `{ Work_Mem = "1MB" }`)),
+				ExpectError: regexp.MustCompile(`is not a valid parameter name`),
+			},
+			{
+				Config:      roleConfig(block("postgres", `{ work_mem = "1MB" }`) + block("postgres", `{ lock_timeout = "1s" }`)),
+				ExpectError: regexp.MustCompile(`the database "postgres" is defined twice`),
+			},
+			// at the creation, the role is not created
+			{
+				Config:      roleConfig(block("postgres", `{ shared_buffers = "1GB" }`)),
+				ExpectError: regexp.MustCompile(`could not set parameter shared_buffers for role dbp_rejected in database postgres`),
+			},
+			{
+				Config:      roleConfig(block("does_not_exist", `{ work_mem = "1MB" }`)),
+				ExpectError: regexp.MustCompile(`could not set parameter work_mem for role dbp_rejected in database does_not_exist`),
+			},
+			{
+				Config: roleConfig(block("postgres", `{ work_mem = "64MB" }`)),
+				Check:  testAccCheckRoleDatabaseConfig("dbp_rejected", "postgres", []string{"work_mem=64MB"}),
+			},
+			// on update, the other changes are not applied
+			{
+				Config:      roleConfig(block("postgres", `{ work_mem = "128MB", shared_buffers = "1GB" }`)),
+				ExpectError: regexp.MustCompile(`could not set parameter shared_buffers for role dbp_rejected in database postgres`),
+			},
+			{
+				Config: roleConfig(block("postgres", `{ work_mem = "64MB" }`)),
+				Check:  testAccCheckRoleDatabaseConfig("dbp_rejected", "postgres", []string{"work_mem=64MB"}),
 			},
 		},
 	})

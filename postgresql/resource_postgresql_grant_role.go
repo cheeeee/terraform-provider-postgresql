@@ -12,24 +12,50 @@ import (
 )
 
 const (
-	// This returns the role membership for role, grant_role
-	getGrantRoleQuery = `
+	grantRoleWithAdminOptionAttr   = "with_admin_option"
+	grantRoleWithInheritOptionAttr = "with_inherit_option"
+	grantRoleWithSetOptionAttr     = "with_set_option"
+	grantRoleGrantorAttr           = "grantor"
+)
+
+// getGrantRoleQuery returns the role membership for role, grant_role.
+// The inherit and set options and the grantor are stored by PostgreSQL 16+,
+// in the older versions there is only one grantor: the role which ran the GRANT.
+// A membership can be granted several times, by different grantors (PostgreSQL 16+):
+// the one of the grantor of the resource is read if it is known.
+func getGrantRoleQuery(db *DBConnection, withGrantor bool) string {
+	inheritOption, setOption := "true", "true"
+	if db.featureSupported(featureRoleMembershipOptions) {
+		inheritOption, setOption = "inherit_option", "set_option"
+	}
+	grantorFilter := ""
+	if withGrantor {
+		grantorFilter = " AND pg_get_userbyid(grantor) = $3"
+	}
+
+	return fmt.Sprintf(`
 SELECT
   pg_get_userbyid(member) as role,
   pg_get_userbyid(roleid) as grant_role,
-  admin_option
+  admin_option,
+  %s,
+  %s,
+  pg_get_userbyid(grantor)
 FROM
   pg_auth_members
 WHERE
   pg_get_userbyid(member) = $1 AND
-  pg_get_userbyid(roleid) = $2;
-`
-)
+  pg_get_userbyid(roleid) = $2%s
+ORDER BY grantor
+LIMIT 1;
+`, inheritOption, setOption, grantorFilter)
+}
 
 func resourcePostgreSQLGrantRole() *schema.Resource {
 	return &schema.Resource{
 		Create: PGResourceFunc(resourcePostgreSQLGrantRoleCreate),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRoleRead),
+		Update: PGResourceFunc(resourcePostgreSQLGrantRoleUpdate),
 		Delete: PGResourceFunc(resourcePostgreSQLGrantRoleDelete),
 
 		Schema: map[string]*schema.Schema{
@@ -45,12 +71,30 @@ func resourcePostgreSQLGrantRole() *schema.Resource {
 				ForceNew:    true,
 				Description: "The name of the role that is granted to role",
 			},
-			"with_admin_option": {
+			grantRoleWithAdminOptionAttr: {
 				Type:        schema.TypeBool,
 				Optional:    true,
-				ForceNew:    true,
 				Default:     false,
 				Description: "Permit the grant recipient to grant it to others",
+			},
+			grantRoleWithInheritOptionAttr: {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Computed:    true,
+				Description: "Permit the grant recipient to use the privileges of the granted role (PostgreSQL 16+). Defaults to the INHERIT attribute of the role",
+			},
+			grantRoleWithSetOptionAttr: {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Computed:    true,
+				Description: "Permit the grant recipient to use SET ROLE to the granted role (PostgreSQL 16+). Defaults to true",
+			},
+			grantRoleGrantorAttr: {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Computed:    true,
+				ForceNew:    true,
+				Description: "The role recorded as the grantor of the membership (GRANTED BY, PostgreSQL 16+). Defaults to the role which runs the GRANT",
 			},
 		},
 	}
@@ -75,6 +119,10 @@ func resourcePostgreSQLGrantRoleCreate(db *DBConnection, d *schema.ResourceData)
 		)
 	}
 
+	if err := checkGrantRoleOptions(db, d); err != nil {
+		return err
+	}
+
 	txn, err := startTransaction(db.client, "")
 	if err != nil {
 		return err
@@ -95,6 +143,52 @@ func resourcePostgreSQLGrantRoleCreate(db *DBConnection, d *schema.ResourceData)
 	}
 
 	d.SetId(generateGrantRoleID(d))
+
+	return readGrantRole(db, d)
+}
+
+func resourcePostgreSQLGrantRoleUpdate(db *DBConnection, d *schema.ResourceData) error {
+	if !db.featureSupported(featurePrivileges) {
+		return fmt.Errorf(
+			"postgresql_grant_role resource is not supported for this Postgres version (%s)",
+			db.version,
+		)
+	}
+
+	if err := checkGrantRoleOptions(db, d); err != nil {
+		return err
+	}
+
+	txn, err := startTransaction(db.client, "")
+	if err != nil {
+		return err
+	}
+	defer deferredRollback(txn)
+
+	// The options are changed in place: GRANT ... WITH <option> to enable one,
+	// REVOKE <option> OPTION FOR to disable it.
+	for _, option := range grantRoleOptions {
+		if !d.HasChange(option.attr) {
+			continue
+		}
+		if _, configured := rawConfigBool(d, option.attr); !configured && option.attr != grantRoleWithAdminOptionAttr {
+			continue
+		}
+
+		var query string
+		if d.Get(option.attr).(bool) {
+			query = createGrantRoleQuery(d, option)
+		} else {
+			query = createRevokeRoleOptionQuery(d, option)
+		}
+		if _, err := txn.Exec(query); err != nil {
+			return fmt.Errorf("could not change %s of the grant role: %w", option.sql, err)
+		}
+	}
+
+	if err = txn.Commit(); err != nil {
+		return fmt.Errorf("could not commit transaction: %w", err)
+	}
 
 	return readGrantRole(db, d)
 }
@@ -124,9 +218,9 @@ func resourcePostgreSQLGrantRoleDelete(db *DBConnection, d *schema.ResourceData)
 	return nil
 }
 
-func readGrantRole(db QueryAble, d *schema.ResourceData) error {
-	var roleName, grantRoleName string
-	var withAdminOption bool
+func readGrantRole(db *DBConnection, d *schema.ResourceData) error {
+	var roleName, grantRoleName, grantor string
+	var withAdminOption, withInheritOption, withSetOption bool
 
 	grantRoleID := d.Id()
 
@@ -134,9 +228,17 @@ func readGrantRole(db QueryAble, d *schema.ResourceData) error {
 		&roleName,
 		&grantRoleName,
 		&withAdminOption,
+		&withInheritOption,
+		&withSetOption,
+		&grantor,
 	}
 
-	err := db.QueryRow(getGrantRoleQuery, d.Get("role"), d.Get("grant_role")).Scan(values...)
+	args := []any{d.Get("role"), d.Get("grant_role")}
+	if g, _ := d.Get(grantRoleGrantorAttr).(string); g != "" {
+		args = append(args, g)
+	}
+
+	err := db.QueryRow(getGrantRoleQuery(db, len(args) == 3), args...).Scan(values...)
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL grant role (%q) not found", grantRoleID)
@@ -148,14 +250,72 @@ func readGrantRole(db QueryAble, d *schema.ResourceData) error {
 
 	d.Set("role", roleName)
 	d.Set("grant_role", grantRoleName)
-	d.Set("with_admin_option", withAdminOption)
+	d.Set(grantRoleWithAdminOptionAttr, withAdminOption)
+	d.Set(grantRoleWithInheritOptionAttr, withInheritOption)
+	d.Set(grantRoleWithSetOptionAttr, withSetOption)
+	d.Set(grantRoleGrantorAttr, grantor)
 
 	d.SetId(generateGrantRoleID(d))
 
 	return nil
 }
 
-func createGrantRoleQuery(d *schema.ResourceData) string {
+// grantRoleOption is an option of a role membership.
+type grantRoleOption struct {
+	attr string
+	// sql is the name of the option in GRANT ... WITH <sql> and REVOKE <sql> OPTION FOR
+	sql string
+}
+
+var grantRoleOptions = []grantRoleOption{
+	{grantRoleWithAdminOptionAttr, "ADMIN"},
+	{grantRoleWithInheritOptionAttr, "INHERIT"},
+	{grantRoleWithSetOptionAttr, "SET"},
+}
+
+// rawConfigBool returns the value of a boolean attribute as it is written
+// in the configuration, and whether it is written at all.
+func rawConfigBool(d *schema.ResourceData, attr string) (bool, bool) {
+	config := d.GetRawConfig()
+	if config.IsNull() || !config.IsKnown() || !config.Type().IsObjectType() || !config.Type().HasAttribute(attr) {
+		return false, false
+	}
+	value := config.GetAttr(attr)
+	if value.IsNull() || !value.IsKnown() {
+		return false, false
+	}
+	return value.True(), true
+}
+
+// checkGrantRoleOptions refuses the options which the server does not know.
+func checkGrantRoleOptions(db *DBConnection, d *schema.ResourceData) error {
+	if db.featureSupported(featureRoleMembershipOptions) {
+		return nil
+	}
+	for _, attr := range []string{grantRoleWithInheritOptionAttr, grantRoleWithSetOptionAttr} {
+		if _, ok := rawConfigBool(d, attr); ok {
+			return fmt.Errorf("%s requires PostgreSQL 16 or later (server version: %s)", attr, db.version)
+		}
+	}
+	if config := d.GetRawConfig(); !config.IsNull() && config.IsKnown() && config.Type().IsObjectType() && config.Type().HasAttribute(grantRoleGrantorAttr) {
+		if g := config.GetAttr(grantRoleGrantorAttr); !g.IsNull() && g.IsKnown() && g.AsString() != "" {
+			return fmt.Errorf("%s requires PostgreSQL 16 or later (server version: %s)", grantRoleGrantorAttr, db.version)
+		}
+	}
+	return nil
+}
+
+func grantRoleGrantorClause(d *schema.ResourceData) string {
+	if grantor, _ := d.Get(grantRoleGrantorAttr).(string); grantor != "" {
+		return " GRANTED BY " + pq.QuoteIdentifier(grantor)
+	}
+	return ""
+}
+
+// createGrantRoleQuery returns the GRANT statement. Without options, it grants
+// the membership with the options which are in the configuration; with options,
+// only these ones (they are changed in place for an existing membership).
+func createGrantRoleQuery(d *schema.ResourceData, only ...grantRoleOption) string {
 	grantRole, _ := d.Get("grant_role").(string)
 	role, _ := d.Get("role").(string)
 
@@ -164,11 +324,34 @@ func createGrantRoleQuery(d *schema.ResourceData) string {
 		pq.QuoteIdentifier(grantRole),
 		pq.QuoteIdentifier(role),
 	)
-	if wao, _ := d.Get("with_admin_option").(bool); wao {
-		query = query + " WITH ADMIN OPTION"
+
+	var options []string
+	if len(only) > 0 {
+		for _, option := range only {
+			options = append(options, grantRoleOptionSQL(option, d.Get(option.attr).(bool)))
+		}
+	} else {
+		if wao, _ := d.Get(grantRoleWithAdminOptionAttr).(bool); wao {
+			options = append(options, "ADMIN OPTION")
+		}
+		for _, option := range grantRoleOptions[1:] {
+			if value, ok := rawConfigBool(d, option.attr); ok {
+				options = append(options, grantRoleOptionSQL(option, value))
+			}
+		}
+	}
+	if len(options) > 0 {
+		query += " WITH " + strings.Join(options, ", ")
 	}
 
-	return query
+	return query + grantRoleGrantorClause(d)
+}
+
+func grantRoleOptionSQL(option grantRoleOption, value bool) string {
+	if option.attr == grantRoleWithAdminOptionAttr && value {
+		return "ADMIN OPTION"
+	}
+	return fmt.Sprintf("%s %s", option.sql, strings.ToUpper(strconv.FormatBool(value)))
 }
 
 func createRevokeRoleQuery(d *schema.ResourceData) string {
@@ -176,9 +359,23 @@ func createRevokeRoleQuery(d *schema.ResourceData) string {
 	role, _ := d.Get("role").(string)
 
 	return fmt.Sprintf(
-		"REVOKE %s FROM %s",
+		"REVOKE %s FROM %s%s",
 		pq.QuoteIdentifier(grantRole),
 		pq.QuoteIdentifier(role),
+		grantRoleGrantorClause(d),
+	)
+}
+
+func createRevokeRoleOptionQuery(d *schema.ResourceData, option grantRoleOption) string {
+	grantRole, _ := d.Get("grant_role").(string)
+	role, _ := d.Get("role").(string)
+
+	return fmt.Sprintf(
+		"REVOKE %s OPTION FOR %s FROM %s%s",
+		option.sql,
+		pq.QuoteIdentifier(grantRole),
+		pq.QuoteIdentifier(role),
+		grantRoleGrantorClause(d),
 	)
 }
 
