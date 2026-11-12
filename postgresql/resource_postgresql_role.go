@@ -794,12 +794,10 @@ func resourcePostgreSQLRoleUpdate(db *DBConnection, d *schema.ResourceData) erro
 		return err
 	}
 
-	// applying roles: let's revoke all / grant the right ones
-	if err = revokeRoles(txn, d); err != nil {
-		return err
-	}
-
-	if err = grantRoles(txn, d); err != nil {
+	// applying roles: revoke the ones which are removed, grant the added ones.
+	// The memberships which are not changed are kept as they are, they can have
+	// options which are managed with postgresql_grant_role.
+	if err = changeRoles(txn, d); err != nil {
 		return err
 	}
 
@@ -1116,42 +1114,28 @@ func setRoleValidUntil(txn *sql.Tx, d *schema.ResourceData) error {
 	return nil
 }
 
-func revokeRoles(txn *sql.Tx, d *schema.ResourceData) error {
+// changeRoles revokes the roles which are not in the resource anymore and grants the new ones.
+func changeRoles(txn *sql.Tx, d *schema.ResourceData) error {
+	if !d.HasChange(roleRolesAttr) {
+		return nil
+	}
+
 	role := d.Get(roleNameAttr).(string)
+	oldRoles, newRoles := d.GetChange(roleRolesAttr)
+	removed := oldRoles.(*schema.Set).Difference(newRoles.(*schema.Set)).List()
+	added := newRoles.(*schema.Set).Difference(oldRoles.(*schema.Set)).List()
 
-	query := `SELECT pg_get_userbyid(roleid)
-		FROM pg_catalog.pg_auth_members members
-		JOIN pg_catalog.pg_roles ON members.member = pg_roles.oid
-		WHERE rolname = $1`
-
-	rows, err := txn.Query(query, role)
-	if err != nil {
-		return fmt.Errorf("could not get roles list for role %s: %w", role, err)
-	}
-	defer func() {
-		if err := rows.Close(); err != nil {
-			log.Printf("error closing rows: %v", err)
-		}
-	}()
-
-	grantedRoles := []string{}
-	for rows.Next() {
-		var grantedRole string
-
-		if err = rows.Scan(&grantedRole); err != nil {
-			return fmt.Errorf("could not scan role name for role %s: %w", role, err)
-		}
-		// We cannot revoke directly here as it shares the same cursor (with Tx)
-		// and rows.Next seems to retrieve result row by row.
-		// see: https://github.com/lib/pq/issues/81
-		grantedRoles = append(grantedRoles, grantedRole)
-	}
-
-	for _, grantedRole := range grantedRoles {
-		query = fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(grantedRole), pq.QuoteIdentifier(role))
-
+	for _, revokedRole := range removed {
+		query := fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(revokedRole.(string)), pq.QuoteIdentifier(role))
 		if _, err := txn.Exec(query); err != nil {
-			return fmt.Errorf("could not revoke role %s from %s: %w", string(grantedRole), role, err)
+			return fmt.Errorf("could not revoke role %s from %s: %w", revokedRole, role, err)
+		}
+	}
+
+	for _, grantedRole := range added {
+		query := fmt.Sprintf("GRANT %s TO %s", pq.QuoteIdentifier(grantedRole.(string)), pq.QuoteIdentifier(role))
+		if _, err := txn.Exec(query); err != nil {
+			return fmt.Errorf("could not grant role %s to %s: %w", grantedRole, role, err)
 		}
 	}
 

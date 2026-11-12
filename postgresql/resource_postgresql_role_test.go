@@ -1364,3 +1364,443 @@ resource "postgresql_role" "dbp_rejected" {
 		},
 	})
 }
+
+// testAccCheckRoleCannotLogin checks that a session cannot be opened with the password.
+func testAccCheckRoleCannotLogin(t *testing.T, role, password string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		config := getTestConfig(t)
+		config.Username = role
+		config.Password = password
+		db, err := sql.Open("postgres", config.connStr("postgres"))
+		if err != nil {
+			return fmt.Errorf("could not open SQL connection: %v", err)
+		}
+		defer closeDB(t, db)
+		if err := db.Ping(); err == nil {
+			return fmt.Errorf("role %s can login with the password %q", role, password)
+		}
+		return nil
+	}
+}
+
+// testAccCheckRoleColumn checks a column of pg_roles.
+func testAccCheckRoleColumn(role, column string, expected any) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		db, err := testAccProvider.Meta().(*Client).Connect()
+		if err != nil {
+			return err
+		}
+		var actual any
+		switch expected.(type) {
+		case bool:
+			var v bool
+			err = db.QueryRow(fmt.Sprintf("SELECT %s FROM pg_catalog.pg_roles WHERE rolname = $1", column), role).Scan(&v)
+			actual = v
+		case int:
+			var v int
+			err = db.QueryRow(fmt.Sprintf("SELECT %s FROM pg_catalog.pg_roles WHERE rolname = $1", column), role).Scan(&v)
+			actual = v
+		default:
+			var v string
+			err = db.QueryRow(fmt.Sprintf("SELECT %s::text FROM pg_catalog.pg_roles WHERE rolname = $1", column), role).Scan(&v)
+			actual = v
+		}
+		if err != nil {
+			return fmt.Errorf("could not read %s of role %s: %w", column, role, err)
+		}
+		if actual != expected {
+			return fmt.Errorf("%s of role %s: expected %v, got %v", column, role, expected, actual)
+		}
+		return nil
+	}
+}
+
+// testAccCheckRoleValidUntil checks the expiration of the password of a role, "infinity" for none.
+func testAccCheckRoleValidUntil(role, validUntil string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		db, err := testAccProvider.Meta().(*Client).Connect()
+		if err != nil {
+			return err
+		}
+		var ok bool
+		err = db.QueryRow(`SELECT COALESCE(rolvaliduntil = $2::timestamptz, $2 = 'infinity') FROM pg_catalog.pg_roles WHERE rolname = $1`,
+			role, validUntil).Scan(&ok)
+		if err != nil {
+			return fmt.Errorf("could not read the expiration of role %s: %w", role, err)
+		}
+		if !ok {
+			return fmt.Errorf("the password of role %s does not expire at %s", role, validUntil)
+		}
+		return nil
+	}
+}
+
+// testRoleBoolAttribute tests a boolean attribute of a role, at the creation and at the update, in both
+// directions, in the catalog and when it is changed outside of Terraform.
+// Two roles are used: the first one is created with true, the other with false.
+func testRoleBoolAttribute(t *testing.T, attr, column, enable, disable string, probe ...string) {
+	roleA, roleB := "bool_"+attr+"_a", "bool_"+attr+"_b"
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := func(a, b bool) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "a" {
+  name = "%s"
+  %s = %t
+}
+
+resource "postgresql_role" "b" {
+  name = "%s"
+  %s = %t
+}
+`, roleA, attr, a, roleB, attr, b)
+	}
+	check := func(a, b bool) resource.TestCheckFunc {
+		return resource.ComposeTestCheckFunc(
+			resource.TestCheckResourceAttr("postgresql_role.a", attr, strconv.FormatBool(a)),
+			resource.TestCheckResourceAttr("postgresql_role.b", attr, strconv.FormatBool(b)),
+			testAccCheckRoleColumn(roleA, column, a),
+			testAccCheckRoleColumn(roleB, column, b),
+		)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+			if len(probe) > 0 {
+				testCheckCanExecute(t, "set "+enable, probe...)
+			}
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{Config: roleConfig(true, false), Check: check(true, false)},
+			{Config: roleConfig(false, true), Check: check(false, true)},
+			{Config: roleConfig(true, false), Check: check(true, false)},
+			// changed outside of Terraform, in both directions
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, fmt.Sprintf("ALTER ROLE %s WITH %s", roleA, disable))
+					dbExecute(t, dsn, fmt.Sprintf("ALTER ROLE %s WITH %s", roleB, enable))
+				},
+				Config:             roleConfig(true, false),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{Config: roleConfig(true, false), Check: check(true, false)},
+			{
+				ResourceName:      "postgresql_role.a",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlRole_AttributeSuperuser(t *testing.T) {
+	testRoleBoolAttribute(t, "superuser", "rolsuper", "SUPERUSER", "NOSUPERUSER",
+		"CREATE ROLE tf_probe_su SUPERUSER")
+}
+
+func TestAccPostgresqlRole_AttributeCreateDatabase(t *testing.T) {
+	testRoleBoolAttribute(t, "create_database", "rolcreatedb", "CREATEDB", "NOCREATEDB")
+}
+
+func TestAccPostgresqlRole_AttributeCreateRole(t *testing.T) {
+	testRoleBoolAttribute(t, "create_role", "rolcreaterole", "CREATEROLE", "NOCREATEROLE")
+}
+
+func TestAccPostgresqlRole_AttributeInherit(t *testing.T) {
+	testRoleBoolAttribute(t, "inherit", "rolinherit", "INHERIT", "NOINHERIT")
+}
+
+func TestAccPostgresqlRole_AttributeLogin(t *testing.T) {
+	testRoleBoolAttribute(t, "login", "rolcanlogin", "LOGIN", "NOLOGIN")
+}
+
+func TestAccPostgresqlRole_AttributeReplication(t *testing.T) {
+	testRoleBoolAttribute(t, "replication", "rolreplication", "REPLICATION", "NOREPLICATION",
+		"CREATE ROLE tf_probe_repl REPLICATION")
+}
+
+func TestAccPostgresqlRole_AttributeBypassRLS(t *testing.T) {
+	testRoleBoolAttribute(t, "bypass_row_level_security", "rolbypassrls", "BYPASSRLS", "NOBYPASSRLS",
+		"CREATE ROLE tf_probe_rls BYPASSRLS")
+}
+
+// Test the numbers and the dates of a role, at the creation and at the update.
+func TestAccPostgresqlRole_AttributeLimitAndExpiration(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := func(limitA, validUntilA, limitB, validUntilB string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "a" {
+  name             = "limit_role_a"
+  %s
+  %s
+}
+
+resource "postgresql_role" "b" {
+  name             = "limit_role_b"
+  %s
+  %s
+}
+`, limitA, validUntilA, limitB, validUntilB)
+	}
+	limit := func(n int) string { return fmt.Sprintf("connection_limit = %d", n) }
+	until := func(v string) string { return fmt.Sprintf("valid_until = %q", v) }
+	check := func(limitA int, untilA string, limitB int, untilB string) resource.TestCheckFunc {
+		return resource.ComposeTestCheckFunc(
+			resource.TestCheckResourceAttr("postgresql_role.a", "connection_limit", strconv.Itoa(limitA)),
+			resource.TestCheckResourceAttr("postgresql_role.a", "valid_until", untilA),
+			resource.TestCheckResourceAttr("postgresql_role.b", "connection_limit", strconv.Itoa(limitB)),
+			resource.TestCheckResourceAttr("postgresql_role.b", "valid_until", untilB),
+			testAccCheckRoleColumn("limit_role_a", "rolconnlimit", limitA),
+			testAccCheckRoleColumn("limit_role_b", "rolconnlimit", limitB),
+			testAccCheckRoleValidUntil("limit_role_a", untilA),
+			testAccCheckRoleValidUntil("limit_role_b", untilB),
+		)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			// a date and the infinity at the creation, a positive limit and none
+			{
+				Config: roleConfig(limit(5), until("2099-05-04 12:00:00+00"), limit(-1), until("infinity")),
+				Check:  check(5, "2099-05-04 12:00:00+00", -1, "infinity"),
+			},
+			// in both directions, with another date
+			{
+				Config: roleConfig(limit(-1), until("infinity"), limit(2), until("2098-01-02 03:04:05+00")),
+				Check:  check(-1, "infinity", 2, "2098-01-02 03:04:05+00"),
+			},
+			{
+				Config: roleConfig(limit(0), until("2097-12-31 23:59:59+00"), limit(10), until("infinity")),
+				Check:  check(0, "2097-12-31 23:59:59+00", 10, "infinity"),
+			},
+			// the default values
+			{
+				Config: roleConfig("", "", "", ""),
+				Check:  check(-1, "infinity", -1, "infinity"),
+			},
+			// changed outside of Terraform
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER ROLE limit_role_a CONNECTION LIMIT 3")
+					dbExecute(t, dsn, "ALTER ROLE limit_role_b VALID UNTIL '2090-01-01 00:00:00+00'")
+				},
+				Config:             roleConfig("", "", "", ""),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: roleConfig("", "", "", ""),
+				Check:  check(-1, "infinity", -1, "infinity"),
+			},
+			{
+				ResourceName:      "postgresql_role.a",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				ResourceName:      "postgresql_role.b",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// Test the password of a role: set, changed, removed with NULL, removed from the configuration.
+func TestAccPostgresqlRole_Password(t *testing.T) {
+	roleConfig := func(password string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "pwd_role" {
+  name  = "pwd_role"
+  login = true
+  %s
+}
+
+resource "postgresql_role" "pwd_null_role" {
+  name     = "pwd_null_role"
+  login    = true
+  password = "NULL"
+}
+`, password)
+	}
+	password := func(p string) string { return fmt.Sprintf("password = %q", p) }
+	scram := func(role string) resource.TestCheckFunc {
+		return testAccCheckRoleStoredPassword(role, func(stored string) error {
+			if !scramSHA256PasswordRegexp.MatchString(stored) {
+				return fmt.Errorf("the password is not a SCRAM-SHA-256 hash: %q", stored)
+			}
+			return nil
+		})
+	}
+	noPassword := func(role string) resource.TestCheckFunc {
+		return testAccCheckRoleStoredPassword(role, func(stored string) error {
+			if stored != "" {
+				return fmt.Errorf("the role has a password: %q", stored)
+			}
+			return nil
+		})
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig(password("pwd1")),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleCanLogin(t, "pwd_role", "pwd1"),
+					scram("pwd_role"),
+					// NULL at the creation
+					testAccCheckRoleCannotLogin(t, "pwd_null_role", "NULL"),
+					testAccCheckRoleCannotLogin(t, "pwd_null_role", ""),
+					noPassword("pwd_null_role"),
+				),
+			},
+			{
+				Config: roleConfig(password("pwd2")),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleCanLogin(t, "pwd_role", "pwd2"),
+					testAccCheckRoleCannotLogin(t, "pwd_role", "pwd1"),
+					scram("pwd_role"),
+				),
+			},
+			// NULL at the update: the password is removed
+			{
+				Config: roleConfig(password("NULL")),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleCannotLogin(t, "pwd_role", "pwd2"),
+					testAccCheckRoleCannotLogin(t, "pwd_role", "pwd1"),
+					testAccCheckRoleCannotLogin(t, "pwd_role", "NULL"),
+					testAccCheckRoleCannotLogin(t, "pwd_role", ""),
+					noPassword("pwd_role"),
+				),
+			},
+			{
+				Config: roleConfig(password("pwd3")),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleCanLogin(t, "pwd_role", "pwd3"),
+					scram("pwd_role"),
+				),
+			},
+			// The password is removed from the configuration: the role keeps it.
+			// (removing it needs password = "NULL")
+			{
+				Config: roleConfig(""),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleCanLogin(t, "pwd_role", "pwd3"),
+					scram("pwd_role"),
+				),
+			},
+			{
+				Config: roleConfig(password("NULL")),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleCannotLogin(t, "pwd_role", "pwd3"),
+					noPassword("pwd_role"),
+				),
+			},
+			// a password given again after NULL, and the role is renamed
+			{
+				Config: strings.ReplaceAll(roleConfig(password("pwd4")), `"pwd_role"`, `"pwd_role_renamed"`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleCanLogin(t, "pwd_role_renamed", "pwd4"),
+					testAccCheckRoleCannotLogin(t, "pwd_role_renamed", "pwd3"),
+				),
+			},
+		},
+	})
+}
+
+// The passwords are sent in clear text if it is asked, and removed too.
+func TestAccPostgresqlRole_PasswordClearText(t *testing.T) {
+	roleConfig := func(password string) string {
+		return fmt.Sprintf(`
+provider "postgresql" {
+  password_authentication = "password"
+}
+
+resource "postgresql_role" "pwd_clear_role" {
+  name     = "pwd_clear_role"
+  login    = true
+  password = %q
+}
+`, password)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		// Unlike Providers, ProviderFactories lets the steps configure the provider
+		ProviderFactories: map[string]func() (*schema.Provider, error){
+			"postgresql": func() (*schema.Provider, error) { return testAccProvider, nil },
+		},
+		CheckDestroy: func(s *terraform.State) error {
+			// the other tests use the default configuration of the provider
+			resetDBRegistry()
+			return testAccCheckPostgresqlRoleDestroy(s)
+		},
+		Steps: []resource.TestStep{
+			{
+				PreConfig: resetDBRegistry,
+				Config:    roleConfig("clear1"),
+				Check:     testAccCheckRoleCanLogin(t, "pwd_clear_role", "clear1"),
+			},
+			{
+				Config: roleConfig("clear2"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleCanLogin(t, "pwd_clear_role", "clear2"),
+					testAccCheckRoleCannotLogin(t, "pwd_clear_role", "clear1"),
+				),
+			},
+			{
+				Config: roleConfig("NULL"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleCannotLogin(t, "pwd_clear_role", "clear2"),
+					testAccCheckRoleCannotLogin(t, "pwd_clear_role", "NULL"),
+				),
+			},
+		},
+	})
+}
+
+// PostgreSQL does not accept UNENCRYPTED passwords anymore.
+func TestAccPostgresqlRole_PasswordUnencrypted(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureScramSHA256)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_role" "unencrypted_role" {
+  name               = "unencrypted_role"
+  password           = "pwd"
+  encrypted_password = false
+}`,
+				ExpectError: regexp.MustCompile(`UNENCRYPTED PASSWORD is no longer supported`),
+			},
+		},
+	})
+}
