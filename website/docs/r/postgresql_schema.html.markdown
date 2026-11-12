@@ -59,7 +59,7 @@ resource "postgresql_schema" "my_schema" {
   database instance where it is configured.
 * `database` - (Optional) The DATABASE in which where this schema will be created. (Default: The database used by your `provider` configuration)
 * `owner` - (Optional) The ROLE who owns the schema.
-* `if_not_exists` - (Optional) When true, use the existing schema if it exists. (Default: true)
+* `if_not_exists` - (Optional) When true, use the existing schema if it exists. When false, creating a schema which already exists fails with the PostgreSQL error `schema ... already exists`. (Default: true)
 * `drop_cascade` - (Optional) When true, will also drop all the objects that are contained in the schema. (Default: false)
 * `policy` - (Optional) Can be specified multiple times for each policy.  Each
     policy block supports fields documented below.
@@ -73,6 +73,13 @@ The `policy` block supports:
 * `usage_with_grant` - (Optional) Should the specified ROLE have USAGE privileges to the specified SCHEMA and the ability to GRANT the USAGE privilege to other ROLEs.
 
 ~> **NOTE on `policy`:** The permissions of a role specified in multiple policy blocks is cumulative.  For example, if the same role is specified in two different `policy` each with different permissions (e.g. `create` and `usage_with_grant`, respectively), then the specified role with have both `create` and `usage_with_grant` privileges.
+
+~> **NOTE on drift:** The privileges of the roles (and of `PUBLIC`) which have a
+`policy` block are read back from the schema: a privilege of such a role which
+is granted or revoked outside of Terraform shows up in the plan, and applying
+repairs it. Privileges of roles without a `policy` block (for instance those given
+by `postgresql_grant`) are left alone, and so are those of the owner of the
+schema, which are implicit. The policy is not read when the resource is imported.
 
 ## Import Example
 
