@@ -124,9 +124,14 @@ resource "postgresql_role" "app_user" {
   is always set (to the conservative and safe value), but may interfere with the
   behavior of
   [PostgreSQL's `password_encryption` setting](https://www.postgresql.org/docs/current/static/runtime-config-connection.html#GUC-PASSWORD-ENCRYPTION).
+  `false` is refused by PostgreSQL 10 and above (`UNENCRYPTED PASSWORD is no longer supported`).
 
 * `password` - (Optional) Sets the role's password. A password is only of use
-  for roles having the `login` attribute set to true.
+  for roles having the `login` attribute set to true. The magic value `NULL`
+  removes the password (`ALTER ROLE ... PASSWORD NULL`): the role cannot log in
+  with a password anymore. Removing the `password` attribute from the
+  configuration does **not** remove the password of the role, it keeps the one
+  which is set: use `password = "NULL"` to remove it.
 
 * `password_wo` - (Optional) Sets the role's password without storing it in the state file.
   This is useful for managing passwords securely. Must be used together with `password_wo_version`.
@@ -137,7 +142,14 @@ resource "postgresql_role" "app_user" {
   change the password specified in `password_wo`. Must be used together with `password_wo`.
   Conflicts with `password`.
 
-* `roles` - (Optional) Defines list of roles which will be granted to this new role.
+* `roles` - (Optional) Defines list of roles which will be granted to this new role
+  (`GRANT role TO this_role`, the same as `CREATE ROLE ... IN ROLE`). The memberships
+  have the default options of PostgreSQL: use the
+  [`postgresql_grant_role`](postgresql_grant_role.html) resource (with `ignore_changes = [roles]`
+  here) for a membership with `with_admin_option`, `with_inherit_option` or `with_set_option`.
+  On update, only the roles which are added to or removed from the list are granted or revoked.
+  The `ROLE` and `ADMIN` clauses of `CREATE ROLE` (the roles which are members of the new role)
+  are expressed with `postgresql_grant_role`, with `role` set to the member.
 
 * `search_path` - (Optional) Alters the search path of this new role. Note that
   due to limitations in the implementation, values cannot contain the substring
@@ -175,6 +187,11 @@ resource "postgresql_role" "app_user" {
   set for this role with
   [`ALTER ROLE ... SET`](https://www.postgresql.org/docs/current/sql-alterrole.html),
   they are the session defaults of the role. See [Parameters](#parameters) below.
+
+* `database_parameters` - (Optional) Blocks of configuration parameters set for this
+  role in a database with
+  [`ALTER ROLE ... IN DATABASE ... SET`](https://www.postgresql.org/docs/current/sql-alterrole.html),
+  see [Database parameters](#database-parameters) below.
 
 ## Parameters
 
@@ -223,6 +240,49 @@ resource "postgresql_role" "app" {
 defined by an extension like [pgaudit](https://github.com/pgaudit/pgaudit),
 the extension needs to be loaded on the server (`shared_preload_libraries`)
 for the setting to have an effect, e.g.: with the DB parameter group on AWS RDS.
+
+## Database parameters
+
+```hcl
+resource "postgresql_role" "app" {
+  name  = "app"
+  login = true
+
+  parameters = {
+    work_mem = "16MB"
+  }
+
+  database_parameters {
+    database = "orders"
+    parameters = {
+      work_mem           = "64MB"
+      extra_float_digits = "2"
+    }
+  }
+}
+```
+
+* `database` - (Required) The name of the database, once per block.
+
+* `parameters` - (Required) A map of parameters, with the same rules as the
+  [`parameters`](#parameters) attribute of the role (lowercase names, `search_path`,
+  `statement_timeout`, `idle_in_transaction_session_timeout` and `role` are reserved,
+  lists of identifiers are comma-separated).
+
+The settings of a role in a database win over the settings of the role, which win
+over the settings of the database (`postgresql_database` `parameters`), so a session
+of the role in this database uses `64MB` in the example above and `16MB` in the other databases.
+
+* A block defines the exhaustive list of the parameters of the role in its database:
+  the ones which are added, changed or removed outside of Terraform are reported in the plan
+  and reverted on apply, `parameters = {}` removes all of them. Removing a block
+  resets the parameters of the role in this database.
+
+* The databases which have no block are never read or modified. When there is
+  no `database_parameters` block at all, the existing settings are left untouched.
+
+* They are not read by `terraform import`: add the blocks to the configuration
+  to manage them.
 
 ## Import Example
 
