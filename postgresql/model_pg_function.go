@@ -72,7 +72,9 @@ func (pgFunction *PGFunction) FromResourceData(d *schema.ResourceData) error {
 	for _, t := range d.Get(funcTransformAttr).([]any) {
 		pgFunction.Transform = append(pgFunction.Transform, t.(string))
 	}
-	pgFunction.Parameters = d.Get(funcParametersAttr).(map[string]any)
+	if parameters := d.Get(funcParametersAttr).(map[string]any); len(parameters) > 0 {
+		pgFunction.Parameters = parameters
+	}
 	for _, e := range d.Get(funcDependsOnExtensionsAttr).(*schema.Set).List() {
 		pgFunction.Extensions = append(pgFunction.Extensions, e.(string))
 	}

@@ -1299,6 +1299,15 @@ resource "postgresql_function" "c" {
     volatility = "%s"
     strict = true
 }
+
+# the library built with the test image, which has no SQL script in $libdir
+resource "postgresql_function" "dummy" {
+    name = "tf_lang_dummy"
+    returns = "void"
+    language = "c"
+    obj_file = "/opt/dummy_seclabel/dummy_seclabel"
+    body = "dummy_seclabel_dummy"
+}
 `, volatility)
 	}
 	var cOID string
@@ -1309,6 +1318,7 @@ resource "postgresql_function" "c" {
 				t, "create functions in the internal and c languages",
 				"CREATE FUNCTION public.tf_probe_internal(integer, integer) RETURNS integer LANGUAGE internal AS 'int4pl'",
 				"CREATE FUNCTION public.tf_probe_c(text, text) RETURNS boolean LANGUAGE c AS '$libdir/citext', 'citext_eq'",
+				"CREATE FUNCTION public.tf_probe_dummy() RETURNS void LANGUAGE c AS '/opt/dummy_seclabel/dummy_seclabel', 'dummy_seclabel_dummy'",
 			)
 		},
 		Providers:    testAccProviders,
@@ -1325,6 +1335,8 @@ resource "postgresql_function" "c" {
 					resource.TestCheckResourceAttr("postgresql_function.c", "obj_file", "$libdir/citext"),
 					resource.TestCheckResourceAttr("postgresql_function.c", "body", "citext_eq"),
 					testAccFunctionCall("SELECT public.tf_lang_c('Abc', 'aBC')", "true"),
+					testAccFunctionProp("postgresql_function.dummy", "p.probin || ',' || p.prosrc", "/opt/dummy_seclabel/dummy_seclabel,dummy_seclabel_dummy"),
+					testAccFunctionCall("SELECT public.tf_lang_dummy() IS NULL", "false"),
 				),
 			},
 			{
@@ -1343,6 +1355,12 @@ resource "postgresql_function" "c" {
 			},
 			{
 				ResourceName:            "postgresql_function.c",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				ResourceName:            "postgresql_function.dummy",
 				ImportState:             true,
 				ImportStateVerify:       true,
 				ImportStateVerifyIgnore: []string{"drop_cascade"},
