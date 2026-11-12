@@ -207,8 +207,12 @@ The following arguments are supported:
 * `aws_rds_iam_auth` - (Optional) If set to `true`, call the AWS RDS API to grab a temporary password, using AWS Credentials
   from the environment (or the given profile, see `aws_rds_iam_profile`)
 * `aws_rds_iam_profile` - (Optional) The AWS IAM Profile to use while using AWS RDS IAM Auth.
-* `aws_rds_iam_region` - (Optional) The AWS region to use while using AWS RDS IAM Auth.
-* `aws_rds_iam_provider_role_arn` - (Optional) AWS IAM role to assume while using AWS RDS IAM Auth.
+* `aws_rds_iam_region` - (Optional) The AWS region to use while using AWS RDS IAM Auth: the region of the
+  database. When it is not set, the region of the profile or of the environment (`AWS_REGION`) is used.
+  It takes precedence over the region of `aws_rds_iam_profile`. The provider returns an error when no region is found.
+* `aws_rds_iam_provider_role_arn` - (Optional) AWS IAM role to assume while using AWS RDS IAM Auth. The role is
+  assumed with the credentials of the environment (or of `aws_rds_iam_profile`) and the token is signed
+  with the credentials of the role, in the same region.
 * `azure_identity_auth` - (Optional) If set to `true`, call the Azure OAuth token endpoint for temporary token
 * `azure_tenant_id` - (Optional) (Required if `azure_identity_auth` is `true`) Azure tenant ID [read more](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/data-sources/client_config.html)
 

@@ -271,44 +271,68 @@ func validateExpectedVersion(v any, key string) (warnings []string, errors []err
 	return
 }
 
+// rdsAssumeRole returns the temporary credentials of an AWS IAM role, assumed with the
+// credentials and the region of the given configuration.
+type rdsAssumeRole func(ctx context.Context, awscfg aws.Config, role string) (aws.CredentialsProvider, error)
+
+func assumeRDSRole(ctx context.Context, awscfg aws.Config, role string) (aws.CredentialsProvider, error) {
+	roleOutput, err := sts.NewFromConfig(awscfg).AssumeRole(ctx, &sts.AssumeRoleInput{
+		RoleArn:         aws.String(role),
+		RoleSessionName: aws.String("TerraformPostgresqlProvider"),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("could not assume AWS role: %w", err)
+	}
+
+	return credentials.NewStaticCredentialsProvider(
+		*roleOutput.Credentials.AccessKeyId,
+		*roleOutput.Credentials.SecretAccessKey,
+		*roleOutput.Credentials.SessionToken,
+	), nil
+}
+
 func getRDSAuthToken(region string, profile string, role string, username string, host string, port int) (string, error) {
+	return buildRDSAuthToken(context.Background(), region, profile, role, username, host, port, assumeRDSRole)
+}
+
+// buildRDSAuthToken returns the token used as a password to log in with AWS RDS IAM
+// authentication. The region of the token is aws_rds_iam_region if it is set, otherwise
+// the one of the profile or of the environment; it is the same whether a role is assumed or not.
+func buildRDSAuthToken(
+	ctx context.Context, region string, profile string, role string, username string, host string, port int,
+	assumeRole rdsAssumeRole,
+) (string, error) {
 	endpoint := fmt.Sprintf("%s:%d", host, port)
 
-	ctx := context.Background()
-
-	var awscfg aws.Config
-	var err error
-
+	var options []func(*awsConfig.LoadOptions) error
 	if profile != "" {
-		awscfg, err = awsConfig.LoadDefaultConfig(ctx, awsConfig.WithSharedConfigProfile(profile))
-	} else if region != "" {
-		awscfg, err = awsConfig.LoadDefaultConfig(ctx, awsConfig.WithRegion(region))
-	} else {
-		awscfg, err = awsConfig.LoadDefaultConfig(ctx)
+		options = append(options, awsConfig.WithSharedConfigProfile(profile))
 	}
+	if region != "" {
+		options = append(options, awsConfig.WithRegion(region))
+	}
+	awscfg, err := awsConfig.LoadDefaultConfig(ctx, options...)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("could not load AWS default config: %w", err)
+	}
+
+	// A token signed without a region is refused by the database with an authentication
+	// error ("PAM authentication failed") which says nothing about its cause.
+	if awscfg.Region == "" {
+		return "", fmt.Errorf(
+			"could not find the AWS region for RDS IAM authentication: " +
+				"set aws_rds_iam_region, a region in the AWS profile or the AWS_REGION environment variable",
+		)
 	}
 
 	if role != "" {
-		stsClient := sts.NewFromConfig(awscfg)
-		roleInput := &sts.AssumeRoleInput{
-			RoleArn:         aws.String(role),
-			RoleSessionName: aws.String("TerraformPostgresqlProvider"),
-		}
-
-		roleOutput, err := stsClient.AssumeRole(ctx, roleInput)
+		roleCredentials, err := assumeRole(ctx, awscfg, role)
 		if err != nil {
-			return "", fmt.Errorf("could not assume AWS role: %w", err)
+			return "", err
 		}
-
 		// Swap the credentials in place rather than reloading the config, which discards
 		// the region resolved above and leaves BuildAuthToken signing without one.
-		awscfg.Credentials = aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(
-			*roleOutput.Credentials.AccessKeyId,
-			*roleOutput.Credentials.SecretAccessKey,
-			*roleOutput.Credentials.SessionToken,
-		))
+		awscfg.Credentials = aws.NewCredentialsCache(roleCredentials)
 	}
 
 	token, err := auth.BuildAuthToken(ctx, endpoint, awscfg.Region, username, awscfg.Credentials)
