@@ -648,3 +648,20 @@ resource "postgresql_event_trigger" "event_trigger" {
   %[7]s
 }
 `
+
+// PostgreSQL refuses a filter variable specified more than once, so only one filter block is allowed.
+func TestAccPostgresqlEventTrigger_FilterMultiple(t *testing.T) {
+	skipIfNotAcc(t)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:  func() { testAccPreCheck(t) },
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(testAccPostgreSQLEventTriggerGenericConfig, "postgres", "public", "test_event", "ddl_command_end", "postgres", "enable",
+					testAccEventTriggerFilter("CREATE TABLE")+"\n"+testAccEventTriggerFilter("ALTER TABLE"), ""),
+				ExpectError: regexp.MustCompile(`Too many filter blocks`),
+			},
+		},
+	})
+}
