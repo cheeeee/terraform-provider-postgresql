@@ -3,6 +3,7 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
@@ -165,9 +166,52 @@ func testAccCheckPostgresqlPhysicalReplicationSlotReserved(name string, expected
 	}
 }
 
-// A logical slot with the same name must not be seen as the physical one.
+// testAccCheckPostgresqlPhysicalReplicationSlotCatalog checks in pg_replication_slots that the slot is physical:
+// a physical slot has neither an output plugin nor a database.
+func testAccCheckPostgresqlPhysicalReplicationSlotCatalog(name string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		db, err := testAccProvider.Meta().(*Client).Connect()
+		if err != nil {
+			return err
+		}
+
+		var slotType string
+		var plugin, database sql.NullString
+		err = db.QueryRow(
+			"SELECT slot_type, plugin, database FROM pg_catalog.pg_replication_slots WHERE slot_name = $1", name,
+		).Scan(&slotType, &plugin, &database)
+		if err != nil {
+			return fmt.Errorf("error reading replication slot %s: %w", name, err)
+		}
+		if slotType != "physical" {
+			return fmt.Errorf("replication slot %s: expected slot_type physical, got %s", name, slotType)
+		}
+		if plugin.Valid {
+			return fmt.Errorf("replication slot %s: physical slot has plugin %s", name, plugin.String)
+		}
+		if database.Valid {
+			return fmt.Errorf("replication slot %s: physical slot has database %s", name, database.String)
+		}
+		return nil
+	}
+}
+
+// A logical slot is not a physical slot: the resource neither reads it nor imports it, and a physical
+// slot cannot be created with its name.
 func TestAccPostgresqlPhysicalReplicationSlot_NotLogical(t *testing.T) {
 	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	// Removes the logical slot left by the test, if any.
+	defer dbExecute(t, dsn, "SELECT pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'logical_slot'")
+
+	physicalConfig := `
+resource "postgresql_physical_replication_slot" "myslot" {
+  name = "physical_slot"
+}
+`
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
@@ -179,20 +223,31 @@ func TestAccPostgresqlPhysicalReplicationSlot_NotLogical(t *testing.T) {
 		CheckDestroy: testAccCheckPostgresqlPhysicalReplicationSlotDestroy,
 		Steps: []resource.TestStep{
 			{
-				Config: `
-resource "postgresql_replication_slot" "logical" {
-  name   = "logical_slot"
-  plugin = "test_decoding"
-}
-
-resource "postgresql_physical_replication_slot" "physical" {
-  name = "physical_slot"
-}
-`,
+				Config: physicalConfig,
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlPhysicalReplicationSlotExists("physical_slot", true),
-					testAccCheckPostgresqlPhysicalReplicationSlotExists("logical_slot", false),
+					testAccCheckPostgresqlPhysicalReplicationSlotCatalog("physical_slot"),
 				),
+			},
+			// The logical slot is not imported as a physical slot.
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "SELECT FROM pg_create_logical_replication_slot('logical_slot', 'test_decoding')")
+				},
+				Config:        physicalConfig,
+				ResourceName:  "postgresql_physical_replication_slot.myslot",
+				ImportState:   true,
+				ImportStateId: "logical_slot",
+				ExpectError:   regexp.MustCompile(`Cannot import non-existent remote object`),
+			},
+			// A physical slot is not created with the name of the logical slot.
+			{
+				Config: `
+resource "postgresql_physical_replication_slot" "myslot" {
+  name = "logical_slot"
+}
+`,
+				ExpectError: regexp.MustCompile(`already exists`),
 			},
 		},
 	})

@@ -300,16 +300,12 @@ func setExtVersion(txn *sql.Tx, d *schema.ResourceData) error {
 
 	extName := d.Get(extNameAttr).(string)
 
-	b := bytes.NewBufferString("ALTER EXTENSION ")
-	fmt.Fprintf(b, "%s UPDATE", pq.QuoteIdentifier(extName))
-
+	// version is Optional and Computed: a configuration which omits it keeps the installed
+	// version, so the new value is never empty here.
 	_, nraw := d.GetChange(extVersionAttr)
 	n := nraw.(string)
-	if n != "" {
-		fmt.Fprintf(b, " TO %s", pq.QuoteIdentifier(n))
-	}
 
-	sql := b.String()
+	sql := fmt.Sprintf("ALTER EXTENSION %s UPDATE TO %s", pq.QuoteIdentifier(extName), pq.QuoteIdentifier(n))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("error updating extension version: %w", err)
 	}
