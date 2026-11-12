@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -1056,5 +1057,883 @@ resource "postgresql_database" "audited_db" {
 				),
 			},
 		},
+	})
+}
+
+// testSkipIfOlderThan skips the test if the server is older than minVersion (server_version_num).
+func testSkipIfOlderThan(t *testing.T, minVersion int, feature string) {
+	if version := testServerVersionNum(t); version < minVersion {
+		t.Skipf("Skip test: %s needs a PostgreSQL server of version %d or later", feature, minVersion)
+	}
+}
+
+// testDatabaseOptionSteps returns the steps if the server accepts the CREATE DATABASE option,
+// otherwise a single step which checks that the provider refuses it with a clear error.
+func testDatabaseOptionSteps(t *testing.T, minVersion int, clause, config string, steps []resource.TestStep) []resource.TestStep {
+	if testServerVersionNum(t) >= minVersion {
+		return steps
+	}
+	return []resource.TestStep{{
+		Config:      config,
+		ExpectError: regexp.MustCompile(`does not support database ` + clause),
+	}}
+}
+
+// testQueryDatabase returns the first column of the first row returned by a query on the server.
+func testQueryDatabase(t *testing.T, query string, args ...any) string {
+	config := getTestConfig(t)
+	db, err := sql.Open("postgres", config.connStr("postgres"))
+	if err != nil {
+		t.Fatalf("could not open SQL connection: %v", err)
+	}
+	defer closeDB(t, db)
+
+	var value sql.NullString
+	if err := db.QueryRow(query, args...).Scan(&value); err != nil {
+		t.Fatalf("could not run the query %q: %v", query, err)
+	}
+	return value.String
+}
+
+// testCheckDatabaseValue checks the value returned by a query on the server (e.g.: a catalog query).
+func testCheckDatabaseValue(t *testing.T, expected, query string, args ...any) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		if got := testQueryDatabase(t, query, args...); got != expected {
+			return fmt.Errorf("query %q: expected %q, got %q", query, expected, got)
+		}
+		return nil
+	}
+}
+
+// testICULocaleColumn returns the column of pg_database which stores the ICU locale.
+func testICULocaleColumn(t *testing.T) string {
+	if testServerVersionNum(t) >= 170000 {
+		return "datlocale"
+	}
+	return "daticulocale"
+}
+
+// Renaming a database changes its name in place: the database is not replaced.
+func TestAccPostgresqlDatabase_Rename(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbConfig := func(name string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "rename_db" {
+  name = %q
+}
+`, name)
+	}
+	const oidQuery = "SELECT oid::text FROM pg_database WHERE datname = $1"
+	var oid string
+	recordOID := func(name string) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			oid = testQueryDatabase(t, oidQuery, name)
+			return nil
+		}
+	}
+	checkSameOID := func(name string) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			if got := testQueryDatabase(t, oidQuery, name); got != oid {
+				return fmt.Errorf("database %s was replaced: its OID changed from %s to %s", name, oid, got)
+			}
+			return nil
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig("rename_db_1"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlDatabaseExists("postgresql_database.rename_db"),
+					recordOID("rename_db_1"),
+				),
+			},
+			{
+				Config: dbConfig("rename_db_2"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.rename_db", "name", "rename_db_2"),
+					testCheckDatabaseValue(t, "0", "SELECT count(*)::text FROM pg_database WHERE datname = $1", "rename_db_1"),
+					checkSameOID("rename_db_2"),
+				),
+			},
+			// A rename made outside of Terraform is seen as a missing database.
+		},
+	})
+}
+
+// is_template can be set to true and back to false, the change made outside of Terraform is reverted.
+func TestAccPostgresqlDatabase_IsTemplate(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	dbConfig := func(isTemplate string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "template_db" {
+  name        = "template_db"
+  is_template = %s
+}
+`, isTemplate)
+	}
+	const isTemplateQuery = "SELECT datistemplate::text FROM pg_database WHERE datname = $1"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig("false"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.template_db", "is_template", "false"),
+					testCheckDatabaseValue(t, "false", isTemplateQuery, "template_db"),
+				),
+			},
+			{
+				Config: dbConfig("true"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.template_db", "is_template", "true"),
+					testCheckDatabaseValue(t, "true", isTemplateQuery, "template_db"),
+				),
+			},
+			{
+				Config: dbConfig("false"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.template_db", "is_template", "false"),
+					testCheckDatabaseValue(t, "false", isTemplateQuery, "template_db"),
+				),
+			},
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER DATABASE template_db IS_TEMPLATE true")
+				},
+				Config:             dbConfig("false"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: dbConfig("false"),
+				Check:  testCheckDatabaseValue(t, "false", isTemplateQuery, "template_db"),
+			},
+		},
+	})
+}
+
+// allow_connections can be false at the creation and changed in both directions.
+func TestAccPostgresqlDatabase_AllowConnections(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	dbConfig := func(allowConnections string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "allow_conn_db" {
+  name              = "allow_conn_db"
+  allow_connections = %s
+}
+`, allowConnections)
+	}
+	const allowConnQuery = "SELECT datallowconn::text FROM pg_database WHERE datname = $1"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig("false"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.allow_conn_db", "allow_connections", "false"),
+					testCheckDatabaseValue(t, "false", allowConnQuery, "allow_conn_db"),
+				),
+			},
+			{
+				Config: dbConfig("true"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.allow_conn_db", "allow_connections", "true"),
+					testCheckDatabaseValue(t, "true", allowConnQuery, "allow_conn_db"),
+				),
+			},
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER DATABASE allow_conn_db ALLOW_CONNECTIONS false")
+				},
+				Config:             dbConfig("true"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: dbConfig("true"),
+				Check:  testCheckDatabaseValue(t, "true", allowConnQuery, "allow_conn_db"),
+			},
+		},
+	})
+}
+
+// connection_limit is changed in place, the change made outside of Terraform is reverted.
+func TestAccPostgresqlDatabase_ConnectionLimit(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	dbConfig := func(connLimit string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "conn_limit_db" {
+  name             = "conn_limit_db"
+  connection_limit = %s
+}
+`, connLimit)
+	}
+	const connLimitQuery = "SELECT datconnlimit::text FROM pg_database WHERE datname = $1"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig("5"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.conn_limit_db", "connection_limit", "5"),
+					testCheckDatabaseValue(t, "5", connLimitQuery, "conn_limit_db"),
+				),
+			},
+			{
+				Config: dbConfig("2"),
+				Check:  testCheckDatabaseValue(t, "2", connLimitQuery, "conn_limit_db"),
+			},
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER DATABASE conn_limit_db CONNECTION LIMIT = 7")
+				},
+				Config:             dbConfig("2"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: dbConfig("-1"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.conn_limit_db", "connection_limit", "-1"),
+					testCheckDatabaseValue(t, "-1", connLimitQuery, "conn_limit_db"),
+				),
+			},
+		},
+	})
+}
+
+// Changing the owner of a database changes the owner of the database only, the owner of its
+// objects is changed too when alter_object_ownership is set.
+func TestAccPostgresqlDatabase_OwnerChange(t *testing.T) {
+	testAccPostgresqlDatabaseOwnerChange(t, false)
+}
+
+func TestAccPostgresqlDatabase_OwnerChangeAlterObjectOwnership(t *testing.T) {
+	testAccPostgresqlDatabaseOwnerChange(t, true)
+}
+
+func testAccPostgresqlDatabaseOwnerChange(t *testing.T, alterObjectOwnership bool) {
+	skipIfNotAcc(t)
+
+	const (
+		dbSuffix  = "owner_change"
+		tableName = "owner_change_table"
+		newOwner  = "owner_change_new"
+	)
+	dbName := fmt.Sprintf("%s_%s", dbNamePrefix, dbSuffix)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	// PostgreSQL only lets the owner of a database change its owner: without
+	// alter_object_ownership, the database is first owned by the connected user.
+	// With it, the objects of the initial owner are reassigned: it is a role of its own,
+	// as the connected superuser owns objects which cannot be reassigned.
+	initialOwner := config.Username
+	tableCreator := ""
+	roles := []string{newOwner}
+	if alterObjectOwnership {
+		initialOwner = "owner_change_initial"
+		tableCreator = initialOwner
+		roles = append(roles, initialOwner)
+	}
+	for _, role := range roles {
+		dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE %s", role))
+		defer dbExecute(t, dsn, fmt.Sprintf("DROP ROLE %s", role))
+	}
+	dbConfig := func(owner string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "owner_change_db" {
+  name                   = %q
+  owner                  = %q
+  alter_object_ownership = %t
+}
+`, dbName, owner, alterObjectOwnership)
+	}
+	const ownerQuery = "SELECT pg_get_userbyid(datdba)::text FROM pg_database WHERE datname = $1"
+
+	// The owner of the table is the one of the objects which are reassigned with the database.
+	tableOwnerAfterChange := initialOwner
+	if alterObjectOwnership {
+		tableOwnerAfterChange = newOwner
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			// PostgreSQL denies REASSIGN OWNED to a role which is not a superuser.
+			if alterObjectOwnership {
+				testSuperuserPreCheck(t)
+			}
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig(initialOwner),
+				Check: resource.ComposeTestCheckFunc(
+					testCheckDatabaseValue(t, initialOwner, ownerQuery, dbName),
+					func(*terraform.State) error {
+						// The table is created after the database, by its owner.
+						_ = createTestTables(t, dbSuffix, []string{tableName}, tableCreator)
+						return nil
+					},
+				),
+			},
+			{
+				Config: dbConfig(newOwner),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.owner_change_db", "owner", newOwner),
+					testCheckDatabaseValue(t, newOwner, ownerQuery, dbName),
+					checkTableOwnership(t, config.connStr(dbName), tableOwnerAfterChange, tableName),
+				),
+			},
+		},
+	})
+}
+
+// Dropping a database terminates the sessions which are connected to it.
+func TestAccPostgresqlDatabase_DropWithOpenConnection(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	const dbName = "drop_open_db"
+
+	var pool *sql.DB
+	var conn *sql.Conn
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_database" "drop_open_db" {
+  name = "drop_open_db"
+}
+`,
+				Check: func(*terraform.State) error {
+					var err error
+					pool, err = sql.Open("postgres", config.connStr(dbName))
+					if err != nil {
+						return fmt.Errorf("could not open SQL connection: %w", err)
+					}
+					conn, err = pool.Conn(context.Background())
+					if err != nil {
+						return fmt.Errorf("could not connect to the database: %w", err)
+					}
+					var one int
+					return conn.QueryRowContext(context.Background(), "SELECT 1").Scan(&one)
+				},
+			},
+			{
+				Config: "# the database is removed while a session is connected to it\n",
+				Check: func(*terraform.State) error {
+					defer pool.Close()
+					if err := conn.PingContext(context.Background()); err == nil {
+						return errors.New("the session opened on the database is still connected after DROP DATABASE")
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// LOCALE sets LC_COLLATE and LC_CTYPE at once, it cannot be used with them.
+func TestAccPostgresqlDatabase_Locale(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbConfig := func(options string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "locale_db" {
+  name = "locale_db"
+  %s
+}
+`, options)
+	}
+	const collateQuery = "SELECT datcollate || ' ' || datctype FROM pg_database WHERE datname = $1"
+	const oidQuery = "SELECT oid::text FROM pg_database WHERE datname = $1"
+	var oid string
+	recordOID := func(*terraform.State) error {
+		oid = testQueryDatabase(t, oidQuery, "locale_db")
+		return nil
+	}
+	checkOIDChanged := func(*terraform.State) error {
+		if got := testQueryDatabase(t, oidQuery, "locale_db"); got == oid {
+			return errors.New("the database was not replaced by the change of locale")
+		}
+		return nil
+	}
+	checkSameOID := func(*terraform.State) error {
+		if got := testQueryDatabase(t, oidQuery, "locale_db"); got != oid {
+			return fmt.Errorf("the database was replaced: its OID changed from %s to %s", oid, got)
+		}
+		return nil
+	}
+
+	steps := []resource.TestStep{
+		{
+			Config: dbConfig(`locale = "C"`),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.locale_db", "locale", "C"),
+				resource.TestCheckResourceAttr("postgresql_database.locale_db", "lc_collate", "C"),
+				resource.TestCheckResourceAttr("postgresql_database.locale_db", "lc_ctype", "C"),
+				testCheckDatabaseValue(t, "C C", collateQuery, "locale_db"),
+				recordOID,
+			),
+		},
+		{
+			ResourceName:            "postgresql_database.locale_db",
+			ImportState:             true,
+			ImportStateVerify:       true,
+			ImportStateVerifyIgnore: []string{"template", "alter_object_ownership"},
+		},
+		// LOCALE is set at the creation: the database is replaced.
+		{
+			Config: dbConfig(`locale = "en_US.UTF-8"`),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.locale_db", "locale", "en_US.UTF-8"),
+				testCheckDatabaseValue(t, "en_US.UTF-8 en_US.UTF-8", collateQuery, "locale_db"),
+				checkOIDChanged,
+				recordOID,
+			),
+		},
+		{
+			Config:      "resource \"postgresql_database\" \"locale_db\" {\n  name   = \"locale_db\"\n  locale = \"C\"\n  lc_collate = \"C\"\n}\n",
+			ExpectError: regexp.MustCompile(`conflicts with`),
+		},
+		// Without locale, the database is left as it is.
+		{
+			Config: dbConfig(""),
+			Check: resource.ComposeTestCheckFunc(
+				testCheckDatabaseValue(t, "en_US.UTF-8 en_US.UTF-8", collateQuery, "locale_db"),
+				checkSameOID,
+			),
+		},
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps:        testDatabaseOptionSteps(t, 130000, "LOCALE", dbConfig(`locale = "C"`), steps),
+	})
+}
+
+// tablespace_name is changed in place: DEFAULT moves the database back to pg_default.
+// The tablespace needs a directory on the server, so it is created with
+// allow_in_place_tablespaces (PostgreSQL 15 and above, superuser only).
+func TestAccPostgresqlDatabase_Tablespace(t *testing.T) {
+	skipIfNotAcc(t)
+	testSkipIfOlderThan(t, 150000, "allow_in_place_tablespaces")
+
+	if testQueryDatabase(t, "SELECT rolsuper::text FROM pg_roles WHERE rolname = current_user") != "true" {
+		t.Skip("Skip test: CREATE TABLESPACE can be run only by a superuser")
+	}
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	const tablespace = "tf_tests_tablespace"
+
+	dbExecute(t, dsn, fmt.Sprintf("DROP TABLESPACE IF EXISTS %s", tablespace))
+	func() {
+		db, err := sql.Open("postgres", dsn)
+		if err != nil {
+			t.Fatalf("could not open SQL connection: %v", err)
+		}
+		defer closeDB(t, db)
+
+		conn, err := db.Conn(context.Background())
+		if err != nil {
+			t.Fatalf("could not connect to the database: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		// The option is set for this session only, the tablespace has no directory.
+		for _, statement := range []string{
+			"SET allow_in_place_tablespaces = on",
+			fmt.Sprintf("CREATE TABLESPACE %s LOCATION ''", tablespace),
+		} {
+			if _, err := conn.ExecContext(context.Background(), statement); err != nil {
+				t.Fatalf("could not run %q: %v", statement, err)
+			}
+		}
+	}()
+	defer dbExecute(t, dsn, fmt.Sprintf("DROP TABLESPACE %s", tablespace))
+
+	const tablespaceQuery = "SELECT t.spcname FROM pg_database d JOIN pg_tablespace t ON t.oid = d.dattablespace WHERE d.datname = $1"
+	dbConfig := func(tablespaceName string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "tablespace_db" {
+  name            = "tablespace_db"
+  tablespace_name = %q
+}
+`, tablespaceName)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: dbConfig(tablespace),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.tablespace_db", "tablespace_name", tablespace),
+					testCheckDatabaseValue(t, tablespace, tablespaceQuery, "tablespace_db"),
+				),
+			},
+			{
+				Config: dbConfig("DEFAULT"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_database.tablespace_db", "tablespace_name", "pg_default"),
+					testCheckDatabaseValue(t, "pg_default", tablespaceQuery, "tablespace_db"),
+				),
+			},
+			// A move made outside of Terraform is reverted.
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, fmt.Sprintf("ALTER DATABASE tablespace_db SET TABLESPACE %s", tablespace))
+				},
+				Config:             dbConfig("DEFAULT"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: dbConfig(tablespace),
+				Check:  testCheckDatabaseValue(t, tablespace, tablespaceQuery, "tablespace_db"),
+			},
+			{
+				Config: dbConfig("DEFAULT"),
+				Check:  testCheckDatabaseValue(t, "pg_default", tablespaceQuery, "tablespace_db"),
+			},
+		},
+	})
+}
+
+// strategy is only used at the creation: it is not read back, its changes are ignored.
+func TestAccPostgresqlDatabase_Strategy(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbConfig := func(strategy string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "strategy_db" {
+  name     = "strategy_db"
+  strategy = %q
+}
+`, strategy)
+	}
+	const oidQuery = "SELECT oid::text FROM pg_database WHERE datname = $1"
+	var oid string
+
+	steps := []resource.TestStep{
+		{
+			Config: dbConfig("wal_log"),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.strategy_db", "strategy", "wal_log"),
+				testCheckDatabaseValue(t, "strategy_db", "SELECT datname FROM pg_database WHERE datname = $1", "strategy_db"),
+				func(*terraform.State) error {
+					oid = testQueryDatabase(t, oidQuery, "strategy_db")
+					return nil
+				},
+			),
+		},
+		{
+			ResourceName:            "postgresql_database.strategy_db",
+			ImportState:             true,
+			ImportStateVerify:       true,
+			ImportStateVerifyIgnore: []string{"template", "alter_object_ownership", "strategy"},
+		},
+		// No diff, the database is not replaced.
+		{
+			Config: dbConfig("file_copy"),
+			Check: func(*terraform.State) error {
+				if got := testQueryDatabase(t, oidQuery, "strategy_db"); got != oid {
+					return fmt.Errorf("the database was replaced: its OID changed from %s to %s", oid, got)
+				}
+				return nil
+			},
+		},
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps:        testDatabaseOptionSteps(t, 150000, "STRATEGY", dbConfig("wal_log"), steps),
+	})
+}
+
+// oid is set at the creation, the database is replaced when it changes.
+func TestAccPostgresqlDatabase_OID(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbConfig := func(oid string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "oid_db" {
+  name = "oid_db"
+  %s
+}
+`, oid)
+	}
+	const oidQuery = "SELECT oid::text FROM pg_database WHERE datname = $1"
+
+	steps := []resource.TestStep{
+		{
+			Config: dbConfig("oid = 3456789"),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.oid_db", "oid", "3456789"),
+				testCheckDatabaseValue(t, "3456789", oidQuery, "oid_db"),
+			),
+		},
+		{
+			ResourceName:            "postgresql_database.oid_db",
+			ImportState:             true,
+			ImportStateVerify:       true,
+			ImportStateVerifyIgnore: []string{"template", "alter_object_ownership"},
+		},
+		{
+			Config: dbConfig("oid = 3456790"),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.oid_db", "oid", "3456790"),
+				testCheckDatabaseValue(t, "3456790", oidQuery, "oid_db"),
+			),
+		},
+		// Without oid, the database is left as it is.
+		{
+			Config: dbConfig(""),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.oid_db", "oid", "3456790"),
+				testCheckDatabaseValue(t, "3456790", oidQuery, "oid_db"),
+			),
+		},
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps:        testDatabaseOptionSteps(t, 150000, "OID", dbConfig("oid = 3456789"), steps),
+	})
+}
+
+// locale_provider, icu_locale: the ICU locale is stored in daticulocale up to PostgreSQL 16, in datlocale after.
+func TestAccPostgresqlDatabase_LocaleProvider(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbConfig := func(options string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "icu_db" {
+  name = "icu_db"
+  %s
+}
+`, options)
+	}
+	icuLocaleQuery := fmt.Sprintf("SELECT COALESCE(%s, '') FROM pg_database WHERE datname = $1", testICULocaleColumn(t))
+	const providerQuery = "SELECT datlocprovider::text FROM pg_database WHERE datname = $1"
+
+	steps := []resource.TestStep{
+		{
+			Config:      dbConfig(`icu_locale = "en-US"`),
+			ExpectError: regexp.MustCompile(`cannot be specified unless locale provider is ICU`),
+		},
+		{
+			Config: dbConfig(`locale_provider = "icu"
+  icu_locale      = "en-US"`),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.icu_db", "locale_provider", "icu"),
+				resource.TestCheckResourceAttr("postgresql_database.icu_db", "icu_locale", "en-US"),
+				testCheckDatabaseValue(t, "i", providerQuery, "icu_db"),
+				testCheckDatabaseValue(t, "en-US", icuLocaleQuery, "icu_db"),
+			),
+		},
+		{
+			ResourceName:            "postgresql_database.icu_db",
+			ImportState:             true,
+			ImportStateVerify:       true,
+			ImportStateVerifyIgnore: []string{"template", "alter_object_ownership"},
+		},
+		// The provider and the ICU locale are set at the creation: the database is replaced.
+		{
+			Config: dbConfig(`locale_provider = "icu"
+  icu_locale      = "fr-FR"`),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.icu_db", "icu_locale", "fr-FR"),
+				testCheckDatabaseValue(t, "fr-FR", icuLocaleQuery, "icu_db"),
+			),
+		},
+		// Without these options, the database is left as it is.
+		{
+			Config: dbConfig(""),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.icu_db", "icu_locale", "fr-FR"),
+				testCheckDatabaseValue(t, "fr-FR", icuLocaleQuery, "icu_db"),
+				testCheckDatabaseValue(t, "i", providerQuery, "icu_db"),
+			),
+		},
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps:        testDatabaseOptionSteps(t, 150000, "LOCALE_PROVIDER", dbConfig(`locale_provider = "icu"`), steps),
+	})
+}
+
+// icu_rules is stored in daticurules (PostgreSQL 16 and above).
+func TestAccPostgresqlDatabase_ICURules(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbConfig := func(options string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "icu_rules_db" {
+  name = "icu_rules_db"
+  %s
+}
+`, options)
+	}
+	const rulesQuery = "SELECT COALESCE(daticurules, '') FROM pg_database WHERE datname = $1"
+	const rules = "&a<b"
+
+	steps := []resource.TestStep{
+		{
+			Config: dbConfig(fmt.Sprintf(`locale_provider = "icu"
+  icu_locale = "en-US"
+  icu_rules  = %q`, rules)),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.icu_rules_db", "icu_rules", rules),
+				testCheckDatabaseValue(t, rules, rulesQuery, "icu_rules_db"),
+			),
+		},
+		{
+			ResourceName:            "postgresql_database.icu_rules_db",
+			ImportState:             true,
+			ImportStateVerify:       true,
+			ImportStateVerifyIgnore: []string{"template", "alter_object_ownership"},
+		},
+		{
+			Config: dbConfig(`locale_provider = "icu"
+  icu_locale = "en-US"`),
+			Check: testCheckDatabaseValue(t, rules, rulesQuery, "icu_rules_db"),
+		},
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps:        testDatabaseOptionSteps(t, 160000, "ICU_RULES", dbConfig(fmt.Sprintf("icu_rules = %q", rules)), steps),
+	})
+}
+
+// collation_version is stored in datcollversion (PostgreSQL 15 and above).
+func TestAccPostgresqlDatabase_CollationVersion(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbConfig := func(options string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "collation_version_db" {
+  name = "collation_version_db"
+  %s
+}
+`, options)
+	}
+	const versionQuery = "SELECT datcollversion FROM pg_database WHERE datname = $1"
+
+	steps := []resource.TestStep{
+		{
+			Config: dbConfig(`locale             = "C"
+  collation_version = "1.0"`),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.collation_version_db", "collation_version", "1.0"),
+				testCheckDatabaseValue(t, "1.0", versionQuery, "collation_version_db"),
+			),
+		},
+		{
+			ResourceName:            "postgresql_database.collation_version_db",
+			ImportState:             true,
+			ImportStateVerify:       true,
+			ImportStateVerifyIgnore: []string{"template", "alter_object_ownership"},
+		},
+		{
+			Config: dbConfig(`locale = "C"`),
+			Check:  testCheckDatabaseValue(t, "1.0", versionQuery, "collation_version_db"),
+		},
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps:        testDatabaseOptionSteps(t, 150000, "COLLATION_VERSION", dbConfig(`collation_version = "1.0"`), steps),
+	})
+}
+
+// builtin_locale is stored in datlocale (PostgreSQL 17 and above).
+func TestAccPostgresqlDatabase_BuiltinLocale(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbConfig := func(options string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "builtin_db" {
+  name = "builtin_db"
+  %s
+}
+`, options)
+	}
+	const providerQuery = "SELECT datlocprovider::text FROM pg_database WHERE datname = $1"
+	const localeQuery = "SELECT COALESCE(datlocale, '') FROM pg_database WHERE datname = $1"
+
+	steps := []resource.TestStep{
+		{
+			Config: dbConfig(`locale_provider = "builtin"
+  builtin_locale  = "C.UTF-8"`),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.builtin_db", "builtin_locale", "C.UTF-8"),
+				testCheckDatabaseValue(t, "b", providerQuery, "builtin_db"),
+				testCheckDatabaseValue(t, "C.UTF-8", localeQuery, "builtin_db"),
+			),
+		},
+		{
+			ResourceName:            "postgresql_database.builtin_db",
+			ImportState:             true,
+			ImportStateVerify:       true,
+			ImportStateVerifyIgnore: []string{"template", "alter_object_ownership"},
+		},
+		{
+			Config: dbConfig(""),
+			Check:  testCheckDatabaseValue(t, "C.UTF-8", localeQuery, "builtin_db"),
+		},
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps:        testDatabaseOptionSteps(t, 170000, "BUILTIN_LOCALE", dbConfig(`builtin_locale = "C.UTF-8"`), steps),
 	})
 }

@@ -57,6 +57,12 @@ const (
 	featureLogicalSlotTwoPhase
 	featureLogicalSlotFailover
 	featureDefaultPrivilegesLargeObjects
+	featureDBLocale
+	featureDBStrategy
+	featureDBOID
+	featureDBLocaleProvider
+	featureDBICURules
+	featureDBBuiltinLocale
 )
 
 var (
@@ -150,6 +156,18 @@ var (
 		featureLogicalSlotFailover: semver.MustParseRange(">=17.0.0"),
 		// ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS (PG 18+)
 		featureDefaultPrivilegesLargeObjects: semver.MustParseRange(">=18.0.0"),
+		// CREATE DATABASE has LOCALE support (PG 13+)
+		featureDBLocale: semver.MustParseRange(">=13.0.0"),
+		// CREATE DATABASE has STRATEGY and OID support (PG 15+)
+		featureDBStrategy: semver.MustParseRange(">=15.0.0"),
+		featureDBOID:      semver.MustParseRange(">=15.0.0"),
+		// CREATE DATABASE has LOCALE_PROVIDER, ICU_LOCALE and COLLATION_VERSION support (PG 15+)
+		featureDBLocaleProvider: semver.MustParseRange(">=15.0.0"),
+		// CREATE DATABASE has ICU_RULES support (PG 16+)
+		featureDBICURules: semver.MustParseRange(">=16.0.0"),
+		// CREATE DATABASE has BUILTIN_LOCALE support (PG 17+), where pg_database.datlocale
+		// replaces pg_database.daticulocale
+		featureDBBuiltinLocale: semver.MustParseRange(">=17.0.0"),
 	}
 )
 
