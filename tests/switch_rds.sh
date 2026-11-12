@@ -51,7 +51,7 @@ EOS
 
 export TF_ACC=true
 export PGHOST=localhost
-export PGPORT=25432
+export PGPORT=${TEST_PGPORT:-25432}
 export PGUSER=rds
 export PGPASSWORD=rds
 export PGSSLMODE=disable
