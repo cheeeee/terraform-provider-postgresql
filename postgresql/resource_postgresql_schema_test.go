@@ -634,8 +634,6 @@ func testAccSchemaPolicyDrift(t *testing.T, c schemaDriftCase) {
 	defer teardown()
 
 	dbName, roleName := getTestDBNames(dbSuffix)
-	otherRole := roleName + "_other"
-	defer createTestRole(t, otherRole)()
 
 	grantee, role := "PUBLIC", ""
 	if c.role != "" {
@@ -651,19 +649,18 @@ func testAccSchemaPolicyDrift(t *testing.T, c schemaDriftCase) {
 		otherPriv = "USAGE"
 	}
 
-	// The declared role is not the owner: the owner has implicit privileges.
+	// The owner is the connected user, which is not the declared role.
 	config := fmt.Sprintf(`
 resource "postgresql_schema" "test_drift" {
   name     = "tf_drift"
   database = "%s"
-  owner    = "%s"
 
   policy {
     %s = true
     role = "%s"
   }
 }
-`, dbName, otherRole, c.flag, role)
+`, dbName, c.flag, role)
 
 	declared := func(s *terraform.State) error {
 		return testAccCheckSchemaPrivilege(dbName, "tf_drift", role, c.priv, c.expected)(s)
@@ -718,11 +715,13 @@ func TestAccPostgresqlSchema_PolicyUndeclaredRole(t *testing.T) {
 	defer teardown()
 
 	dbName, roleName := getTestDBNames(dbSuffix)
+	testConfig := getTestConfig(t)
+	// The owner is the connected user: it can grant on the schema.
+	ownerName := testConfig.Username
 	declaredRole := roleName + "_declared"
 	defer createTestRole(t, declaredRole)()
 	undeclaredRole := roleName + "_undeclared"
 	defer createTestRole(t, undeclaredRole)()
-	testConfig := getTestConfig(t)
 	dsn := testConfig.connStr(dbName)
 
 	// The owner is declared with a partial policy: its other privileges are implicit.
@@ -730,19 +729,18 @@ func TestAccPostgresqlSchema_PolicyUndeclaredRole(t *testing.T) {
 resource "postgresql_schema" "test_undeclared" {
   name     = "tf_undeclared"
   database = "%[1]s"
-  owner    = "%[2]s"
-
-  policy {
-    usage = true
-    role  = "%[3]s"
-  }
 
   policy {
     usage = true
     role  = "%[2]s"
   }
+
+  policy {
+    usage = true
+    role  = "%[3]s"
+  }
 }
-`, dbName, roleName, declaredRole)
+`, dbName, declaredRole, ownerName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:     func() { testAccPreCheck(t) },
