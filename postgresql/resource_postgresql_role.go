@@ -1126,6 +1126,17 @@ func changeRoles(txn *sql.Tx, d *schema.ResourceData) error {
 	added := newRoles.(*schema.Set).Difference(oldRoles.(*schema.Set)).List()
 
 	for _, revokedRole := range removed {
+		// The role can have been dropped (with its memberships) in the same apply
+		var member bool
+		err := txn.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members
+			WHERE pg_get_userbyid(roleid) = $1 AND pg_get_userbyid(member) = $2)`, revokedRole, role).Scan(&member)
+		if err != nil {
+			return fmt.Errorf("could not read the membership of %s in %s: %w", role, revokedRole, err)
+		}
+		if !member {
+			continue
+		}
+
 		query := fmt.Sprintf("REVOKE %s FROM %s", pq.QuoteIdentifier(revokedRole.(string)), pq.QuoteIdentifier(role))
 		if _, err := txn.Exec(query); err != nil {
 			return fmt.Errorf("could not revoke role %s from %s: %w", revokedRole, role, err)

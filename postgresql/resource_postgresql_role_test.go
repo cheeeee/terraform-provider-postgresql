@@ -1804,3 +1804,603 @@ resource "postgresql_role" "unencrypted_role" {
 		},
 	})
 }
+
+// Test the roles of a role: added and removed, in the catalog, and the memberships
+// which are managed by postgresql_grant_role are left as they are.
+func TestAccPostgresqlRole_Roles(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := func(roles, login string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "roles_g1" {
+  name = "roles_g1"
+}
+
+resource "postgresql_role" "roles_g2" {
+  name = "roles_g2"
+}
+
+resource "postgresql_role" "roles_g3" {
+  name = "roles_g3"
+}
+
+resource "postgresql_role" "roles_member" {
+  name  = "roles_member"
+  login = %s
+  roles = %s
+}
+`, login, roles)
+	}
+	ref := func(names ...string) string {
+		refs := make([]string, len(names))
+		for i, name := range names {
+			refs[i] = "postgresql_role.roles_" + name + ".name"
+		}
+		return "[" + strings.Join(refs, ", ") + "]"
+	}
+	member := func(roles ...string) resource.TestCheckFunc {
+		granted := make([]string, len(roles))
+		for i, role := range roles {
+			granted[i] = "roles_" + role
+		}
+		return resource.ComposeTestCheckFunc(
+			resource.TestCheckResourceAttr("postgresql_role.roles_member", "roles.#", strconv.Itoa(len(roles))),
+			testAccCheckPostgresqlRoleExists("roles_member", granted, nil),
+		)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{Config: roleConfig(ref("g1", "g2"), "false"), Check: member("g1", "g2")},
+			// one is removed and another one is added
+			{Config: roleConfig(ref("g2", "g3"), "false"), Check: member("g2", "g3")},
+			{Config: roleConfig(ref("g1", "g2", "g3"), "false"), Check: member("g1", "g2", "g3")},
+			{Config: roleConfig(ref("g3"), "false"), Check: member("g3")},
+			{Config: roleConfig("[]", "false"), Check: member()},
+			{Config: roleConfig(ref("g1"), "false"), Check: member("g1")},
+			// changed outside of Terraform, in both directions
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "GRANT roles_g2 TO roles_member")
+					dbExecute(t, dsn, "REVOKE roles_g1 FROM roles_member")
+				},
+				Config:             roleConfig(ref("g1"), "false"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{Config: roleConfig(ref("g1"), "false"), Check: member("g1")},
+			{
+				ResourceName:      "postgresql_role.roles_member",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// The memberships managed by postgresql_grant_role are not changed when the role is updated.
+func TestAccPostgresqlRole_RolesAndGrantRole(t *testing.T) {
+	roleConfig := func(login bool) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "rag_g1" {
+  name = "rag_g1"
+}
+
+resource "postgresql_role" "rag_g2" {
+  name = "rag_g2"
+}
+
+resource "postgresql_role" "rag_member" {
+  name  = "rag_member"
+  login = %t
+  roles = [postgresql_role.rag_g1.name]
+  lifecycle {
+    ignore_changes = [roles]
+  }
+}
+
+resource "postgresql_grant_role" "rag" {
+  role              = postgresql_role.rag_member.name
+  grant_role        = postgresql_role.rag_g2.name
+  with_admin_option = true
+}
+`, login)
+	}
+	check := resource.ComposeTestCheckFunc(
+		testAccCheckMembership("rag_member", "rag_g1", membershipOptions{inherit: true, set: true}),
+		testAccCheckMembership("rag_member", "rag_g2", membershipOptions{admin: true, inherit: true, set: true}),
+	)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{Config: roleConfig(false), Check: check},
+			{Config: roleConfig(true), Check: check},
+			{Config: roleConfig(false), Check: check},
+		},
+	})
+}
+
+// The memberships of CREATE ROLE ... IN ROLE / ROLE / ADMIN are the ones of the roles
+// attribute and of postgresql_grant_role.
+func TestAccPostgresqlRole_CreateRoleMembershipClauses(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := `
+resource "postgresql_role" "cm_in" {
+  name = "cm_in"
+}
+
+# CREATE ROLE cm_ctl_in IN ROLE cm_in_group
+resource "postgresql_role" "cm_in_group" {
+  name = "cm_in_group"
+}
+
+resource "postgresql_role" "cm_member_in" {
+  name  = "cm_member_in"
+  roles = [postgresql_role.cm_in_group.name]
+}
+
+# CREATE ROLE cm_target ROLE cm_member ADMIN cm_admin
+resource "postgresql_role" "cm_target" {
+  name = "cm_target"
+}
+
+resource "postgresql_role" "cm_member" {
+  name = "cm_member"
+  lifecycle {
+    ignore_changes = [roles]
+  }
+}
+
+resource "postgresql_role" "cm_admin" {
+  name = "cm_admin"
+  lifecycle {
+    ignore_changes = [roles]
+  }
+}
+
+resource "postgresql_grant_role" "cm_member" {
+  role       = postgresql_role.cm_member.name
+  grant_role = postgresql_role.cm_target.name
+}
+
+resource "postgresql_grant_role" "cm_admin" {
+  role              = postgresql_role.cm_admin.name
+  grant_role        = postgresql_role.cm_target.name
+  with_admin_option = true
+}
+`
+	sameMembership := func(member, role, controlMember, controlRole string) resource.TestCheckFunc {
+		return func(s *terraform.State) error {
+			client := testAccProvider.Meta().(*Client)
+			actual, err := readMembership(client, member, role)
+			if err != nil {
+				return err
+			}
+			expected, err := readMembership(client, controlMember, controlRole)
+			if err != nil {
+				return err
+			}
+			if actual == nil || expected == nil {
+				return fmt.Errorf("missing membership: %s in %s %v, %s in %s %v", member, role, actual, controlMember, controlRole, expected)
+			}
+			actual.grantor, expected.grantor = "", ""
+			if *actual != *expected {
+				return fmt.Errorf("%s in %s: %+v, %s in %s: %+v", member, role, *actual, controlMember, controlRole, *expected)
+			}
+			return nil
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		CheckDestroy: func(s *terraform.State) error {
+			for _, role := range []string{"cm_ctl_in", "cm_ctl_target", "cm_ctl_member", "cm_ctl_admin", "cm_ctl_group"} {
+				dbExecute(t, dsn, "DROP ROLE IF EXISTS "+role)
+			}
+			return testAccCheckPostgresqlRoleDestroy(s)
+		},
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					for _, role := range []string{"cm_ctl_in", "cm_ctl_target", "cm_ctl_member", "cm_ctl_admin", "cm_ctl_group"} {
+						dbExecute(t, dsn, "DROP ROLE IF EXISTS "+role)
+					}
+					dbExecute(t, dsn, "CREATE ROLE cm_ctl_group")
+					dbExecute(t, dsn, "CREATE ROLE cm_ctl_in IN ROLE cm_ctl_group")
+					dbExecute(t, dsn, "CREATE ROLE cm_ctl_member")
+					dbExecute(t, dsn, "CREATE ROLE cm_ctl_admin")
+					dbExecute(t, dsn, "CREATE ROLE cm_ctl_target ROLE cm_ctl_member ADMIN cm_ctl_admin")
+				},
+				Config: roleConfig,
+				Check: resource.ComposeTestCheckFunc(
+					sameMembership("cm_member_in", "cm_in_group", "cm_ctl_in", "cm_ctl_group"),
+					sameMembership("cm_member", "cm_target", "cm_ctl_member", "cm_ctl_target"),
+					sameMembership("cm_admin", "cm_target", "cm_ctl_admin", "cm_ctl_target"),
+				),
+			},
+		},
+	})
+}
+
+// Test the settings which have their own attribute, at the creation and at the update, in both directions.
+func TestAccPostgresqlRole_Settings(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := func(settings string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "set_g1" {
+  name = "set_g1"
+}
+
+resource "postgresql_role" "set_g2" {
+  name = "set_g2"
+}
+
+resource "postgresql_role" "set_role" {
+  name  = "set_role"
+  login = true
+  roles = [postgresql_role.set_g1.name, postgresql_role.set_g2.name]
+  %s
+}
+`, settings)
+	}
+	query := func(role string, parameters ...string) resource.TestCheckFunc {
+		return testAccCheckConfigParameters(testRoleConfigQuery, role, parameters)
+	}
+
+	create := `search_path = ["bar", "foo-with-hyphen"]
+  statement_timeout = 30000
+  idle_in_transaction_session_timeout = 60000
+  assume_role = postgresql_role.set_g1.name`
+	update := `search_path = ["other", "Mixed Case", "public"]
+  statement_timeout = 1
+  idle_in_transaction_session_timeout = 2
+  assume_role = postgresql_role.set_g2.name`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig(create),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "search_path.#", "2"),
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "search_path.1", "foo-with-hyphen"),
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "statement_timeout", "30000"),
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "idle_in_transaction_session_timeout", "60000"),
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "assume_role", "set_g1"),
+					query("set_role", `search_path=bar, "foo-with-hyphen"`, "statement_timeout=30000",
+						"idle_in_transaction_session_timeout=60000", "role=set_g1"),
+				),
+			},
+			{
+				Config: roleConfig(update),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "search_path.#", "3"),
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "statement_timeout", "1"),
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "idle_in_transaction_session_timeout", "2"),
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "assume_role", "set_g2"),
+					query("set_role", `search_path=other, "Mixed Case", public`, "statement_timeout=1",
+						"idle_in_transaction_session_timeout=2", "role=set_g2"),
+				),
+			},
+			// changed outside of Terraform
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER ROLE set_role SET statement_timeout TO 5")
+					dbExecute(t, dsn, "ALTER ROLE set_role RESET role")
+				},
+				Config:             roleConfig(update),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: roleConfig(update),
+				Check: query("set_role", `search_path=other, "Mixed Case", public`, "statement_timeout=1",
+					"idle_in_transaction_session_timeout=2", "role=set_g2"),
+			},
+			// the settings are reset: they are removed from the catalog
+			{
+				Config: roleConfig(``),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "search_path.#", "0"),
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "statement_timeout", "0"),
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "idle_in_transaction_session_timeout", "0"),
+					resource.TestCheckResourceAttr("postgresql_role.set_role", "assume_role", ""),
+					query("set_role"),
+				),
+			},
+			// and set again
+			{
+				Config: roleConfig(create),
+				Check: query("set_role", `search_path=bar, "foo-with-hyphen"`, "statement_timeout=30000",
+					"idle_in_transaction_session_timeout=60000", "role=set_g1"),
+			},
+			{
+				ResourceName:      "postgresql_role.set_role",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// Test the rename of a role: what the role has is kept.
+func TestAccPostgresqlRole_Rename(t *testing.T) {
+	roleConfig := func(name string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "rename_db" {
+  name = "rename_db"
+}
+
+resource "postgresql_role" "rename_g" {
+  name = "rename_g"
+}
+
+resource "postgresql_role" "rename_role" {
+  name             = "%s"
+  login            = true
+  password         = "rename_pwd"
+  connection_limit = 4
+  roles            = [postgresql_role.rename_g.name]
+  parameters       = { work_mem = "16MB" }
+  database_parameters {
+    database   = postgresql_database.rename_db.name
+    parameters = { work_mem = "32MB" }
+  }
+}
+`, name)
+	}
+	check := func(name string) resource.TestCheckFunc {
+		return resource.ComposeTestCheckFunc(
+			resource.TestCheckResourceAttr("postgresql_role.rename_role", "name", name),
+			resource.TestCheckResourceAttr("postgresql_role.rename_role", "id", name),
+			testAccCheckPostgresqlRoleExists(name, []string{"rename_g"}, nil),
+			testAccCheckRoleColumn(name, "rolconnlimit", 4),
+			testAccCheckRoleCanLogin(t, name, "rename_pwd"),
+			testAccCheckConfigParameters(testRoleConfigQuery, name, []string{"work_mem=16MB"}),
+			testAccCheckRoleDatabaseConfig(name, "rename_db", []string{"work_mem=32MB"}),
+			testAccCheckSessionParameter(t, name, "rename_pwd", "rename_db", "work_mem", "32MB"),
+		)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		CheckDestroy: func(s *terraform.State) error {
+			if err := testAccCheckPostgresqlRoleDestroy(s); err != nil {
+				return err
+			}
+			return testAccCheckPostgresqlDatabaseDestroy(s)
+		},
+		Steps: []resource.TestStep{
+			{Config: roleConfig("rename_role"), Check: check("rename_role")},
+			{Config: roleConfig("rename_role2"), Check: check("rename_role2")},
+			{Config: roleConfig("rename_role"), Check: check("rename_role")},
+		},
+	})
+}
+
+// A role is changed or dropped outside of Terraform.
+func TestAccPostgresqlRole_ChangedOutside(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := `
+resource "postgresql_role" "outside_role" {
+  name  = "outside_role"
+  login = true
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig,
+				Check:  testAccCheckRoleColumn("outside_role", "rolcanlogin", true),
+			},
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "ALTER ROLE outside_role NOLOGIN")
+				},
+				Config:             roleConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: roleConfig,
+				Check:  testAccCheckRoleColumn("outside_role", "rolcanlogin", true),
+			},
+			// dropped: it is created again
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "DROP ROLE outside_role")
+				},
+				Config:             roleConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: roleConfig,
+				Check:  testAccCheckRoleColumn("outside_role", "rolcanlogin", true),
+			},
+			// dropped, then destroyed: nothing to do
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "DROP ROLE outside_role")
+				},
+				Config:  roleConfig,
+				Destroy: true,
+			},
+		},
+	})
+}
+
+// A role which owns objects is dropped after its objects are reassigned to the connected user.
+func TestAccPostgresqlRole_ReassignOwned(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := `
+resource "postgresql_role" "owner_role" {
+  name = "owner_role"
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		CheckDestroy: func(s *terraform.State) error {
+			if err := testAccCheckPostgresqlRoleDestroy(s); err != nil {
+				return err
+			}
+			var owner string
+			db, err := testAccProvider.Meta().(*Client).Connect()
+			if err != nil {
+				return err
+			}
+			if err := db.QueryRow("SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'owner_role_table'").Scan(&owner); err != nil {
+				return fmt.Errorf("the table of the role has been dropped: %w", err)
+			}
+			if owner != config.Username {
+				return fmt.Errorf("the table is owned by %s instead of %s", owner, config.Username)
+			}
+			dbExecute(t, dsn, "DROP TABLE owner_role_table")
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig,
+				Check: func(s *terraform.State) error {
+					// the connected user has to be able to give the table to the role (and to take it back)
+					dbExecute(t, dsn, "GRANT owner_role TO CURRENT_USER")
+					dbExecute(t, dsn, "GRANT CREATE ON SCHEMA public TO owner_role")
+					dbExecute(t, dsn, "CREATE TABLE owner_role_table (id int)")
+					dbExecute(t, dsn, "ALTER TABLE owner_role_table OWNER TO owner_role")
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// skip_reassign_owned: the objects of the role are not reassigned, so the role cannot be dropped.
+func TestAccPostgresqlRole_SkipReassignOwned(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := func(skip bool) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "skip_reassign_role" {
+  name                = "skip_reassign_role"
+  skip_reassign_owned = %t
+}
+`, skip)
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		CheckDestroy: func(s *terraform.State) error {
+			dbExecute(t, dsn, "DROP TABLE IF EXISTS skip_reassign_table")
+			return testAccCheckPostgresqlRoleDestroy(s)
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig(true),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_role.skip_reassign_role", "skip_reassign_owned", "true"),
+					func(s *terraform.State) error {
+						dbExecute(t, dsn, "GRANT skip_reassign_role TO CURRENT_USER")
+						dbExecute(t, dsn, "GRANT CREATE ON SCHEMA public TO skip_reassign_role")
+						dbExecute(t, dsn, "CREATE TABLE skip_reassign_table (id int)")
+						dbExecute(t, dsn, "ALTER TABLE skip_reassign_table OWNER TO skip_reassign_role")
+						return nil
+					},
+				),
+			},
+			// the role cannot be dropped because it owns the table
+			{
+				Config:      roleConfig(true),
+				Destroy:     true,
+				ExpectError: regexp.MustCompile(`could not delete role skip_reassign_role`),
+			},
+			// the objects are reassigned if the option is removed
+			{
+				Config: roleConfig(false),
+				Check:  resource.TestCheckResourceAttr("postgresql_role.skip_reassign_role", "skip_reassign_owned", "false"),
+			},
+		},
+	})
+}
+
+// skip_drop_role: the role is not dropped.
+func TestAccPostgresqlRole_SkipDropRole(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		CheckDestroy: func(s *terraform.State) error {
+			exists, err := checkRoleExists(testAccProvider.Meta().(*Client), "skip_drop_role")
+			if err != nil {
+				return err
+			}
+			if !exists {
+				return fmt.Errorf("the role has been dropped")
+			}
+			dbExecute(t, dsn, "DROP ROLE skip_drop_role")
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_role" "skip_drop_role" {
+  name           = "skip_drop_role"
+  skip_drop_role = true
+}`,
+				Check: resource.TestCheckResourceAttr("postgresql_role.skip_drop_role", "skip_drop_role", "true"),
+			},
+		},
+	})
+}
