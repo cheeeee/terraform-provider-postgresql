@@ -1,17 +1,20 @@
 Terraform Provider for PostgreSQL
 =================================
 
-This provider allows to manage with Terraform [Postgresql](https://www.postgresql.org/) objects like databases, extensions, roles, etc.
+This provider manages [PostgreSQL](https://www.postgresql.org/) objects with Terraform: roles, databases, schemas, extensions, grants and default privileges, functions, publications, subscriptions and replication slots, foreign servers and user mappings, and security labels. It also manages per-role and per-database configuration parameters (`ALTER ROLE ... SET` / `ALTER DATABASE ... SET`), for example to turn pgaudit on or off on AWS RDS, and reports any change made outside of Terraform in the plan.
 
 It's published on the [Terraform registry](https://registry.terraform.io/providers/cyrilgdn/postgresql/latest/docs).
 It replaces https://github.com/hashicorp/terraform-provider-postgresql since Hashicorp stopped hosting community providers in favor of the Terraform registry.
 
 - Documentation: https://registry.terraform.io/providers/cyrilgdn/postgresql/latest/docs
 
+It works the same way with [Terraform](https://www.terraform.io/) and with [OpenTofu](https://opentofu.org/):
+the acceptance and end-to-end tests are run with both of them.
+
 Requirements
 ------------
 
--	[Terraform](https://www.terraform.io/downloads.html) 0.12.x
+-	[Terraform](https://www.terraform.io/downloads.html) 0.12 or later, or [OpenTofu](https://opentofu.org/docs/intro/install/)
 -	[Go](https://golang.org/doc/install) 1.16 (to build the provider plugin)
 
 Building The Provider

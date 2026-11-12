@@ -12,6 +12,8 @@ The PostgreSQL provider gives the ability to deploy and configure resources in a
 
 Use the navigation to the left to read about the available resources.
 
+The provider can be used with Terraform and with OpenTofu, it is tested with both of them.
+
 ## Usage
 
 ```hcl
