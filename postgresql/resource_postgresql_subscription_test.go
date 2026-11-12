@@ -414,11 +414,19 @@ func (s *subTest) configFull(name, slotResource, conninfoSuffix string, publicat
 		name     = "test_slot"
 		database = "%[1]s"
 		plugin   = "pgoutput"
+		lifecycle {
+			// a subscription with two_phase = true turns the slot to two-phase decoding
+			ignore_changes = [two_phase]
+		}
 	}
 	resource "postgresql_replication_slot" "test_slot2" {
 		name     = "test_slot2"
 		database = "%[1]s"
 		plugin   = "pgoutput"
+		lifecycle {
+			// a subscription with two_phase = true turns the slot to two-phase decoding
+			ignore_changes = [two_phase]
+		}
 	}
 	resource "postgresql_subscription" "test_sub" {
 		name         = "%[2]s"
