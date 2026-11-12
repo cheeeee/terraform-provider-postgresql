@@ -1,11 +1,16 @@
 package postgresql
 
 import (
+	"database/sql"
 	"fmt"
+	"regexp"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlDefaultPrivileges(t *testing.T) {
@@ -394,6 +399,546 @@ resource "postgresql_default_privileges" "test" {
 						return nil
 					},
 				),
+			},
+		},
+	})
+}
+
+// defaultPrivilegesObjectClass describes one object class for the table-driven test.
+type defaultPrivilegesObjectClass struct {
+	objectType string
+	// sqlClass is the class keyword of ALTER DEFAULT PRIVILEGES
+	sqlClass string
+	// create and drop run as the owner (the connected user) and create the object in test_schema
+	create, drop string
+	// object is the SQL literal which names the object in hasPrivilege
+	object string
+	// hasPrivilege is the has_*_privilege function of the object class
+	hasPrivilege string
+	// privileges are the individual privileges of the class (ALL excluded)
+	privileges []string
+	// schemaScoped is true when the class accepts the schema attribute
+	schemaScoped bool
+}
+
+var testDefaultPrivilegesClasses = []defaultPrivilegesObjectClass{
+	{
+		objectType: "table", sqlClass: "TABLES",
+		create: "CREATE TABLE test_schema.dp_table (val text)", drop: "DROP TABLE test_schema.dp_table",
+		object: "'test_schema.dp_table'", hasPrivilege: "has_table_privilege",
+		privileges:   []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"},
+		schemaScoped: true,
+	},
+	{
+		objectType: "sequence", sqlClass: "SEQUENCES",
+		create: "CREATE SEQUENCE test_schema.dp_sequence", drop: "DROP SEQUENCE test_schema.dp_sequence",
+		object: "'test_schema.dp_sequence'", hasPrivilege: "has_sequence_privilege",
+		privileges:   []string{"USAGE", "SELECT", "UPDATE"},
+		schemaScoped: true,
+	},
+	{
+		objectType: "function", sqlClass: "FUNCTIONS",
+		create: "CREATE FUNCTION test_schema.dp_function() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
+		drop:   "DROP FUNCTION test_schema.dp_function()",
+		object: "'test_schema.dp_function()'", hasPrivilege: "has_function_privilege",
+		privileges:   []string{"EXECUTE"},
+		schemaScoped: true,
+	},
+	{
+		objectType: "routine", sqlClass: "ROUTINES",
+		create: "CREATE FUNCTION test_schema.dp_routine() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
+		drop:   "DROP FUNCTION test_schema.dp_routine()",
+		object: "'test_schema.dp_routine()'", hasPrivilege: "has_function_privilege",
+		privileges:   []string{"EXECUTE"},
+		schemaScoped: true,
+	},
+	{
+		objectType: "type", sqlClass: "TYPES",
+		create: "CREATE TYPE test_schema.dp_type AS ENUM ('a')", drop: "DROP TYPE test_schema.dp_type",
+		object: "'test_schema.dp_type'", hasPrivilege: "has_type_privilege",
+		privileges:   []string{"USAGE"},
+		schemaScoped: true,
+	},
+	{
+		objectType: "schema", sqlClass: "SCHEMAS",
+		create: "CREATE SCHEMA dp_schema", drop: "DROP SCHEMA dp_schema",
+		object: "'dp_schema'", hasPrivilege: "has_schema_privilege",
+		privileges: []string{"CREATE", "USAGE"},
+	},
+	{
+		objectType: "large_object", sqlClass: "LARGE OBJECTS",
+		create: "SELECT lo_create(4242)", drop: "SELECT lo_unlink(4242)",
+		object: "4242", hasPrivilege: "has_largeobject_privilege",
+		privileges: []string{"SELECT", "UPDATE"},
+	},
+}
+
+// testServerVersionNum returns the server_version_num of the test database.
+func testServerVersionNum(t *testing.T) int {
+	config := getTestConfig(t)
+	db, err := sql.Open("postgres", config.connStr("postgres"))
+	if err != nil {
+		t.Fatalf("could not open connection pool: %v", err)
+	}
+	defer closeDB(t, db)
+
+	var version int
+	if err := db.QueryRow("SHOW server_version_num").Scan(&version); err != nil {
+		t.Fatalf("could not read server version: %v", err)
+	}
+	return version
+}
+
+// testCheckDefaultPrivilegesACL checks in pg_default_acl the privileges granted to roleName
+// for the owner, the schema (empty for global defaults) and the object class.
+func testCheckDefaultPrivilegesACL(t *testing.T, dbName string, class defaultPrivilegesObjectClass, owner, roleName, schema string, expected []string, grantOption bool) error {
+	config := getTestConfig(t)
+	db, err := sql.Open("postgres", config.connStr(dbName))
+	if err != nil {
+		t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
+	}
+	defer closeDB(t, db)
+
+	// PostgreSQL deletes a default ACL which equals the built-in default: without a row
+	// the effective ACL is the schema row, then the global row, then acldefault.
+	query := `SELECT array_agg(a.privilege_type ORDER BY a.privilege_type), bool_and(a.is_grantable)
+	FROM (SELECT COALESCE(
+		(SELECT defaclacl FROM pg_default_acl WHERE defaclobjtype = $1 AND defaclrole = (SELECT oid FROM pg_roles WHERE rolname = $4)
+			AND defaclnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2)),
+		(SELECT defaclacl FROM pg_default_acl WHERE defaclobjtype = $1 AND defaclrole = (SELECT oid FROM pg_roles WHERE rolname = $4)
+			AND defaclnamespace = 0),
+		acldefault($1::"char", (SELECT oid FROM pg_roles WHERE rolname = $4))
+	) AS acl) AS d CROSS JOIN LATERAL aclexplode(d.acl) AS a
+	WHERE a.grantee = CASE WHEN $3 = 'public' THEN 0 ELSE (SELECT oid FROM pg_roles WHERE rolname = $3) END`
+
+	defacl := map[string]string{"TABLES": "r", "SEQUENCES": "S", "FUNCTIONS": "f", "ROUTINES": "f", "TYPES": "T", "SCHEMAS": "n", "LARGE OBJECTS": "L"}
+
+	var privileges pq.StringArray
+	var grantable sql.NullBool
+	if err := db.QueryRow(query, defacl[class.sqlClass], schema, roleName, owner).Scan(&privileges, &grantable); err != nil {
+		return fmt.Errorf("could not read pg_default_acl: %w", err)
+	}
+
+	want := append([]string{}, expected...)
+	sort.Strings(want)
+	got := append([]string{}, privileges...)
+	sort.Strings(got)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		return fmt.Errorf("pg_default_acl for %s on %s (schema %q): expected privileges %v, got %v", roleName, class.sqlClass, schema, want, got)
+	}
+	if len(want) > 0 && grantable.Bool != grantOption {
+		return fmt.Errorf("pg_default_acl for %s on %s: expected grant option %t, got %t", roleName, class.sqlClass, grantOption, grantable.Bool)
+	}
+	return nil
+}
+
+// testCheckDefaultPrivilegesEffect checks, with the has_*_privilege catalog functions, which
+// privileges roleName has on an object created by the owner after the default privileges were set.
+func testCheckDefaultPrivilegesEffect(t *testing.T, dbName string, class defaultPrivilegesObjectClass, roleName string, privileges, expected []string) error {
+	config := getTestConfig(t)
+	db, err := sql.Open("postgres", config.connStr(dbName))
+	if err != nil {
+		t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
+	}
+	defer closeDB(t, db)
+
+	for _, privilege := range privileges {
+		var has bool
+		query := fmt.Sprintf("SELECT %s('%s', %s, '%s')", class.hasPrivilege, roleName, class.object, privilege)
+		if err := db.QueryRow(query).Scan(&has); err != nil {
+			return fmt.Errorf("could not run %s: %w", query, err)
+		}
+		if want := sliceContainsStr(expected, privilege); has != want {
+			return fmt.Errorf("%s on new %s: expected %t, got %t", privilege, class.objectType, want, has)
+		}
+	}
+	return nil
+}
+
+// testDefaultPrivilegesList returns the HCL privileges list of a step.
+func testDefaultPrivilegesList(privileges []string) string {
+	quoted := []string{}
+	for _, p := range privileges {
+		quoted = append(quoted, fmt.Sprintf("%q", p))
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+// Table-driven test of every object class and of every privilege of the class:
+// each step sets privileges, then checks pg_default_acl and the effect on an object
+// created afterwards by the owner. Steps reduce and extend the privileges, use ALL and remove them.
+func TestAccPostgresqlDefaultPrivilegesObjectClasses(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	config := getTestConfig(t)
+	dbName, roleName := getTestDBNames(dbSuffix)
+	maintain := testServerVersionNum(t) >= 170000
+
+	for _, class := range testDefaultPrivilegesClasses {
+		class := class
+		privileges := []string{}
+		for _, p := range class.privileges {
+			if p != "MAINTAIN" || maintain {
+				privileges = append(privileges, p)
+			}
+		}
+		// Steps: nothing, first privilege, all privileges, ALL, back to the first privilege, nothing
+		steps := [][]string{{}, {privileges[0]}, privileges, {"ALL"}, {privileges[0]}, {}}
+
+		scopes := []string{""}
+		if class.schemaScoped {
+			scopes = append(scopes, "test_schema")
+		}
+
+		for _, role := range []string{roleName, "public"} {
+			for _, schema := range scopes {
+				t.Run(fmt.Sprintf("%s/%s/schema=%s", class.objectType, role, schema), func(t *testing.T) {
+					withGrant := role != "public"
+					schemaLine := ""
+					if schema != "" {
+						schemaLine = fmt.Sprintf(`schema = "%s"`, schema)
+					}
+					tfConfig := fmt.Sprintf(`
+resource "postgresql_default_privileges" "test" {
+	database          = "%s"
+	owner             = "%s"
+	role              = "%s"
+	%s
+	object_type       = "%s"
+	with_grant_option = %t
+	privileges        = %%s
+}
+`, dbName, config.Username, role, schemaLine, class.objectType, withGrant)
+
+					// Use the owner's default privileges from a known state: PUBLIC may have
+					// privileges on new objects by default, which would hide what the role gets.
+					revokePublic := fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s ", config.Username)
+					if schema != "" {
+						revokePublic += "IN SCHEMA " + schema + " "
+					}
+					revokePublic += fmt.Sprintf("REVOKE ALL ON %s FROM PUBLIC", class.sqlClass)
+
+					var resourceSteps []resource.TestStep
+					for i, step := range steps {
+						step := step
+						expected := step
+						if len(step) == 1 && step[0] == "ALL" {
+							expected = privileges
+						}
+						tfStep := resource.TestStep{
+							Config: fmt.Sprintf(tfConfig, testDefaultPrivilegesList(step)),
+							Check: func(*terraform.State) error {
+								dbExecute(t, config.connStr(dbName), class.create)
+								defer dbExecute(t, config.connStr(dbName), class.drop)
+
+								if err := testCheckDefaultPrivilegesACL(t, dbName, class, config.Username, role, schema, expected, withGrant); err != nil {
+									return err
+								}
+								return testCheckDefaultPrivilegesEffect(t, dbName, class, roleName, privileges, expected)
+							},
+						}
+						if i == 0 {
+							tfStep.PreConfig = func() { dbExecute(t, config.connStr(dbName), revokePublic) }
+						}
+						resourceSteps = append(resourceSteps, tfStep)
+					}
+
+					resource.Test(t, resource.TestCase{
+						PreCheck: func() {
+							testAccPreCheck(t)
+							testCheckCompatibleVersion(t, featurePrivileges)
+							if class.objectType == "large_object" {
+								testCheckCompatibleVersion(t, featureDefaultPrivilegesLargeObjects)
+							}
+							if class.objectType == "schema" {
+								testCheckCompatibleVersion(t, featurePrivilegesOnSchemas)
+							}
+						},
+						Providers: testAccProviders,
+						Steps:     resourceSteps,
+					})
+				})
+			}
+		}
+	}
+}
+
+// testDefaultPrivilegesClassByType returns the test description of an object_type.
+func testDefaultPrivilegesClassByType(t *testing.T, objectType string) defaultPrivilegesObjectClass {
+	for _, class := range testDefaultPrivilegesClasses {
+		if class.objectType == objectType {
+			return class
+		}
+	}
+	t.Fatalf("unknown object type %s in test", objectType)
+	return defaultPrivilegesObjectClass{}
+}
+
+// The grant option is removed by a change from true to false, and added by a change from false to true.
+// Each change recreates the resource, which must leave the grant option as configured.
+func TestAccPostgresqlDefaultPrivilegesGrantOption(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	config := getTestConfig(t)
+	dbName, roleName := getTestDBNames(dbSuffix)
+	class := testDefaultPrivilegesClassByType(t, "table")
+
+	tfConfig := func(withGrant bool) string {
+		return fmt.Sprintf(`
+resource "postgresql_default_privileges" "test" {
+	database          = "%s"
+	owner             = "%s"
+	role              = "%s"
+	schema            = "test_schema"
+	object_type       = "table"
+	with_grant_option = %t
+	privileges        = ["SELECT"]
+}
+`, dbName, config.Username, roleName, withGrant)
+	}
+
+	// checkGrantOption checks pg_default_acl and the effect on a new table
+	checkGrantOption := func(withGrant bool) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			if err := testCheckDefaultPrivilegesACL(t, dbName, class, config.Username, roleName, "test_schema", []string{"SELECT"}, withGrant); err != nil {
+				return err
+			}
+			dbExecute(t, config.connStr(dbName), class.create)
+			defer dbExecute(t, config.connStr(dbName), class.drop)
+			return testCheckDefaultPrivilegesEffect(t, dbName, class, roleName, []string{"SELECT", "INSERT"}, []string{"SELECT"})
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					dbExecute(t, config.connStr(dbName), fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA test_schema REVOKE ALL ON TABLES FROM PUBLIC", config.Username))
+				},
+				Config: tfConfig(true),
+				Check:  checkGrantOption(true),
+			},
+			{
+				// true to false: the grant option must be removed
+				Config: tfConfig(false),
+				Check:  checkGrantOption(false),
+			},
+			{
+				// false to true: the grant option must be added
+				Config: tfConfig(true),
+				Check:  checkGrantOption(true),
+			},
+			{
+				// The grant option is removed outside of Terraform: the plan must show a change
+				PreConfig: func() {
+					dbExecute(t, config.connStr(dbName), fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA test_schema REVOKE GRANT OPTION FOR SELECT ON TABLES FROM %s", config.Username, roleName))
+				},
+				Config:             tfConfig(true),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+// A change made outside of Terraform is detected by the plan, and the next apply restores the configuration.
+func TestAccPostgresqlDefaultPrivilegesOutsideChange(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	config := getTestConfig(t)
+	dbName, roleName := getTestDBNames(dbSuffix)
+	class := testDefaultPrivilegesClassByType(t, "table")
+
+	tfConfig := fmt.Sprintf(`
+resource "postgresql_default_privileges" "test" {
+	database    = "%s"
+	owner       = "%s"
+	role        = "%s"
+	schema      = "test_schema"
+	object_type = "table"
+	privileges  = ["SELECT"]
+}
+`, dbName, config.Username, roleName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: tfConfig,
+				Check: func(*terraform.State) error {
+					return testCheckDefaultPrivilegesACL(t, dbName, class, config.Username, roleName, "test_schema", []string{"SELECT"}, false)
+				},
+			},
+			{
+				PreConfig: func() {
+					dbExecute(t, config.connStr(dbName), fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA test_schema GRANT INSERT ON TABLES TO %s", config.Username, roleName))
+				},
+				Config:             tfConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				// The apply restores the privileges of the configuration
+				Config: tfConfig,
+				Check: func(*terraform.State) error {
+					if err := testCheckDefaultPrivilegesACL(t, dbName, class, config.Username, roleName, "test_schema", []string{"SELECT"}, false); err != nil {
+						return err
+					}
+					dbExecute(t, config.connStr(dbName), class.create)
+					defer dbExecute(t, config.connStr(dbName), class.drop)
+					return testCheckDefaultPrivilegesEffect(t, dbName, class, roleName, []string{"SELECT", "INSERT"}, []string{"SELECT"})
+				},
+			},
+		},
+	})
+}
+
+// Removing the resource revokes the default privileges of the role.
+func TestAccPostgresqlDefaultPrivilegesRemoval(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	config := getTestConfig(t)
+	dbName, roleName := getTestDBNames(dbSuffix)
+	class := testDefaultPrivilegesClassByType(t, "table")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+resource "postgresql_default_privileges" "test" {
+	database          = "%s"
+	owner             = "%s"
+	role              = "%s"
+	schema            = "test_schema"
+	object_type       = "table"
+	with_grant_option = true
+	privileges        = ["SELECT", "UPDATE"]
+}
+`, dbName, config.Username, roleName),
+				Check: func(*terraform.State) error {
+					return testCheckDefaultPrivilegesACL(t, dbName, class, config.Username, roleName, "test_schema", []string{"SELECT", "UPDATE"}, true)
+				},
+			},
+		},
+		// After the destroy of the resource, nothing is granted to the role by default
+		CheckDestroy: func(*terraform.State) error {
+			if err := testCheckDefaultPrivilegesACL(t, dbName, class, config.Username, roleName, "test_schema", []string{}, false); err != nil {
+				return err
+			}
+			dbExecute(t, config.connStr(dbName), class.create)
+			defer dbExecute(t, config.connStr(dbName), class.drop)
+			return testCheckDefaultPrivilegesEffect(t, dbName, class, roleName, []string{"SELECT", "UPDATE"}, []string{})
+		},
+	})
+}
+
+// PostgreSQL has no default privileges for schemas inside a schema, the provider refuses them.
+func TestAccPostgresqlDefaultPrivilegesSchemaInSchema(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivilegesOnSchemas)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+resource "postgresql_default_privileges" "test" {
+	database    = "%s"
+	owner       = "%s"
+	role        = "public"
+	schema      = "test_schema"
+	object_type = "schema"
+	privileges  = ["USAGE"]
+}
+`, "postgres", config.Username),
+				ExpectError: regexp.MustCompile("cannot specify `schema` when `object_type` is `schema`"),
+			},
+		},
+	})
+}
+
+// Default privileges on large objects exist from PostgreSQL 18 and cannot be scoped to a schema.
+func TestAccPostgresqlDefaultPrivilegesLargeObjects(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	version := testServerVersionNum(t)
+
+	if version < 180000 {
+		// The provider refuses the object type with a clear error on older versions
+		resource.Test(t, resource.TestCase{
+			PreCheck: func() {
+				testAccPreCheck(t)
+			},
+			Providers: testAccProviders,
+			Steps: []resource.TestStep{
+				{
+					Config: fmt.Sprintf(`
+resource "postgresql_default_privileges" "test" {
+	database    = "postgres"
+	owner       = "%s"
+	role        = "public"
+	object_type = "large_object"
+	privileges  = ["SELECT"]
+}
+`, config.Username),
+					ExpectError: regexp.MustCompile("object type LARGE OBJECTS is not supported for this Postgres version"),
+				},
+			},
+		})
+		return
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureDefaultPrivilegesLargeObjects)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+resource "postgresql_default_privileges" "test" {
+	database    = "postgres"
+	owner       = "%s"
+	role        = "public"
+	schema      = "test_schema"
+	object_type = "large_object"
+	privileges  = ["SELECT"]
+}
+`, config.Username),
+				ExpectError: regexp.MustCompile("cannot specify `schema` when `object_type` is `large_object`"),
 			},
 		},
 	})
