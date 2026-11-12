@@ -70,11 +70,11 @@ resource "postgresql_function" "increment" {
 * `leakproof` - (Optional) If the function has no side effects and reveals nothing about its arguments
   except by its result (`LEAKPROOF`). Reserved to superusers. Default is false.
 
-* `cost` - (Optional) Estimated execution cost of the function, in cost units (`COST`).
+* `cost` - (Optional) Estimated execution cost of the function, in cost units (`COST`). It must be positive.
   If not specified, PostgreSQL chooses 100 (1 for the functions in the c and internal languages).
 
 * `rows` - (Optional) Estimated number of rows returned by a function which returns a set (`ROWS`).
-  It can only be set for such a function. If not specified, PostgreSQL chooses 1000.
+  It must be positive. It can only be set for such a function. If not specified, PostgreSQL chooses 1000.
 
 * `support` - (Optional) Planner support function (`SUPPORT`), schema qualified, e.g.
   `pg_catalog.generate_series_int4_support`. Reserved to superusers. PostgreSQL has no `ALTER FUNCTION`

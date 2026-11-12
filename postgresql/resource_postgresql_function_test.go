@@ -1918,3 +1918,361 @@ resource "postgresql_function" "cascade" {
 		},
 	})
 }
+
+func TestAccPostgresqlFunction_LeakproofOnCreate(t *testing.T) {
+	config := func(leakproof string) string {
+		return fmt.Sprintf(`
+resource "postgresql_function" "leak" {
+    name = "tf_leak_create"
+    arg {
+        name = "i"
+        type = "integer"
+    }
+    returns = "boolean"
+    language = "sql"
+    %s
+    volatility = "IMMUTABLE"
+    body = "SELECT i > 0"
+}
+`, leakproof)
+	}
+	var oid string
+	const res = "postgresql_function.leak"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			testCheckCanCreateSuperuserFunction(t)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				// created with LEAKPROOF
+				Config: config(`leakproof = true`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.proleakproof", "true"),
+					resource.TestCheckResourceAttr(res, "leakproof", "true"),
+					testAccFunctionCall("SELECT public.tf_leak_create(1)", "true"),
+				),
+			},
+			{
+				ResourceName:      res,
+				ImportState:       true,
+				ImportStateVerify: true,
+				// it is not read from the database
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				// NOT LEAKPROOF is done in place with ALTER FUNCTION
+				Config: config(`leakproof = false`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.proleakproof", "false"),
+					resource.TestCheckResourceAttr(res, "leakproof", "false"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_RowsOnCreate(t *testing.T) {
+	config := `
+resource "postgresql_function" "rows" {
+    name = "tf_rows_create"
+    arg {
+        name = "n"
+        type = "integer"
+    }
+    returns = "SETOF integer"
+    language = "sql"
+    rows = 42
+    body = "SELECT generate_series(1, n)"
+}
+`
+	var oid string
+	const res = "postgresql_function.rows"
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccFunctionPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				// created with ROWS
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.prorows", "42"),
+					testAccFunctionProp(res, "p.proretset", "true"),
+					resource.TestCheckResourceAttr(res, "rows", "42"),
+					testAccFunctionCall("SELECT count(*) FROM public.tf_rows_create(3)", "3"),
+				),
+			},
+			{
+				ResourceName:      res,
+				ImportState:       true,
+				ImportStateVerify: true,
+				// it is not read from the database
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				PreConfig: func() {
+					testAccFunctionExec(t, "ALTER FUNCTION public.tf_rows_create(integer) ROWS 7")
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.prorows", "42"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_SupportOnCreate(t *testing.T) {
+	config := `
+resource "postgresql_function" "support" {
+    name = "tf_support_create"
+    arg {
+        name = "a"
+        type = "integer"
+    }
+    arg {
+        name = "b"
+        type = "integer"
+    }
+    returns = "SETOF integer"
+    language = "sql"
+    support = "pg_catalog.generate_series_int4_support"
+    volatility = "IMMUTABLE"
+    body = "SELECT generate_series(a, b)"
+}
+`
+	var oid string
+	const res = "postgresql_function.support"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			testCheckCanExecute(
+				t, "set a support function",
+				"CREATE FUNCTION public.tf_probe_support() RETURNS SETOF integer LANGUAGE sql SUPPORT pg_catalog.generate_series_int4_support AS 'SELECT 1'",
+			)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				// created with SUPPORT
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.prosupport::regproc", "generate_series_int4_support"),
+					resource.TestCheckResourceAttr(res, "support", "pg_catalog.generate_series_int4_support"),
+					testAccFunctionCall("SELECT count(*) FROM public.tf_support_create(1, 5)", "5"),
+				),
+			},
+			{
+				ResourceName:      res,
+				ImportState:       true,
+				ImportStateVerify: true,
+				// it is not read from the database
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				// replaced outside of Terraform without the support function
+				PreConfig: func() {
+					testAccFunctionExec(t, "CREATE OR REPLACE FUNCTION public.tf_support_create(a integer, b integer) RETURNS SETOF integer LANGUAGE sql IMMUTABLE AS 'SELECT generate_series(a, b)'")
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.prosupport::regproc", "generate_series_int4_support"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_CostRowsNotPositive(t *testing.T) {
+	const config = `
+resource "postgresql_function" "cost" {
+    name = "tf_cost_positive"
+    returns = "SETOF integer"
+    language = "sql"
+    body = "SELECT 1"
+}
+`
+	var oid string
+	const res = "postgresql_function.cost"
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccFunctionPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				// without cost and rows, nothing changes: PostgreSQL chooses the defaults
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.procost", "100"),
+					testAccFunctionProp(res, "p.prorows", "1000"),
+					resource.TestCheckResourceAttr(res, "cost", "100"),
+					resource.TestCheckResourceAttr(res, "rows", "1000"),
+				),
+			},
+			{
+				// PostgreSQL refuses COST 0, and the provider would never converge with it
+				Config: `
+resource "postgresql_function" "cost" {
+    name = "tf_cost_positive"
+    returns = "integer"
+    cost = 0
+    body = "BEGIN RETURN 1; END;"
+}
+`,
+				ExpectError: regexp.MustCompile("cost must be positive"),
+			},
+			{
+				Config: `
+resource "postgresql_function" "cost" {
+    name = "tf_cost_positive"
+    returns = "integer"
+    cost = -1
+    body = "BEGIN RETURN 1; END;"
+}
+`,
+				ExpectError: regexp.MustCompile("cost must be positive"),
+			},
+			{
+				Config: `
+resource "postgresql_function" "cost" {
+    name = "tf_cost_positive"
+    returns = "SETOF integer"
+    language = "sql"
+    rows = 0
+    body = "SELECT 1"
+}
+`,
+				ExpectError: regexp.MustCompile("rows must be positive"),
+			},
+			{
+				// the valid configuration is the last one: it is destroyed with it
+				Config: config,
+				Check:  testAccFunctionProp(res, "p.procost", "100"),
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_ArgDefaultChange(t *testing.T) {
+	config := func(def string) string {
+		return fmt.Sprintf(`
+resource "postgresql_function" "defaults" {
+    name = "tf_default_change"
+    arg {
+        name = "a"
+        type = "integer"
+    }
+    arg {
+        name = "b"
+        type = "integer"
+        default = "%s"
+    }
+    returns = "integer"
+    language = "sql"
+    body = "SELECT a + b"
+}
+`, def)
+	}
+	var oid string
+	const res = "postgresql_function.defaults"
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccFunctionPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("1"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "pg_get_function_arguments(p.oid)", "a integer, b integer DEFAULT 1"),
+					testAccFunctionCall("SELECT public.tf_default_change(5)", "6"),
+				),
+			},
+			{
+				// the default is changed by CREATE OR REPLACE FUNCTION: the function is not dropped
+				Config: config("10"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "pg_get_function_arguments(p.oid)", "a integer, b integer DEFAULT 10"),
+					testAccFunctionProp(res, "p.pronargdefaults", "1"),
+					resource.TestCheckResourceAttr(res, "arg.1.default", "10"),
+					testAccFunctionCall("SELECT public.tf_default_change(5)", "15"),
+				),
+			},
+			{
+				ResourceName:      res,
+				ImportState:       true,
+				ImportStateVerify: true,
+				// it is not read from the database
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+		},
+	})
+}
+
+func TestAccPostgresqlFunction_ObjFileChange(t *testing.T) {
+	config := func(objFile string) string {
+		return fmt.Sprintf(`
+resource "postgresql_function" "c" {
+    name = "tf_obj_file_change"
+    returns = "void"
+    language = "c"
+    obj_file = "%s"
+    body = "dummy_seclabel_dummy"
+}
+`, objFile)
+	}
+	var oid string
+	const res = "postgresql_function.c"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			testCheckCanExecute(
+				t, "create a function in the c language",
+				"CREATE FUNCTION public.tf_probe_obj_file() RETURNS void LANGUAGE c AS '/opt/dummy_seclabel/dummy_seclabel', 'dummy_seclabel_dummy'",
+			)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("/opt/dummy_seclabel/dummy_seclabel"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.probin", "/opt/dummy_seclabel/dummy_seclabel"),
+				),
+			},
+			{
+				// the same library, under another name: the object file is changed by CREATE OR REPLACE FUNCTION
+				Config: config("/opt/dummy_seclabel/dummy_seclabel.so"),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.probin", "/opt/dummy_seclabel/dummy_seclabel.so"),
+					resource.TestCheckResourceAttr(res, "obj_file", "/opt/dummy_seclabel/dummy_seclabel.so"),
+					testAccFunctionCall("SELECT public.tf_obj_file_change() IS NULL", "false"),
+				),
+			},
+		},
+	})
+}
