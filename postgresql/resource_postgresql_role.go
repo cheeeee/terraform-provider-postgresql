@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-cty/cty"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 	"github.com/lib/pq"
@@ -65,9 +66,9 @@ func resourcePostgreSQLRole() *schema.Resource {
 		Delete: PGResourceFunc(resourcePostgreSQLRoleDelete),
 		Exists: PGResourceExistsFunc(resourcePostgreSQLRoleExists),
 		Importer: &schema.ResourceImporter{
-			StateContext: schema.ImportStatePassthroughContext,
+			StateContext: resourcePostgreSQLRoleImport,
 		},
-		CustomizeDiff: validateRoleDatabaseParameters,
+		CustomizeDiff: customdiff.All(validateRoleDatabaseParameters, validateRoleEncryptedPassword),
 
 		Schema: map[string]*schema.Schema{
 			roleNameAttr: {
@@ -125,9 +126,13 @@ func resourcePostgreSQLRole() *schema.Resource {
 				Description: "Control whether the password is stored encrypted in the system catalogs",
 			},
 			roleValidUntilAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Default:     "infinity",
+				Type:     schema.TypeString,
+				Optional: true,
+				Default:  "infinity",
+				// an empty value means no expiry, like infinity (which is what is read back)
+				DiffSuppressFunc: func(_, old, new string, _ *schema.ResourceData) bool {
+					return old == "infinity" && new == ""
+				},
 				Description: "Sets a date and time after which the role's password is no longer valid",
 			},
 			roleConnLimitAttr: {
@@ -1098,10 +1103,9 @@ func setRoleValidUntil(txn *sql.Tx, d *schema.ResourceData) error {
 		return nil
 	}
 
+	// no expiry: an empty value is the same as the default, infinity
 	validUntil := d.Get(roleValidUntilAttr).(string)
-	if validUntil == "" {
-		return nil
-	} else if strings.ToLower(validUntil) == "infinity" {
+	if validUntil == "" || strings.ToLower(validUntil) == "infinity" {
 		validUntil = "infinity"
 	}
 
@@ -1298,6 +1302,21 @@ func roleDatabaseParameters(set *schema.Set) (map[string]map[string]any, error) 
 	return result, nil
 }
 
+// validateRoleEncryptedPassword refuses encrypted_password = false at plan time: since
+// PostgreSQL 10, the server refuses UNENCRYPTED PASSWORD. The attribute is kept
+// (true is its default) so that the existing configurations do not change.
+func validateRoleEncryptedPassword(_ context.Context, d *schema.ResourceDiff, meta any) error {
+	if d.Get(roleEncryptedPassAttr).(bool) {
+		return nil
+	}
+	// the server version is needed: if the server cannot be reached, the apply tells
+	if db, err := meta.(*Client).Connect(); err == nil && !db.featureSupported(featureScramSHA256) {
+		return nil
+	}
+	return fmt.Errorf("%s = false is not supported: PostgreSQL no longer stores unencrypted passwords "+
+		"(UNENCRYPTED PASSWORD is no longer supported since PostgreSQL 10): remove the attribute or set it to true", roleEncryptedPassAttr)
+}
+
 func validateRoleDatabaseParameters(_ context.Context, d *schema.ResourceDiff, _ any) error {
 	set, ok := d.Get(roleDatabaseParametersAttr).(*schema.Set)
 	if !ok {
@@ -1329,6 +1348,41 @@ func hashRoleDatabaseParameters(v any) int {
 		fmt.Fprintf(&b, "%s=%s;", name, value)
 	}
 	return schema.HashString(b.String())
+}
+
+// resourcePostgreSQLRoleImport puts the databases in which the role has parameters in
+// the state: Read only reads the databases which are already in the resource.
+func resourcePostgreSQLRoleImport(_ context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	db, err := meta.(*Client).Connect()
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.Query(`SELECT d.datname FROM pg_catalog.pg_db_role_setting AS s
+		JOIN pg_catalog.pg_database AS d ON d.oid = s.setdatabase
+		JOIN pg_catalog.pg_roles AS r ON r.oid = s.setrole
+		WHERE r.rolname = $1 ORDER BY d.datname`, d.Id())
+	if err != nil {
+		return nil, fmt.Errorf("error reading the databases of role %s: %w", d.Id(), err)
+	}
+	defer rows.Close()
+
+	var blocks []any
+	for rows.Next() {
+		var database string
+		if err := rows.Scan(&database); err != nil {
+			return nil, err
+		}
+		blocks = append(blocks, map[string]any{"database": database, "parameters": map[string]any{}})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := d.Set(roleDatabaseParametersAttr, blocks); err != nil {
+		return nil, err
+	}
+
+	return []*schema.ResourceData{d}, nil
 }
 
 func readRoleDatabaseConfig(db QueryAble, roleName, database string) (map[string]any, error) {

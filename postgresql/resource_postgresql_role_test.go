@@ -2,6 +2,7 @@ package postgresql
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -1277,12 +1278,13 @@ resource "postgresql_role" "dbp_role" {
 					}),
 				),
 			},
-			// The existing parameters of the databases are not read by the import.
+			// The parameters of the databases are read by the import. The only difference is the spelling of
+			// a list, which the state keeps as it is written ("pg_default,pg_default").
 			{
 				ResourceName:            "postgresql_role.dbp_role",
 				ImportState:             true,
 				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"database_parameters", "password"},
+				ImportStateVerifyIgnore: []string{"password", "database_parameters.0.parameters.temp_tablespaces"},
 			},
 			// An empty map resets all the parameters of the database.
 			{
@@ -1365,7 +1367,10 @@ resource "postgresql_role" "dbp_rejected" {
 	})
 }
 
-// testAccCheckRoleCannotLogin checks that a session cannot be opened with the password.
+// testAccCheckRoleCannotLogin checks that a session cannot be opened with the password,
+// and that the server refused it: invalid_password (28P01, wrong or expired password) or
+// invalid_authorization_specification (28000, a role which cannot log in). Any other
+// error (the server is down, the port is wrong...) fails the check.
 func testAccCheckRoleCannotLogin(t *testing.T, role, password string) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		config := getTestConfig(t)
@@ -1376,8 +1381,13 @@ func testAccCheckRoleCannotLogin(t *testing.T, role, password string) resource.T
 			return fmt.Errorf("could not open SQL connection: %v", err)
 		}
 		defer closeDB(t, db)
-		if err := db.Ping(); err == nil {
+		err = db.Ping()
+		if err == nil {
 			return fmt.Errorf("role %s can login with the password %q", role, password)
+		}
+		var pqErr *pq.Error
+		if !errors.As(err, &pqErr) || (pqErr.Code != "28P01" && pqErr.Code != "28000") {
+			return fmt.Errorf("the login of role %s was not refused by the server (expected SQLSTATE 28P01 or 28000): %v", role, err)
 		}
 		return nil
 	}
@@ -1799,7 +1809,9 @@ resource "postgresql_role" "unencrypted_role" {
   password           = "pwd"
   encrypted_password = false
 }`,
-				ExpectError: regexp.MustCompile(`UNENCRYPTED PASSWORD is no longer supported`),
+				// refused by the provider when the plan is made, not by the server at the apply
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`encrypted_password = false is not supported[\s\S]*UNENCRYPTED PASSWORD is no longer supported`),
 			},
 		},
 	})
@@ -2443,4 +2455,76 @@ func TestRoleDatabaseParametersDuplicate(t *testing.T) {
 	if _, err := roleDatabaseParameters(set); err == nil {
 		t.Fatal("a database defined twice has to be refused")
 	}
+}
+
+// Test that an expiry is removed: with an empty value and by removing the attribute,
+// the role has no expiry in the catalog and can log in again.
+func TestAccPostgresqlRole_ValidUntilRemoved(t *testing.T) {
+	roleConfig := func(validUntil string) string {
+		return fmt.Sprintf(`
+resource "postgresql_role" "vu_role" {
+  name     = "vu_role"
+  login    = true
+  password = "vu_pwd"
+  %s
+}
+
+resource "postgresql_role" "vu_nologin" {
+  name     = "vu_nologin"
+  login    = false
+  password = "vu_pwd"
+}
+`, validUntil)
+	}
+	expired := `valid_until = "2000-01-01 00:00:00+00"`
+	noExpiry := resource.ComposeTestCheckFunc(
+		testAccCheckRoleValidUntil("vu_role", "infinity"),
+		testAccCheckRoleColumn("vu_role", "rolvaliduntil", "infinity"),
+		testAccCheckRoleCanLogin(t, "vu_role", "vu_pwd"),
+	)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig(expired),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleValidUntil("vu_role", "2000-01-01 00:00:00+00"),
+					// the password has expired, the right one is refused
+					testAccCheckRoleCannotLogin(t, "vu_role", "vu_pwd"),
+					// a role which cannot log in
+					testAccCheckRoleCannotLogin(t, "vu_nologin", "vu_pwd"),
+				),
+			},
+			// an empty value removes the expiry
+			{
+				Config: roleConfig(`valid_until = ""`),
+				Check:  noExpiry,
+			},
+			{Config: roleConfig(`valid_until = ""`), PlanOnly: true},
+			{
+				Config: roleConfig(expired),
+				Check:  testAccCheckRoleCannotLogin(t, "vu_role", "vu_pwd"),
+			},
+			// so does removing the attribute
+			{
+				Config: roleConfig(``),
+				Check:  testAccCheckRoleValidUntil("vu_role", "infinity"),
+			},
+			{Config: roleConfig(``), PlanOnly: true},
+			{
+				Config: roleConfig(`valid_until = "2099-01-01 00:00:00+00"`),
+				Check:  testAccCheckRoleValidUntil("vu_role", "2099-01-01 00:00:00+00"),
+			},
+			{
+				Config: roleConfig(``),
+				Check:  testAccCheckRoleValidUntil("vu_role", "infinity"),
+			},
+		},
+	})
 }

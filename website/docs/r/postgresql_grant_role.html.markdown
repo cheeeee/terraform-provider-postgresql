@@ -63,3 +63,9 @@ The options which are not set in the configuration are read from `pg_auth_member
 
 ~> **Note:** the `CREATE ROLE ... ROLE` and `ADMIN` clauses (the roles which are members of the new role)
 are expressed with a `postgresql_grant_role` per member, with `with_admin_option = true` for `ADMIN`.
+
+## Import
+
+A membership is imported with the ID `<role>_<grant_role>`, which is also its ID in the state
+(the option `with_admin_option` is not part of it, the options are changed in place).
+The former ID `<role>_<grant_role>_<with_admin_option>` is still accepted.
