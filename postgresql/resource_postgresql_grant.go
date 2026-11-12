@@ -491,6 +491,10 @@ func readRolePrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData) e
 		return readForeignServerRolePrivileges(txn, db, d, roleOID)
 
 	case "function", "procedure", "routine":
+		// The objects given with their argument types are read one by one, by their OID.
+		if drifted, err := readFunctionSignaturesPrivileges(txn, db, d, roleOID); err != nil || drifted {
+			return err
+		}
 		query = `
 SELECT pg_proc.proname, array_remove(array_agg(privilege_type), NULL)
 FROM pg_proc
@@ -624,6 +628,174 @@ GROUP BY pg_class.relname
 	}
 
 	return nil
+}
+
+// readFunctionSignaturesPrivileges compares the privileges of the objects of `objects` which are given with
+// their argument types, e.g. f(integer), with the ones of the state. The catalog only knows the bare name of a
+// function, which cannot tell two overloads apart, so each signature is resolved to the OID of exactly one
+// function and the ACL of this function is read. It returns true when the privileges of an object differ,
+// after having set them in the state. The objects given by their name only are read by readRolePrivileges.
+func readFunctionSignaturesPrivileges(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, roleOID uint32) (bool, error) {
+	query := `
+SELECT array_remove(array_agg(privilege_type), NULL)
+FROM (SELECT (aclexplode(proacl)).* FROM pg_proc WHERE oid = $1::oid) AS privileges
+WHERE grantee = $2
+`
+	for _, object := range d.Get("objects").(*schema.Set).List() {
+		signature := object.(string)
+		if !strings.Contains(signature, "(") {
+			continue
+		}
+		oid, err := resolveFunctionSignature(txn, d.Get("schema").(string), d.Get("object_type").(string), signature)
+		if err != nil {
+			return false, err
+		}
+		if oid == "" {
+			log.Printf("[DEBUG] %s %s of schema %s does not exist or could not be resolved", d.Get("object_type"), signature, d.Get("schema"))
+			continue
+		}
+
+		var privileges pq.ByteaArray
+		if err := txn.QueryRow(query, oid, roleOID).Scan(&privileges); err != nil {
+			return false, fmt.Errorf("could not read privileges for %s %s: %w", d.Get("object_type"), signature, err)
+		}
+		granted := pgArrayToSet(privileges)
+		if !resourcePrivilegesEqual(granted, db, d) {
+			log.Printf("[DEBUG] %s %s has not the expected privileges %v for role %s", d.Get("object_type"), signature, privileges, d.Get("role"))
+			return true, d.Set("privileges", granted)
+		}
+	}
+	return false, nil
+}
+
+// resolveFunctionSignature returns the OID (as a string) of the function, procedure or routine written
+// `name(argument list)` in the schema, or "" when there is none. The argument list is what a GRANT accepts:
+// argument modes and names are dropped and PostgreSQL resolves the types, ignoring their modifiers.
+func resolveFunctionSignature(txn *sql.Tx, schemaName, objectType, signature string) (string, error) {
+	signature = strings.TrimSpace(signature)
+	open := strings.Index(signature, "(")
+	if open < 0 || !strings.HasSuffix(signature, ")") {
+		return "", nil
+	}
+	name := signature[:open]
+
+	// The OUT arguments are not part of the identity of a function, but they are one of a procedure
+	// (PostgreSQL 14 and above): a procedure is looked for with them, then without them.
+	withOut := []string{}
+	withoutOut := []string{}
+	for _, arg := range splitTopLevel(signature[open+1 : len(signature)-1]) {
+		mode, argType, err := parseFunctionArgument(txn, arg)
+		if err != nil {
+			return "", err
+		}
+		if argType == "" {
+			continue
+		}
+		withOut = append(withOut, argType)
+		if mode != "OUT" {
+			withoutOut = append(withoutOut, argType)
+		}
+	}
+
+	candidates := [][]string{withoutOut}
+	if objectType != "function" && len(withOut) != len(withoutOut) {
+		candidates = [][]string{withOut, withoutOut}
+	}
+	for _, types := range candidates {
+		qualified := fmt.Sprintf("%s.%s(%s)", pq.QuoteIdentifier(schemaName), pq.QuoteIdentifier(name), strings.Join(types, ","))
+		oid, ok, err := softQueryString(txn, "SELECT to_regprocedure($1)::oid::text", qualified)
+		if err != nil {
+			return "", err
+		}
+		if ok && oid != "" {
+			return oid, nil
+		}
+	}
+	return "", nil
+}
+
+// splitTopLevel splits a list at the commas which are neither in parentheses or brackets nor in a quoted identifier.
+func splitTopLevel(list string) []string {
+	var parts []string
+	depth, start, quoted := 0, 0, false
+	for i, c := range list {
+		switch {
+		case c == '"':
+			quoted = !quoted
+		case quoted:
+		case c == '(' || c == '[':
+			depth++
+		case c == ')' || c == ']':
+			depth--
+		case c == ',' && depth == 0:
+			parts = append(parts, list[start:i])
+			start = i + 1
+		}
+	}
+	if strings.TrimSpace(list[start:]) != "" || len(parts) > 0 {
+		parts = append(parts, list[start:])
+	}
+	return parts
+}
+
+// firstTokenEnd returns the index of the end of the first word of s, which may be a quoted identifier or
+// contain parentheses.
+func firstTokenEnd(s string) int {
+	depth, quoted := 0, false
+	for i, c := range s {
+		switch {
+		case c == '"':
+			quoted = !quoted
+		case quoted:
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case (c == ' ' || c == '\t' || c == '\n') && depth == 0:
+			return i
+		}
+	}
+	return len(s)
+}
+
+// parseFunctionArgument splits `[mode] [name] type` into the upper-cased mode (empty for none) and the type.
+func parseFunctionArgument(txn *sql.Tx, arg string) (mode, argType string, err error) {
+	arg = strings.TrimSpace(arg)
+	if end := firstTokenEnd(arg); end < len(arg) {
+		switch word := strings.ToUpper(arg[:end]); word {
+		case "IN", "OUT", "INOUT", "VARIADIC":
+			mode, arg = word, strings.TrimSpace(arg[end:])
+		}
+	}
+	end := firstTokenEnd(arg)
+	if end == len(arg) {
+		return mode, arg, nil
+	}
+	// Two words: either a name and a type, or a type of several words (double precision...).
+	if _, ok, err := softQueryString(txn, "SELECT to_regtype($1)::oid::text", arg); err != nil || ok {
+		return mode, arg, err
+	}
+	return mode, strings.TrimSpace(arg[end:]), nil
+}
+
+// softQueryString runs a query with one parameter which returns a string, inside a savepoint: ok is
+// false when the statement fails, which does not abort the transaction (to_regtype and to_regprocedure raise an
+// error for a malformed name).
+func softQueryString(txn *sql.Tx, query, arg string) (value string, ok bool, err error) {
+	if _, err := txn.Exec("SAVEPOINT tfpg_resolve"); err != nil {
+		return "", false, err
+	}
+	var result sql.NullString
+	if qerr := txn.QueryRow(query, arg).Scan(&result); qerr != nil {
+		if _, err := txn.Exec("ROLLBACK TO SAVEPOINT tfpg_resolve"); err != nil {
+			return "", false, err
+		}
+		return "", false, nil
+	}
+	if _, err := txn.Exec("RELEASE SAVEPOINT tfpg_resolve"); err != nil {
+		return "", false, err
+	}
+	return result.String, result.Valid, nil
 }
 
 // namedObjectsClause returns the keyword and the objects of a GRANT or REVOKE statement for the

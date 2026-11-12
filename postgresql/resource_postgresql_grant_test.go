@@ -2611,15 +2611,113 @@ func TestAccPostgresqlGrantFunctionSignatures(t *testing.T) {
 		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_sig_role")
 	}()
 
-	// the canonical signature of each function of the configuration, and whether it is granted
-	expected := map[string]bool{
-		"test_sig_schema.f_typmod(character varying,numeric)": true,
-		"test_sig_schema.f_named(text,double precision)":      true,
-		"test_sig_schema.f_qualified(test_sig_schema.mytype)": true,
-		"test_sig_schema.f_array(integer[])":                  true,
-		`test_sig_schema.f_quoted(test_sig_schema."My Type")`: true,
-		"test_sig_schema.f_over(integer)":                     true,
-		"test_sig_schema.f_over(text)":                        false,
+	// each function is granted by its own resource: Read keeps the privileges of the first object which differs
+	cases := []struct{ object, canonical string }{
+		{"f_typmod(varchar(10), numeric(10,2))", "test_sig_schema.f_typmod(character varying,numeric)"},
+		{"f_named(IN a text, b double precision)", "test_sig_schema.f_named(text,double precision)"},
+		{"f_qualified(test_sig_schema.mytype)", "test_sig_schema.f_qualified(test_sig_schema.mytype)"},
+		{"f_array(integer[])", "test_sig_schema.f_array(integer[])"},
+		{`f_quoted(test_sig_schema.\"My Type\")`, `test_sig_schema.f_quoted(test_sig_schema."My Type")`},
+		{"f_over(integer)", "test_sig_schema.f_over(integer)"},
+	}
+	tfConfig := ""
+	for i, c := range cases {
+		tfConfig += fmt.Sprintf(`
+resource "postgresql_grant" "test%d" {
+  database    = "postgres"
+  role        = "test_sig_role"
+  schema      = "test_sig_schema"
+  object_type = "function"
+  privileges  = ["EXECUTE"]
+  objects     = ["%s"]
+}
+`, i, c.object)
+	}
+	checkAll := func(*terraform.State) error {
+		for _, c := range cases {
+			if err := testFunctionPrivilege(t, "test_sig_role", c.canonical, true); err != nil {
+				return err
+			}
+		}
+		// the other overload of f_over
+		return testFunctionPrivilege(t, "test_sig_role", "test_sig_schema.f_over(text)", false)
+	}
+
+	steps := []resource.TestStep{{Config: tfConfig, Check: checkAll}}
+	for _, c := range cases {
+		canonical := c.canonical
+		steps = append(steps,
+			resource.TestStep{
+				// a privilege revoked outside of Terraform is detected, whatever the form of the signature
+				PreConfig: func() {
+					dbExecute(t, dsn, "REVOKE EXECUTE ON FUNCTION "+canonical+" FROM test_sig_role")
+				},
+				Config:             tfConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			resource.TestStep{Config: tfConfig, Check: checkAll},
+		)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps:     steps,
+	})
+}
+
+// testSetupOverloads creates test_ov_role and the two overloads test_ov_schema.f_ov(integer) and
+// test_ov_schema.f_ov(text), which only the owner can execute. The returned function drops all of it.
+func testSetupOverloads(t *testing.T) func() {
+	dsn := testPostgresDSN(t)
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_ov_role LOGIN PASSWORD '%s'", testRolePassword))
+	dbExecute(t, dsn, "CREATE SCHEMA test_ov_schema")
+	dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_ov_schema TO test_ov_role")
+	dbExecute(t, dsn, "CREATE FUNCTION test_ov_schema.f_ov(a integer) RETURNS int AS $$ select 1 $$ LANGUAGE SQL")
+	dbExecute(t, dsn, "CREATE FUNCTION test_ov_schema.f_ov(a text) RETURNS int AS $$ select 1 $$ LANGUAGE SQL")
+	dbExecute(t, dsn, "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA test_ov_schema FROM PUBLIC")
+	return func() {
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_ov_schema CASCADE")
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_ov_role")
+	}
+}
+
+func testCheckOverloads(t *testing.T, wantInt, wantText bool) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		if err := testFunctionPrivilege(t, "test_ov_role", "test_ov_schema.f_ov(integer)", wantInt); err != nil {
+			return err
+		}
+		return testFunctionPrivilege(t, "test_ov_role", "test_ov_schema.f_ov(text)", wantText)
+	}
+}
+
+// TestAccPostgresqlGrantFunctionSignatureDrift revokes, outside of Terraform, the privilege on one overload of a
+// function which the configuration grants with its signature: the plan must see it, for this overload only.
+func TestAccPostgresqlGrantFunctionSignatureDrift(t *testing.T) {
+	skipIfNotAcc(t)
+	defer testSetupOverloads(t)()
+
+	grant := func(name, signature string) string {
+		return fmt.Sprintf(`
+resource "postgresql_grant" "%s" {
+  database    = "postgres"
+  role        = "test_ov_role"
+  schema      = "test_ov_schema"
+  object_type = "function"
+  privileges  = ["EXECUTE"]
+  objects     = ["%s"]
+}
+`, name, signature)
+	}
+	both := grant("int", "f_ov(a integer)") + grant("text", "f_ov(text)")
+	revoke := func(signature string) func() {
+		return func() {
+			dbExecute(t, testPostgresDSN(t), "REVOKE EXECUTE ON FUNCTION test_ov_schema."+signature+" FROM test_ov_role")
+		}
 	}
 
 	resource.Test(t, resource.TestCase{
@@ -2630,31 +2728,84 @@ func TestAccPostgresqlGrantFunctionSignatures(t *testing.T) {
 		Providers: testAccProviders,
 		Steps: []resource.TestStep{
 			{
-				Config: `
+				Config: both,
+				Check:  testCheckOverloads(t, true, true),
+			},
+			{
+				// one overload loses its privilege: the plan shows a change
+				PreConfig:          revoke("f_ov(text)"),
+				Config:             both,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				// the apply restores it, and only it
+				Config: both,
+				Check:  testCheckOverloads(t, true, true),
+			},
+			{
+				PreConfig:          revoke("f_ov(integer)"),
+				Config:             both,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: both,
+				Check:  testCheckOverloads(t, true, true),
+			},
+			{
+				// the other overload is not in the configuration of this resource: no change
+				Config: grant("int", "f_ov(integer)"),
+				Check:  testCheckOverloads(t, true, false),
+			},
+			{
+				PreConfig:          revoke("f_ov(text)"),
+				Config:             grant("int", "f_ov(integer)"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: false,
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantFunctionBareName checks that a function given by its name only keeps being read by name
+// (PostgreSQL refuses a bare name which is ambiguous, so the function is not overloaded).
+func TestAccPostgresqlGrantFunctionBareName(t *testing.T) {
+	skipIfNotAcc(t)
+	defer testSetupOverloads(t)()
+	dbExecute(t, testPostgresDSN(t), "CREATE FUNCTION test_ov_schema.f_one() RETURNS int AS $$ select 1 $$ LANGUAGE SQL")
+	dbExecute(t, testPostgresDSN(t), "REVOKE ALL ON FUNCTION test_ov_schema.f_one() FROM PUBLIC")
+
+	config := `
 resource "postgresql_grant" "test" {
   database    = "postgres"
-  role        = "test_sig_role"
-  schema      = "test_sig_schema"
+  role        = "test_ov_role"
+  schema      = "test_ov_schema"
   object_type = "function"
   privileges  = ["EXECUTE"]
-  objects = [
-    "f_typmod(varchar(10), numeric(10,2))",
-    "f_named(IN a text, b double precision)",
-    "f_qualified(test_sig_schema.mytype)",
-    "f_array(integer[])",
-    "f_quoted(test_sig_schema.\"My Type\")",
-    "f_over(integer)",
-  ]
+  objects     = ["f_one"]
 }
-`,
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
 				Check: func(*terraform.State) error {
-					for sig, want := range expected {
-						if err := testFunctionPrivilege(t, "test_sig_role", sig, want); err != nil {
-							return err
-						}
-					}
-					return nil
+					return testFunctionPrivilege(t, "test_ov_role", "test_ov_schema.f_one()", true)
 				},
+			},
+			{
+				PreConfig: func() {
+					dbExecute(t, testPostgresDSN(t), "REVOKE EXECUTE ON FUNCTION test_ov_schema.f_one() FROM test_ov_role")
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
 			},
 		},
 	})
