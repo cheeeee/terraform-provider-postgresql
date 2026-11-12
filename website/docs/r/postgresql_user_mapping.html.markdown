@@ -46,7 +46,7 @@ resource "postgresql_user_mapping" "remote" {
 
 ## Argument Reference
 
-* `user_name` - (Required) The name of an existing user that is mapped to foreign server. CURRENT_ROLE, CURRENT_USER, and USER match the name of the current user. When PUBLIC is specified, a so-called public mapping is created that is used when no user-specific mapping is applicable.
+* `user_name` - (Required) The name of an existing user that is mapped to foreign server. Use `public` to create a so-called public mapping, which is used when no user-specific mapping is applicable.
 Changing this value
   will force the creation of a new resource as this value can only be set
   when the user mapping is created.
@@ -55,3 +55,13 @@ Changing this value
   will force the creation of a new resource as this value can only be set
   when the user mapping is created.
 * `options` - (Optional) This clause specifies the options of the user mapping. The options typically define the actual user name and password of the mapping. Option names must be unique. The allowed option names and values are specific to the server's foreign-data wrapper.
+
+## Import
+
+A user mapping can be imported with its user name and its server name joined by a dot, for example:
+
+```
+$ terraform import postgresql_user_mapping.remote remote.myserver_postgres
+```
+
+The options are read from the server only if the connected user can see them: PostgreSQL hides the options of a user mapping from a user who is neither the mapped user nor the owner of the server. In that case, the options of the state are kept.

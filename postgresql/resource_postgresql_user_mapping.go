@@ -32,7 +32,7 @@ func resourcePostgreSQLUserMapping() *schema.Resource {
 				Type:        schema.TypeString,
 				Required:    true,
 				ForceNew:    true,
-				Description: "The name of an existing user that is mapped to foreign server. CURRENT_ROLE, CURRENT_USER, and USER match the name of the current user. When PUBLIC is specified, a so-called public mapping is created that is used when no user-specific mapping is applicable",
+				Description: "The name of an existing user that is mapped to foreign server. Use public to create a so-called public mapping, which is used when no user-specific mapping is applicable",
 			},
 			userMappingServerNameAttr: {
 				Type:        schema.TypeString,
@@ -102,14 +102,27 @@ func resourcePostgreSQLUserMappingRead(db *DBConnection, d *schema.ResourceData)
 }
 
 func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceData) error {
-	username := d.Get(userMappingUserNameAttr).(string)
-	serverName := d.Get(userMappingServerNameAttr).(string)
-
 	txn, err := startTransaction(db.client, "")
 	if err != nil {
 		return err
 	}
 	defer deferredRollback(txn)
+
+	// After an import, only the ID is known: the user name and the server name joined by a dot.
+	if d.Get(userMappingUserNameAttr).(string) == "" {
+		var importedUserName, importedServerName string
+		err := txn.QueryRow(
+			"SELECT usename, srvname FROM pg_user_mappings WHERE usename || '.' || srvname = $1",
+			d.Id(),
+		).Scan(&importedUserName, &importedServerName)
+		if err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("error reading user mapping: %w", err)
+		}
+		d.Set(userMappingUserNameAttr, importedUserName)
+		d.Set(userMappingServerNameAttr, importedServerName)
+	}
+	username := d.Get(userMappingUserNameAttr).(string)
+	serverName := d.Get(userMappingServerNameAttr).(string)
 
 	// information_schema._pg_user_mappings can only be read by a superuser:
 	// the savepoint keeps the transaction usable for the fallback query.
@@ -117,10 +130,16 @@ func resourcePostgreSQLUserMappingReadImpl(db *DBConnection, d *schema.ResourceD
 		return fmt.Errorf("error reading user mapping: %w", err)
 	}
 
+	// The public mapping is named PUBLIC in information_schema, and public in pg_user_mappings.
+	authorizationIdentifier := username
+	if username == "public" {
+		authorizationIdentifier = "PUBLIC"
+	}
+
 	var userMappingOptions []string
 	optionsReadable := true
 	query := "SELECT umoptions FROM information_schema._pg_user_mappings WHERE authorization_identifier = $1 and foreign_server_name = $2"
-	err = txn.QueryRow(query, username, serverName).Scan(pq.Array(&userMappingOptions))
+	err = txn.QueryRow(query, authorizationIdentifier, serverName).Scan(pq.Array(&userMappingOptions))
 
 	if err != sql.ErrNoRows && err != nil {
 		if _, err := txn.Exec("ROLLBACK TO SAVEPOINT user_mapping"); err != nil {

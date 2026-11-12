@@ -3,11 +3,13 @@ package postgresql
 import (
 	"database/sql"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lib/pq"
 )
 
 func TestAccPostgresqlUserMapping_Basic(t *testing.T) {
@@ -162,6 +164,205 @@ func testAccCheckPostgresqlUserMappingExists(n string) resource.TestCheckFunc {
 
 		return nil
 	}
+}
+
+// testAccCheckUserMappingCatalog checks the options of a user mapping in the catalog.
+func testAccCheckUserMappingCatalog(username, serverName string, options map[string]string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		txn, err := startTransaction(testAccProvider.Meta().(*Client), "")
+		if err != nil {
+			return err
+		}
+		defer deferredRollback(txn)
+
+		var umOptions []string
+		err = txn.QueryRow(
+			"SELECT umoptions FROM pg_user_mappings WHERE usename = $1 AND srvname = $2",
+			username, serverName,
+		).Scan(pq.Array(&umOptions))
+		if err != nil {
+			return fmt.Errorf("error reading user mapping %s on server %s: %w", username, serverName, err)
+		}
+		got := make(map[string]string)
+		for _, o := range umOptions {
+			pair := strings.SplitN(o, "=", 2)
+			got[pair[0]] = pair[1]
+		}
+		if !reflect.DeepEqual(got, options) {
+			return fmt.Errorf("options of user mapping %s on server %s are %v, expected %v", username, serverName, got, options)
+		}
+		return nil
+	}
+}
+
+// testAccPostgresqlUserMappingOptionsConfig returns a server, a role and a user mapping
+// of this role with the given options (lines of HCL).
+func testAccPostgresqlUserMappingOptionsConfig(serverName, userName, options string) string {
+	return fmt.Sprintf(`
+resource "postgresql_extension" "ext_postgres_fdw" {
+  name = "postgres_fdw"
+}
+
+resource "postgresql_server" "myserver" {
+  server_name = %q
+  fdw_name    = "postgres_fdw"
+
+  depends_on = [postgresql_extension.ext_postgres_fdw]
+}
+
+resource "postgresql_role" "remote" {
+  name = %q
+}
+
+resource "postgresql_user_mapping" "remote" {
+  server_name = postgresql_server.myserver.server_name
+  user_name   = postgresql_role.remote.name
+  options = {
+%s
+  }
+}
+`, serverName, userName, options)
+}
+
+// A user mapping for PUBLIC is created, read back and changed.
+func TestAccPostgresqlUserMapping_Public(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_extension" "ext_postgres_fdw" {
+  name = "postgres_fdw"
+}
+
+resource "postgresql_server" "myserver" {
+  server_name = "myserver_public"
+  fdw_name    = "postgres_fdw"
+
+  depends_on = [postgresql_extension.ext_postgres_fdw]
+}
+
+resource "postgresql_user_mapping" "public" {
+  server_name = postgresql_server.myserver.server_name
+  user_name   = "public"
+  options = {
+    user     = "admin"
+    password = "pass"
+  }
+}
+`,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("postgresql_user_mapping.public", "user_name", "public"),
+					testAccCheckUserMappingCatalog("public", "myserver_public", map[string]string{"user": "admin", "password": "pass"}),
+				),
+			},
+		},
+	})
+}
+
+// Options of a user mapping added, changed and removed on update.
+func TestAccPostgresqlUserMapping_OptionsAddSetDrop(t *testing.T) {
+	const serverName = "myserver_um_options"
+	const userName = "remote_um_options"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlUserMappingOptionsConfig(serverName, userName, `
+    user = "admin"`),
+				Check: testAccCheckUserMappingCatalog(userName, serverName, map[string]string{"user": "admin"}),
+			},
+			{
+				// SET user, ADD password
+				Config: testAccPostgresqlUserMappingOptionsConfig(serverName, userName, `
+    user = "admin2"
+    password = "pass"`),
+				Check: testAccCheckUserMappingCatalog(userName, serverName, map[string]string{"user": "admin2", "password": "pass"}),
+			},
+			{
+				// DROP user, SET password
+				Config: testAccPostgresqlUserMappingOptionsConfig(serverName, userName, `
+    password = "pass2"`),
+				Check: testAccCheckUserMappingCatalog(userName, serverName, map[string]string{"password": "pass2"}),
+			},
+		},
+	})
+}
+
+// A user mapping is imported by its ID: the user name and the server name joined by a dot.
+func TestAccPostgresqlUserMapping_Import(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPostgresqlUserMappingOptionsConfig("myserver_um_import", "remote_um_import", `
+    user     = "admin"
+    password = "pass"`),
+			},
+			{
+				ResourceName:      "postgresql_user_mapping.remote",
+				ImportState:       true,
+				ImportStateId:     "remote_um_import.myserver_um_import",
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// Changes made outside of Terraform appear in the plan, and are reverted by an apply.
+func TestAccPostgresqlUserMapping_ChangedOutsideTerraform(t *testing.T) {
+	const serverName = "myserver_um_outside"
+	const userName = "remote_um_outside"
+	config := testAccPostgresqlUserMappingOptionsConfig(serverName, userName, `
+    password = "pass"`)
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check:  testAccCheckUserMappingCatalog(userName, serverName, map[string]string{"password": "pass"}),
+			},
+			{
+				PreConfig: func() {
+					testConfig := getTestConfig(t)
+					dbExecute(t, testConfig.connStr("postgres"),
+						fmt.Sprintf("ALTER USER MAPPING FOR %s SERVER %s OPTIONS (SET password 'changed')",
+							pq.QuoteIdentifier(userName), pq.QuoteIdentifier(serverName)))
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config,
+				Check:  testAccCheckUserMappingCatalog(userName, serverName, map[string]string{"password": "pass"}),
+			},
+		},
+	})
 }
 
 var testAccPostgresqlUserMappingConfig = `
