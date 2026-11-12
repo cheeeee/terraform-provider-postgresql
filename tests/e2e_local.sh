@@ -14,6 +14,8 @@ fi
 
 status=0
 ./tests/e2e/run.sh || status=$?
+# Upgrade from the released versions of the provider
+./tests/e2e/upgrade.sh || status=$?
 
 ./tests/testacc_cleanup.sh
 exit $status

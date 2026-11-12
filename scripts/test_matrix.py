@@ -44,6 +44,7 @@ AREAS = [
     ("Data sources", r"^TestAccPostgresqlDataSource"),
 ]
 E2E = "End-to-end plan checks"
+UPGRADE = "Upgrade from the released versions"
 
 # (area, environment) -> why the area cannot be tested in this environment.
 # It is only used when no test of the area ran there: a test which runs is never hidden.
@@ -69,6 +70,7 @@ def parse_log(text):
     suites = collections.defaultdict(dict)
     info = {"parameters": {}}
     suite = "tests"
+    checks = "e2e"
     for line in text.splitlines():
         m = re.search(r"## ->\s+run \((\w+)\)", line)
         if m:
@@ -87,11 +89,16 @@ def parse_log(text):
         m = re.search(r"## ((?:OpenTofu|Terraform) v[0-9.]+)", line)
         if m:
             info["cli"] = m.group(1)
+        if "## Upgrade from " in line:
+            # the checks which follow are the ones of the upgrade test
+            checks = "upgrade"
         m = re.search(r"\| ?(ok|FAIL): ", line) or re.search(r"\t(ok|FAIL): ", line)
         if m:
-            info.setdefault("e2e", []).append(m.group(1))
+            info.setdefault(checks, []).append(m.group(1))
         if "All the end-to-end checks passed" in line:
             info["e2e_passed"] = True
+        if "All the upgrade checks passed" in line:
+            info["upgrade_passed"] = True
         if "SKIPPED" in line and "Module examples" in line:
             info["e2e_partial"] = True
         m = re.search(r"Creating instance \S+ \(PostgreSQL (\d+)", line)
@@ -136,10 +143,10 @@ def area_results(tests, pattern):
     return [result for name, result in tests.items() if re.search(pattern, name)]
 
 
-def e2e_mark(info):
-    if "FAIL" in info.get("e2e", []):
+def e2e_mark(info, checks="e2e"):
+    if "FAIL" in info.get(checks, []):
         return FAIL
-    return PASS if info.get("e2e_passed") else NONE
+    return PASS if info.get(checks + "_passed") else NONE
 
 
 def version_key(version):
@@ -195,6 +202,9 @@ def main():
             for v in versions
         ])
     rows.append([E2E] + [merge(e2e_mark(jobs[(v, c)][1]) for c in clis if (v, c) in jobs) for v in versions])
+    rows.append(
+        [UPGRADE] + [merge(e2e_mark(jobs[(v, c)][1], "upgrade") for c in clis if (v, c) in jobs) for v in versions]
+    )
     counts = []
     for v in versions:
         found = {tuple(jobs[(v, c)][1]["parameters"].get("superuser", [])) for c in clis if (v, c) in jobs}
