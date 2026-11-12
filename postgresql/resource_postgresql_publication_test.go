@@ -949,6 +949,41 @@ func testPubTestCase(t *testing.T, precheck func(), steps []resource.TestStep) {
 	})
 }
 
+// testPubInPlace adds to the checks of the steps the one that the publication is the same
+// object as in the first step: a change which has to be done in place does not replace it.
+func testPubInPlace(steps []resource.TestStep) []resource.TestStep {
+	oid := ""
+	for i := range steps {
+		if steps[i].Check == nil {
+			continue
+		}
+		check := steps[i].Check
+		steps[i].Check = func(s *terraform.State) error {
+			if err := check(s); err != nil {
+				return err
+			}
+			rs, ok := s.RootModule().Resources[testPubResource]
+			if !ok {
+				return fmt.Errorf("Resource not found: %s", testPubResource)
+			}
+			got, err := testPubCatalog(
+				rs.Primary.Attributes[pubDatabaseAttr], rs.Primary.Attributes[pubNameAttr],
+				"SELECT oid::text FROM pg_catalog.pg_publication WHERE pubname = $1",
+			)
+			if err != nil {
+				return err
+			}
+			if oid == "" {
+				oid = got
+			} else if oid != got {
+				return fmt.Errorf("the publication has been replaced: its oid was %s and is %s", oid, got)
+			}
+			return nil
+		}
+	}
+	return steps
+}
+
 // testPubImportStep imports the publication and checks that the state is the one of the previous step.
 func testPubImportStep(ignore ...string) resource.TestStep {
 	return resource.TestStep{
@@ -1015,7 +1050,7 @@ resource "postgresql_publication" "test" {
 	step2 := config("Quoted-Pub", "owner1", `"test_schema.Quoted-Table-1", "test_schema.Quoted-Table-2"`)
 	step3 := config("Quoted Pub's \"name\"", "owner2", `"test_schema.Quoted-Table-2"`)
 
-	testPubTestCase(t, nil, []resource.TestStep{
+	testPubTestCase(t, nil, testPubInPlace([]resource.TestStep{
 		{
 			Config: step1,
 			Check: resource.ComposeTestCheckFunc(
@@ -1041,7 +1076,7 @@ resource "postgresql_publication" "test" {
 			),
 		},
 		testPubImportStep(),
-	})
+	}))
 }
 
 // testCheckIncompatibleVersion skips the test if the feature exists: the tests of the
@@ -1089,7 +1124,7 @@ func TestAccPostgresqlPublication_Descendants(t *testing.T) {
 		only = true
 	}`)
 
-	testPubTestCase(t, nil, []resource.TestStep{
+	testPubTestCase(t, nil, testPubInPlace([]resource.TestStep{
 		{
 			// the descendants are published (and not listed in `tables`)
 			Config: plain,
@@ -1142,7 +1177,7 @@ func TestAccPostgresqlPublication_Descendants(t *testing.T) {
 			Config: plain,
 			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "test_schema.chi,test_schema.grandchi,test_schema.newchi,test_schema.par"),
 		},
-	})
+	}))
 }
 
 func TestAccPostgresqlPublication_Partitioned(t *testing.T) {
@@ -1167,7 +1202,8 @@ func TestAccPostgresqlPublication_Partitioned(t *testing.T) {
 		name = "test_schema.pt"
 	}`)
 
-	testPubTestCase(t, nil, []resource.TestStep{
+	// a partitioned table can be published since PostgreSQL 13
+	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePublishViaRoot) }, testPubInPlace([]resource.TestStep{
 		{
 			// the partitioned table is in the publication, its partitions are not rows of it
 			Config: plain,
@@ -1189,7 +1225,7 @@ func TestAccPostgresqlPublication_Partitioned(t *testing.T) {
 			Config: plain,
 			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "test_schema.pt"),
 		},
-	})
+	}))
 }
 
 func TestAccPostgresqlPublication_PublishParams(t *testing.T) {
@@ -1240,7 +1276,7 @@ func TestAccPostgresqlPublication_PublishParams(t *testing.T) {
 		},
 	)
 
-	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePubTruncate) }, steps)
+	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePubTruncate) }, testPubInPlace(steps))
 }
 
 func TestAccPostgresqlPublication_ViaPartitionRoot(t *testing.T) {
@@ -1261,7 +1297,7 @@ func TestAccPostgresqlPublication_ViaPartitionRoot(t *testing.T) {
 	tables = ["test_schema.pt"]
 	publish_via_partition_root_param = false`)
 
-	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePublishViaRoot) }, []resource.TestStep{
+	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePublishViaRoot) }, testPubInPlace([]resource.TestStep{
 		{
 			// at the creation
 			Config: on,
@@ -1288,7 +1324,7 @@ func TestAccPostgresqlPublication_ViaPartitionRoot(t *testing.T) {
 			Config: on,
 			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubViaRootQuery, "true"),
 		},
-	})
+	}))
 }
 
 func TestAccPostgresqlPublication_GeneratedColumns(t *testing.T) {
@@ -1301,7 +1337,7 @@ func TestAccPostgresqlPublication_GeneratedColumns(t *testing.T) {
 	stored := testPubConfig(dbName, `publish_generated_columns = "stored"`)
 	none := testPubConfig(dbName, `publish_generated_columns = "none"`)
 
-	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePubGeneratedColumns) }, []resource.TestStep{
+	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePubGeneratedColumns) }, testPubInPlace([]resource.TestStep{
 		{
 			Config: stored,
 			Check: resource.ComposeTestCheckFunc(
@@ -1328,7 +1364,7 @@ func TestAccPostgresqlPublication_GeneratedColumns(t *testing.T) {
 			Config: testPubConfig(dbName, ""),
 			Check:  resource.TestCheckResourceAttr(testPubResource, pubGeneratedColumnsAttr, "stored"),
 		},
-	})
+	}))
 }
 
 func TestAccPostgresqlPublication_ColumnList(t *testing.T) {
@@ -1362,7 +1398,7 @@ func TestAccPostgresqlPublication_ColumnList(t *testing.T) {
 	attnames := `SELECT COALESCE(string_agg(tablename || '(' || array_to_string(attnames, ',') || ')', ';' ORDER BY tablename), '')
 		FROM pg_catalog.pg_publication_tables WHERE pubname = $1`
 
-	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePubColumnList) }, []resource.TestStep{
+	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePubColumnList) }, testPubInPlace([]resource.TestStep{
 		{
 			Config: columns1,
 			Check: resource.ComposeTestCheckFunc(
@@ -1418,7 +1454,7 @@ func TestAccPostgresqlPublication_ColumnList(t *testing.T) {
 	}`),
 			ExpectError: regexp.MustCompile(`nope`),
 		},
-	})
+	}))
 }
 
 func TestAccPostgresqlPublication_RowFilter(t *testing.T) {
@@ -1460,7 +1496,7 @@ func TestAccPostgresqlPublication_RowFilter(t *testing.T) {
 		columns = ["val", "test_column_one"]
 	}`)
 
-	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePubRowFilter) }, []resource.TestStep{
+	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePubRowFilter) }, testPubInPlace([]resource.TestStep{
 		{
 			// the plan after the apply is empty: the expression is kept as it is written
 			Config: written,
@@ -1504,7 +1540,7 @@ func TestAccPostgresqlPublication_RowFilter(t *testing.T) {
 			Config: removed,
 			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubFiltersQuery, "test_table_1=;test_table_2="),
 		},
-	})
+	}))
 }
 
 func TestAccPostgresqlPublication_Schemas(t *testing.T) {
@@ -1534,7 +1570,7 @@ func TestAccPostgresqlPublication_Schemas(t *testing.T) {
 			testCheckCompatibleVersion(t, featurePubSchema)
 			testCheckCanExecute(t, "create a publication for the tables of a schema", "CREATE PUBLICATION tf_probe_schema FOR TABLES IN SCHEMA public")
 		},
-		[]resource.TestStep{
+		testPubInPlace([]resource.TestStep{
 			{
 				Config: one,
 				Check: resource.ComposeTestCheckFunc(
@@ -1594,7 +1630,7 @@ func TestAccPostgresqlPublication_Schemas(t *testing.T) {
 				Config: tablesOnly,
 				Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubSchemasQuery, ""),
 			},
-		})
+		}))
 }
 
 func TestAccPostgresqlPublication_DropCascadeAndRemoval(t *testing.T) {
