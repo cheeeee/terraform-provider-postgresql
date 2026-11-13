@@ -1659,6 +1659,11 @@ resource "postgresql_database" "strategy_db" {
 
 	steps := []resource.TestStep{
 		{
+			// the values are case sensitive
+			Config:      dbConfig("WAL_LOG"),
+			ExpectError: regexp.MustCompile(`expected strategy to be one of`),
+		},
+		{
 			Config: dbConfig("wal_log"),
 			Check: resource.ComposeTestCheckFunc(
 				resource.TestCheckResourceAttr("postgresql_database.strategy_db", "strategy", "wal_log"),
@@ -1763,10 +1768,18 @@ resource "postgresql_database" "icu_db" {
 	icuLocaleQuery := fmt.Sprintf("SELECT COALESCE(%s, '') FROM pg_database WHERE datname = $1", testICULocaleColumn(t))
 	const providerQuery = "SELECT datlocprovider::text FROM pg_database WHERE datname = $1"
 
+	const oidQuery = "SELECT oid::text FROM pg_database WHERE datname = $1"
+	var oid string
+
 	steps := []resource.TestStep{
 		{
 			Config:      dbConfig(`icu_locale = "en-US"`),
 			ExpectError: regexp.MustCompile(`cannot be specified unless locale provider is ICU`),
+		},
+		{
+			// the values are case sensitive
+			Config:      dbConfig(`locale_provider = "ICU"`),
+			ExpectError: regexp.MustCompile(`expected locale_provider to be one of`),
 		},
 		{
 			Config: dbConfig(`locale_provider = "icu"
@@ -1800,6 +1813,24 @@ resource "postgresql_database" "icu_db" {
 				resource.TestCheckResourceAttr("postgresql_database.icu_db", "icu_locale", "fr-FR"),
 				testCheckDatabaseValue(t, "fr-FR", icuLocaleQuery, "icu_db"),
 				testCheckDatabaseValue(t, "i", providerQuery, "icu_db"),
+				func(*terraform.State) error {
+					oid = testQueryDatabase(t, oidQuery, "icu_db")
+					return nil
+				},
+			),
+		},
+		// The provider alone is set at the creation: the database is replaced.
+		{
+			Config: dbConfig(`locale_provider = "libc"`),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr("postgresql_database.icu_db", "locale_provider", "libc"),
+				testCheckDatabaseValue(t, "c", providerQuery, "icu_db"),
+				func(*terraform.State) error {
+					if got := testQueryDatabase(t, oidQuery, "icu_db"); got == oid {
+						return errors.New("the database was not replaced by the change of locale_provider")
+					}
+					return nil
+				},
 			),
 		},
 	}
@@ -1987,6 +2018,8 @@ resource "postgresql_database" "builtin_db" {
 	}
 	const providerQuery = "SELECT datlocprovider::text FROM pg_database WHERE datname = $1"
 	const localeQuery = "SELECT COALESCE(datlocale, '') FROM pg_database WHERE datname = $1"
+	const oidQuery = "SELECT oid::text FROM pg_database WHERE datname = $1"
+	var oid string
 
 	steps := []resource.TestStep{
 		{
@@ -2006,7 +2039,27 @@ resource "postgresql_database" "builtin_db" {
 		},
 		{
 			Config: dbConfig(""),
-			Check:  testCheckDatabaseValue(t, "C.UTF-8", localeQuery, "builtin_db"),
+			Check: resource.ComposeTestCheckFunc(
+				testCheckDatabaseValue(t, "C.UTF-8", localeQuery, "builtin_db"),
+				func(*terraform.State) error {
+					oid = testQueryDatabase(t, oidQuery, "builtin_db")
+					return nil
+				},
+			),
+		},
+		// builtin_locale is set at the creation: the database is replaced.
+		{
+			Config: dbConfig(`locale_provider = "builtin"
+  builtin_locale  = "C"`),
+			Check: resource.ComposeTestCheckFunc(
+				testCheckDatabaseValue(t, "C", localeQuery, "builtin_db"),
+				func(*terraform.State) error {
+					if got := testQueryDatabase(t, oidQuery, "builtin_db"); got == oid {
+						return errors.New("the database was not replaced by the change of builtin_locale")
+					}
+					return nil
+				},
+			),
 		},
 	}
 
@@ -2189,5 +2242,90 @@ func TestDatabaseStartTransactionError(t *testing.T) {
 	}
 	if err := setDBOwner(broken, d); err == nil {
 		t.Error("setDBOwner: expected the error of the failed transaction")
+	}
+}
+
+// lc_collate and lc_ctype are set at the creation: a change of either one replaces the database.
+func TestAccPostgresqlDatabase_CollateCTypeReplace(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbConfig := func(collate, ctype string) string {
+		return fmt.Sprintf(`
+resource "postgresql_database" "collate_db" {
+  name       = "collate_db"
+  template   = "template0"
+  encoding   = "UTF8"
+  lc_collate = %q
+  lc_ctype   = %q
+}
+`, collate, ctype)
+	}
+	const oidQuery = "SELECT oid::text FROM pg_database WHERE datname = $1"
+	const collateQuery = "SELECT datcollate || ' ' || datctype FROM pg_database WHERE datname = $1"
+	var oid string
+	step := func(collate, ctype string, replaced bool) resource.TestStep {
+		return resource.TestStep{
+			Config: dbConfig(collate, ctype),
+			Check: resource.ComposeTestCheckFunc(
+				testCheckDatabaseValue(t, collate+" "+ctype, collateQuery, "collate_db"),
+				func(*terraform.State) error {
+					got := testQueryDatabase(t, oidQuery, "collate_db")
+					if replaced && got == oid {
+						return errors.New("the database was not replaced")
+					}
+					oid = got
+					return nil
+				},
+			),
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			step("C", "C", false),
+			step("en_US.UTF-8", "C", true),
+			step("en_US.UTF-8", "en_US.UTF-8", true),
+		},
+	})
+}
+
+// collation_version is Computed: left out, it is read from the server and the plan stays empty.
+func TestAccPostgresqlDatabase_CollationVersionComputed(t *testing.T) {
+	skipIfNotAcc(t)
+	testSkipIfOlderThan(t, 150000, "collation_version")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlDatabaseDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_database" "collation_computed_db" {
+  name              = "collation_computed_db"
+  locale_provider   = "icu"
+  icu_locale        = "en-US"
+}
+`,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttrSet("postgresql_database.collation_computed_db", "collation_version"),
+					func(s *terraform.State) error {
+						want := testQueryDatabase(t, "SELECT datcollversion FROM pg_database WHERE datname = $1", "collation_computed_db")
+						return resource.TestCheckResourceAttr("postgresql_database.collation_computed_db", "collation_version", want)(s)
+					},
+				),
+			},
+		},
+	})
+}
+
+// Without a raw configuration (null), configCollationVersion returns an empty version.
+func TestConfigCollationVersionNullConfig(t *testing.T) {
+	d := resourcePostgreSQLDatabase().TestResourceData()
+	if got := configCollationVersion(d); got != "" {
+		t.Fatalf("expected an empty collation version, got %q", got)
 	}
 }
