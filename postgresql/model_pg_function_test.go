@@ -335,4 +335,16 @@ AS $function$SELECT 1$function$;`, createFunctionSQL(&f, false))
 
 	f = PGFunction{Schema: "public", Name: "f", Returns: "integer", Language: "sql", SQLBody: "RETURN 1", Volatility: "VOLATILE", Parallel: "UNSAFE"}
 	assert.Contains(t, createFunctionSQL(&f, false), "\nRETURN 1;")
+
+	// COST is left out when it is the default of the language: 1 for c and internal, 100 for the others
+	f = PGFunction{Schema: "public", Name: "f", Returns: "boolean", Language: "c", ObjFile: "$libdir/citext", Body: "citext_eq", Volatility: "VOLATILE", Parallel: "UNSAFE", Cost: 1}
+	assert.NotContains(t, createFunctionSQL(&f, false), "COST")
+	f.Cost = 100
+	assert.Contains(t, createFunctionSQL(&f, false), "\nCOST 100\n")
+	f = PGFunction{Schema: "public", Name: "f", Returns: "integer", Language: "internal", Body: "int4pl", Volatility: "VOLATILE", Parallel: "UNSAFE", Cost: 1}
+	assert.NotContains(t, createFunctionSQL(&f, false), "COST")
+	f = PGFunction{Schema: "public", Name: "f", Returns: "integer", Language: "plpgsql", Body: "BEGIN RETURN 1; END;", Volatility: "VOLATILE", Parallel: "UNSAFE", Cost: 1}
+	assert.Contains(t, createFunctionSQL(&f, false), "\nCOST 1\n")
+	f.Cost = 100
+	assert.NotContains(t, createFunctionSQL(&f, false), "COST")
 }

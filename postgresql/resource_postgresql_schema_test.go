@@ -547,8 +547,103 @@ resource "postgresql_schema" "test_policy" {
 					testAccCheckSchemaPrivilege(dbName, "tf_policy", otherRole, "USAGE", "granted"),
 				),
 			},
+			{
+				// More policies than before
+				Config: testAccPostgresqlSchemaPoliciesConfig(dbName, `
+  policy {
+    usage = true
+    role  = "`+otherRole+`"
+  }
+  policy {
+    create = true
+    role  = "`+roleName+`"
+  }`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSchemaPrivilege(dbName, "tf_policy", otherRole, "USAGE", "granted"),
+					testAccCheckSchemaPrivilege(dbName, "tf_policy", otherRole, "CREATE", "absent"),
+					testAccCheckSchemaPrivilege(dbName, "tf_policy", roleName, "CREATE", "granted"),
+				),
+			},
+			{
+				// The privileges of a role are in two blocks now
+				Config: testAccPostgresqlSchemaPoliciesConfig(dbName, `
+  policy {
+    usage = true
+    role  = "`+otherRole+`"
+  }
+  policy {
+    create = true
+    role  = "`+otherRole+`"
+  }
+  policy {
+    create = true
+    role  = "`+roleName+`"
+  }`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSchemaPrivilege(dbName, "tf_policy", otherRole, "USAGE", "granted"),
+					testAccCheckSchemaPrivilege(dbName, "tf_policy", otherRole, "CREATE", "granted"),
+					testAccCheckSchemaPrivilege(dbName, "tf_policy", roleName, "CREATE", "granted"),
+				),
+			},
+			{
+				// The same privileges in one block: nothing is revoked nor granted again, which would move
+				// the roles behind PUBLIC in the ACL of the schema
+				PreConfig: func() {
+					config := getTestConfig(t)
+					dbExecute(t, config.connStr(dbName), "GRANT USAGE ON SCHEMA tf_policy TO PUBLIC")
+				},
+				Config: testAccPostgresqlSchemaPoliciesConfig(dbName, `
+  policy {
+    usage = true
+    create = true
+    role  = "`+otherRole+`"
+  }
+  policy {
+    create = true
+    role  = "`+roleName+`"
+  }`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckSchemaPrivilege(dbName, "tf_policy", otherRole, "USAGE", "granted"),
+					testAccCheckSchemaPrivilege(dbName, "tf_policy", otherRole, "CREATE", "granted"),
+					testAccCheckSchemaPrivilege(dbName, "tf_policy", "", "USAGE", "granted"),
+					testAccCheckSchemaLastGrantee(dbName, "tf_policy", "PUBLIC"),
+				),
+			},
 		},
 	})
+}
+
+func testAccPostgresqlSchemaPoliciesConfig(database, blocks string) string {
+	return fmt.Sprintf(`
+resource "postgresql_schema" "test_policy" {
+  name     = "tf_policy"
+  database = "%s"
+%s
+}
+`, database, blocks)
+}
+
+// testAccCheckSchemaLastGrantee checks that the last item of the ACL of the schema is the one of the grantee
+// (PUBLIC for the empty role): the items are in the order of the statements which gave the privileges.
+func testAccCheckSchemaLastGrantee(database, schemaName, expected string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		client := testAccProvider.Meta().(*Client).config.NewClient(database)
+		db, err := client.Connect()
+		if err != nil {
+			return err
+		}
+
+		var last string
+		if err := db.QueryRow(`SELECT COALESCE(NULLIF(split_part(a::text, '=', 1), ''), 'PUBLIC')
+  FROM pg_catalog.pg_namespace n, unnest(n.nspacl) WITH ORDINALITY AS t(a, i)
+  WHERE n.nspname = $1 ORDER BY i DESC LIMIT 1`, schemaName).Scan(&last); err != nil {
+			return fmt.Errorf("error reading the ACL of schema %s: %w", schemaName, err)
+		}
+		if last != expected {
+			return fmt.Errorf("the last grantee of the ACL of schema %s is %s, expected %s", schemaName, last, expected)
+		}
+		return nil
+	}
 }
 
 func TestAccPostgresqlSchema_IfNotExistsFalse(t *testing.T) {
