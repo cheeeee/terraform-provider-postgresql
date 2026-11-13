@@ -3,7 +3,10 @@ package postgresql
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strings"
@@ -2599,6 +2602,7 @@ func TestAccPostgresqlGrantFunctionSignatures(t *testing.T) {
 		"f_named(IN a text, b double precision)",
 		"f_qualified(a test_sig_schema.mytype)",
 		"f_array(a integer[])",
+		"f_twoword(a double precision)",
 		`f_quoted(a test_sig_schema."My Type")`,
 		"f_over(a integer)",
 		"f_over(a text)",
@@ -2617,6 +2621,7 @@ func TestAccPostgresqlGrantFunctionSignatures(t *testing.T) {
 		{"f_named(IN a text, b double precision)", "test_sig_schema.f_named(text,double precision)"},
 		{"f_qualified(test_sig_schema.mytype)", "test_sig_schema.f_qualified(test_sig_schema.mytype)"},
 		{"f_array(integer[])", "test_sig_schema.f_array(integer[])"},
+		{"f_twoword(double precision)", "test_sig_schema.f_twoword(double precision)"},
 		{`f_quoted(test_sig_schema.\"My Type\")`, `test_sig_schema.f_quoted(test_sig_schema."My Type")`},
 		{"f_over(integer)", "test_sig_schema.f_over(integer)"},
 	}
@@ -3182,6 +3187,562 @@ func TestAccPostgresqlGrantGrantedByOtherRole(t *testing.T) {
 				Config:  config(`["SELECT", "UPDATE"]`),
 				Destroy: true,
 				Check:   testGrantedByACL(t, "test_gb_owner:INSERT", "test_gb_owner:SELECT", "test_gb_owner:UPDATE"),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantFunctionSignatureMixed grants a function given with its signature and one given by its
+// name: the revoke of the privilege of the first one, outside of Terraform, must be seen, and undone by the
+// apply, although the second one still has the privilege.
+func TestAccPostgresqlGrantFunctionSignatureMixed(t *testing.T) {
+	skipIfNotAcc(t)
+	defer testSetupOverloads(t)()
+	dsn := testPostgresDSN(t)
+	dbExecute(t, dsn, "CREATE FUNCTION test_ov_schema.f_one() RETURNS int AS $$ select 1 $$ LANGUAGE SQL")
+	dbExecute(t, dsn, "REVOKE ALL ON FUNCTION test_ov_schema.f_one() FROM PUBLIC")
+
+	config := `
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_ov_role"
+  schema      = "test_ov_schema"
+  object_type = "function"
+  privileges  = ["EXECUTE"]
+  objects     = ["f_ov(integer)", "f_one"]
+}
+`
+	checkBoth := func(*terraform.State) error {
+		if err := testFunctionPrivilege(t, "test_ov_role", "test_ov_schema.f_ov(integer)", true); err != nil {
+			return err
+		}
+		return testFunctionPrivilege(t, "test_ov_role", "test_ov_schema.f_one()", true)
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{Config: config, Check: checkBoth},
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "REVOKE EXECUTE ON FUNCTION test_ov_schema.f_ov(integer) FROM test_ov_role")
+				},
+				// one refresh only (a plan and its refreshes would read the state which the first one changed)
+				Config: config,
+				Check:  checkBoth,
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantFunctionOutArguments grants a function and a procedure given with an OUT argument, next to
+// another one whose input arguments are the arguments with their OUT: PostgreSQL ignores the OUT arguments, so
+// the grant (and the read of its privileges) is on the one which has the input arguments only.
+func TestAccPostgresqlGrantFunctionOutArguments(t *testing.T) {
+	skipIfNotAcc(t)
+
+	for _, kind := range []string{"function", "procedure"} {
+		t.Run(kind, func(t *testing.T) {
+			dsn := testPostgresDSN(t)
+			if kind == "procedure" {
+				// before the setup, which creates a procedure with an OUT argument
+				var version int
+				conn, err := sql.Open("postgres", dsn)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer closeDB(t, conn)
+				if err := conn.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
+					t.Fatal(err)
+				}
+				if version < 140000 {
+					t.Skipf("a procedure has OUT arguments since PostgreSQL 14, not in %d", version)
+				}
+			}
+			dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_out_role LOGIN PASSWORD '%s'", testRolePassword))
+			dbExecute(t, dsn, "CREATE SCHEMA test_out_schema")
+			dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_out_schema TO test_out_role")
+			if kind == "function" {
+				dbExecute(t, dsn, "CREATE FUNCTION test_out_schema.f(a integer, OUT b integer) AS $$ select 1 $$ LANGUAGE SQL")
+				dbExecute(t, dsn, "CREATE FUNCTION test_out_schema.f(a integer, b integer) RETURNS integer AS $$ select 1 $$ LANGUAGE SQL")
+			} else {
+				dbExecute(t, dsn, "CREATE PROCEDURE test_out_schema.f(a integer, OUT b integer) AS $$ begin b := 1; end $$ LANGUAGE plpgsql")
+				dbExecute(t, dsn, "CREATE PROCEDURE test_out_schema.f(a integer, b integer) AS $$ select 1 $$ LANGUAGE SQL")
+			}
+			dbExecute(t, dsn, "REVOKE ALL ON ALL ROUTINES IN SCHEMA test_out_schema FROM PUBLIC")
+			defer func() {
+				dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_out_schema CASCADE")
+				dbExecute(t, dsn, "DROP ROLE IF EXISTS test_out_role")
+			}()
+
+			config := fmt.Sprintf(`
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_out_role"
+  schema      = "test_out_schema"
+  object_type = "%s"
+  privileges  = ["EXECUTE"]
+  objects     = ["f(IN a integer, OUT b integer)"]
+}
+`, kind)
+			check := func(*terraform.State) error {
+				if err := testFunctionPrivilege(t, "test_out_role", "test_out_schema.f(integer)", true); err != nil {
+					return err
+				}
+				return testFunctionPrivilege(t, "test_out_role", "test_out_schema.f(integer,integer)", false)
+			}
+			resource.Test(t, resource.TestCase{
+				PreCheck: func() {
+					testAccPreCheck(t)
+					testCheckCompatibleVersion(t, featurePrivileges)
+					if kind == "procedure" {
+						testCheckCompatibleVersion(t, featureProcedure)
+					}
+				},
+				Providers: testAccProviders,
+				Steps: []resource.TestStep{
+					// the apply leaves nothing to change: the privileges are read from the right object
+					{Config: config, Check: check},
+					{
+						PreConfig: func() {
+							dbExecute(t, dsn, fmt.Sprintf("REVOKE EXECUTE ON %s test_out_schema.f(integer) FROM test_out_role", strings.ToUpper(kind)))
+						},
+						Config:             config,
+						PlanOnly:           true,
+						ExpectNonEmptyPlan: true,
+					},
+					{Config: config, Check: check},
+				},
+			})
+		})
+	}
+}
+
+// TestAccPostgresqlGrantFunctionUnknownSignature checks the error of a function which does not exist, given
+// with its argument types: the one of PostgreSQL, not one about an OID.
+func TestAccPostgresqlGrantFunctionUnknownSignature(t *testing.T) {
+	skipIfNotAcc(t)
+	defer testSetupOverloads(t)()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_ov_role"
+  schema      = "test_ov_schema"
+  object_type = "function"
+  privileges  = ["EXECUTE"]
+  objects     = ["f_ov(boolean)"]
+}
+`,
+				ExpectError: regexp.MustCompile(`function .*f_ov\(boolean\) does not exist`),
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlResolveFunctionSignature resolves signatures against the catalogs of the server.
+func TestAccPostgresqlResolveFunctionSignature(t *testing.T) {
+	skipIfNotAcc(t)
+	defer testSetupOverloads(t)()
+	dbExecute(t, testPostgresDSN(t), "CREATE FUNCTION test_ov_schema.f_one() RETURNS int AS $$ select 1 $$ LANGUAGE SQL")
+
+	db, err := sql.Open("postgres", testPostgresDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeDB(t, db)
+	for signature, want := range map[string]string{
+		"f_ov(integer)":    "test_ov_schema.f_ov(integer)",
+		" f_ov(a text) ":   "test_ov_schema.f_ov(text)",
+		"f_ov(integer, )":  "test_ov_schema.f_ov(integer)", // an empty argument is ignored
+		"f_one()":          "test_ov_schema.f_one()",
+		"f_one( )":         "test_ov_schema.f_one()",
+		"f_ov(boolean)":    "",
+		"f_one(IN)":        "", // IN is the name of a type here, not a mode
+		"f_one":            "",
+		"f_ov(integer":     "",
+		"f_ov integer)":    "",
+		"f_ov(integer))":   "",
+		"f_ov(no_such_t)":  "",
+		"f_nothing(text)":  "",
+		"(integer)":        "", // no name
+		"f_ov(text, text)": "",
+	} {
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		oid, err := resolveFunctionSignature(txn, "test_ov_schema", signature)
+		if err != nil {
+			t.Errorf("resolveFunctionSignature(%q): %v", signature, err)
+		}
+		got := ""
+		if oid != "" {
+			if err := txn.QueryRow("SELECT $1::oid::regprocedure::text", oid).Scan(&got); err != nil {
+				t.Errorf("resolveFunctionSignature(%q) returned %q: %v", signature, oid, err)
+			}
+		}
+		if got != want {
+			t.Errorf("resolveFunctionSignature(%q) = %q, want %q", signature, got, want)
+		}
+		_ = txn.Rollback()
+	}
+}
+
+// A malformed signature is refused before any query: there is no transaction to use.
+func TestResolveFunctionSignatureMalformed(t *testing.T) {
+	for _, signature := range []string{"f", "f(integer", "f integer)", "abc)", ""} {
+		if oid, err := resolveFunctionSignature(nil, "s", signature); oid != "" || err != nil {
+			t.Errorf("resolveFunctionSignature(%q) = %q, %v, want no function and no error", signature, oid, err)
+		}
+	}
+}
+
+func TestSplitTopLevel(t *testing.T) {
+	for in, want := range map[string][]string{
+		"":                                  nil,
+		"  ":                                nil,
+		"integer":                           {"integer"},
+		"a, b":                              {"a", " b"},
+		"a,":                                {"a", ""},
+		"varchar(10), numeric(10,2)":        {"varchar(10)", " numeric(10,2)"},
+		"integer[], int4range[2,3]":         {"integer[]", " int4range[2,3]"},
+		`"a,b" integer, c`:                  {`"a,b" integer`, " c"},
+		`"a""," integer, "(" text, d text)`: {`"a""," integer`, ` "(" text`, " d text)"},
+	} {
+		got := splitTopLevel(in)
+		if strings.Join(got, "|") != strings.Join(want, "|") || len(got) != len(want) {
+			t.Errorf("splitTopLevel(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFirstTokenEnd(t *testing.T) {
+	for in, want := range map[string]int{
+		"":                       0,
+		"integer":                7,
+		"a integer":              1,
+		"a\tinteger":             1,
+		"a\ninteger":             1,
+		"varchar(10) x":          11,
+		"numeric(10, 2) x":       14,
+		`"my arg" integer`:       8,
+		`"my ""x"" arg" integer`: 14,
+		`"(" integer`:            3,
+	} {
+		if got := firstTokenEnd(in); got != want {
+			t.Errorf("firstTokenEnd(%q) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+// A word which is a mode is a mode only when a type follows it. No query is needed for these.
+func TestParseFunctionArgumentWithoutQuery(t *testing.T) {
+	for in, want := range map[string][2]string{
+		"integer":            {"", "integer"},
+		"IN":                 {"", "IN"},
+		"out":                {"", "out"},
+		"OUT integer":        {"OUT", "integer"},
+		"inout  integer[]":   {"INOUT", "integer[]"},
+		"VARIADIC integer[]": {"VARIADIC", "integer[]"},
+		`IN "a b" integer`:   {"IN", `integer`},
+		"":                   {"", ""},
+	} {
+		if in == `IN "a b" integer` {
+			continue // a name and a type need a query to be told from a type of two words
+		}
+		mode, argType, err := parseFunctionArgument(nil, in)
+		if err != nil || mode != want[0] || argType != want[1] {
+			t.Errorf("parseFunctionArgument(%q) = %q, %q, %v, want %q, %q", in, mode, argType, err, want[0], want[1])
+		}
+	}
+}
+
+// fakeDriver is a database/sql driver which fails the statements named by failOn (a prefix of the query).
+type fakeDriver struct{ failOn []string }
+
+type fakeConn struct{ d *fakeDriver }
+type fakeStmt struct {
+	c     *fakeConn
+	query string
+}
+type fakeRows struct{ done bool }
+type fakeTx struct{}
+
+func (d *fakeDriver) Open(string) (driver.Conn, error) { return &fakeConn{d}, nil }
+func (c *fakeConn) Prepare(query string) (driver.Stmt, error) {
+	return &fakeStmt{c, query}, nil
+}
+func (c *fakeConn) Close() error              { return nil }
+func (c *fakeConn) Begin() (driver.Tx, error) { return fakeTx{}, nil }
+func (fakeTx) Commit() error                  { return nil }
+func (fakeTx) Rollback() error                { return nil }
+func (s *fakeStmt) Close() error              { return nil }
+func (s *fakeStmt) NumInput() int             { return -1 }
+func (s *fakeStmt) fail() error {
+	for _, prefix := range s.c.d.failOn {
+		if strings.HasPrefix(s.query, prefix) {
+			return errors.New("fake failure of " + prefix)
+		}
+	}
+	return nil
+}
+func (s *fakeStmt) Exec([]driver.Value) (driver.Result, error) {
+	return driver.ResultNoRows, s.fail()
+}
+func (s *fakeStmt) Query([]driver.Value) (driver.Rows, error) {
+	if err := s.fail(); err != nil {
+		return nil, err
+	}
+	return &fakeRows{}, nil
+}
+func (r *fakeRows) Columns() []string { return []string{"v"} }
+func (r *fakeRows) Close() error      { return nil }
+func (r *fakeRows) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	dest[0] = "42"
+	return nil
+}
+
+// TestSoftQueryStringErrors checks which failures softQueryString reports: a failing statement is not one,
+// as the savepoint is rolled back, but a savepoint which cannot be rolled back is.
+func TestSoftQueryStringErrors(t *testing.T) {
+	for name, tc := range map[string]struct {
+		failOn  []string
+		wantOK  bool
+		wantErr bool
+	}{
+		"no failure":                   {nil, true, false},
+		"failing statement":            {[]string{"SELECT"}, false, false},
+		"failing savepoint":            {[]string{"SAVEPOINT"}, false, true},
+		"failing release":              {[]string{"RELEASE"}, false, true},
+		"failing statement + rollback": {[]string{"SELECT", "ROLLBACK"}, false, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			driverName := "tfpg-fake-" + strings.ReplaceAll(name, " ", "-")
+			sql.Register(driverName, &fakeDriver{failOn: tc.failOn})
+			db, err := sql.Open(driverName, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			txn, err := db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			value, ok, err := softQueryString(txn, "SELECT 1", "x")
+			if (err != nil) != tc.wantErr || ok != tc.wantOK {
+				t.Errorf("softQueryString = %q, %v, %v, want ok %v, error %v", value, ok, err, tc.wantOK, tc.wantErr)
+			}
+			if tc.wantOK && value != "42" {
+				t.Errorf("softQueryString returned %q, want 42", value)
+			}
+		})
+	}
+}
+
+// TestAccPostgresqlGrantSchemaDroppedOutside drops, outside of Terraform, the schema of a grant on its tables: the
+// grant is not there any more, the plan creates it again.
+func TestAccPostgresqlGrantSchemaDroppedOutside(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dsn := testPostgresDSN(t)
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_sd_role LOGIN PASSWORD '%s'", testRolePassword))
+	createSchema := func() {
+		dbExecute(t, dsn, "CREATE SCHEMA test_sd_schema")
+		dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_sd_schema TO test_sd_role")
+		dbExecute(t, dsn, "CREATE TABLE test_sd_schema.t (a int)")
+	}
+	createSchema()
+	defer func() {
+		dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_sd_schema CASCADE")
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS test_sd_role")
+	}()
+
+	config := `
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_sd_role"
+  schema      = "test_sd_schema"
+  object_type = "table"
+  privileges  = ["SELECT"]
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{Config: config},
+			{
+				PreConfig:          func() { dbExecute(t, dsn, "DROP SCHEMA test_sd_schema CASCADE") },
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				PreConfig: createSchema,
+				Config:    config,
+				Check: func(*terraform.State) error {
+					db := connectAsTestRole(t, "test_sd_role", "postgres")
+					defer closeDB(t, db)
+					return testHasGrantForQuery(db, "SELECT 1 FROM test_sd_schema.t", true)
+				},
+			},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantSchemaOfObjectTypeWithoutSchema gives a schema which does not exist to a grant on an
+// object which does not belong to a schema: the schema is not looked for.
+func TestAccPostgresqlGrantSchemaOfObjectTypeWithoutSchema(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dsn := testPostgresDSN(t)
+	dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_ns_role LOGIN PASSWORD '%s'", testRolePassword))
+	defer dbExecute(t, dsn, "DROP ROLE IF EXISTS test_ns_role")
+
+	config := `
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_ns_role"
+  schema      = "test_ns_no_such_schema"
+  object_type = "database"
+  privileges  = ["CONNECT"]
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{Config: config, Check: resource.TestCheckResourceAttr("postgresql_grant.test", "privileges.#", "1")},
+			{Config: config, PlanOnly: true},
+		},
+	})
+}
+
+// TestAccPostgresqlGrantGrantedByReplace changes the grantor: the privileges of the first one are revoked, the
+// resource is replaced and does not leave the grant of the former grantor.
+func TestAccPostgresqlGrantGrantedByReplace(t *testing.T) {
+	skipIfNotAcc(t)
+	skipIfNotSuperuser(t)
+
+	dsn := testPostgresDSN(t)
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testSkipUnlessGrantedBy(t)
+			t.Cleanup(testSetupGrantedBy(t))
+			dbExecute(t, dsn, "GRANT SELECT ON test_gb_schema.t TO test_gb_grantor WITH GRANT OPTION")
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: testGrantedByConfig("test_gb_owner", `["SELECT"]`),
+				Check:  testGrantedByACL(t, "test_gb_owner:SELECT"),
+			},
+			{
+				Config: testGrantedByConfig("test_gb_grantor", `["SELECT"]`),
+				Check:  testGrantedByACL(t, "test_gb_grantor:SELECT"),
+			},
+		},
+	})
+}
+
+// TestGrantedByRequiresNew checks that the plan replaces the grant when its grantor changes: the grantor is the
+// one whose privileges are revoked by the destruction.
+func TestGrantedByRequiresNew(t *testing.T) {
+	r := resourcePostgreSQLGrant()
+	state := &terraform.InstanceState{
+		ID: "r_d_s_table",
+		Attributes: map[string]string{
+			"id":                "r_d_s_table",
+			"database":          "d",
+			"role":              "r",
+			"schema":            "s",
+			"object_type":       "table",
+			"granted_by":        "first",
+			"with_grant_option": "false",
+			"privileges.#":      "1",
+			fmt.Sprintf("privileges.%d", schema.HashString("SELECT")): "SELECT",
+		},
+	}
+	for grantedBy, wantReplace := range map[string]bool{"first": false, "second": true} {
+		config := terraform.NewResourceConfigRaw(map[string]any{
+			"database":    "d",
+			"role":        "r",
+			"schema":      "s",
+			"object_type": "table",
+			"granted_by":  grantedBy,
+			"privileges":  []any{"SELECT"},
+		})
+		diff, err := r.Diff(context.Background(), state, config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := diff != nil && diff.RequiresNew(); got != wantReplace {
+			t.Errorf("granted_by %q: the plan replaces the grant: %v, expected %v", grantedBy, got, wantReplace)
+		}
+	}
+}
+
+// TestAccPostgresqlGrantFunctionDroppedOutside drops, outside of Terraform, a function which the configuration
+// grants with its signature: reading it is not an error (there is nothing to read), and the apply which follows
+// the creation of a new function grants it again.
+func TestAccPostgresqlGrantFunctionDroppedOutside(t *testing.T) {
+	skipIfNotAcc(t)
+	defer testSetupOverloads(t)()
+	dsn := testPostgresDSN(t)
+
+	config := `
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_ov_role"
+  schema      = "test_ov_schema"
+  object_type = "function"
+  privileges  = ["EXECUTE"]
+  objects     = ["f_ov(integer)"]
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{Config: config, Check: testCheckOverloads(t, true, false)},
+			{
+				PreConfig: func() { dbExecute(t, dsn, "DROP FUNCTION test_ov_schema.f_ov(integer)") },
+				Config:    config,
+				PlanOnly:  true,
+			},
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "CREATE FUNCTION test_ov_schema.f_ov(a integer) RETURNS int AS $$ select 1 $$ LANGUAGE SQL")
+					dbExecute(t, dsn, "REVOKE ALL ON FUNCTION test_ov_schema.f_ov(integer) FROM PUBLIC")
+				},
+				Config: config,
+				Check:  testCheckOverloads(t, true, false),
 			},
 		},
 	})

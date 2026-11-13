@@ -661,7 +661,7 @@ WHERE grantee = $2` + grantorClause(d, "") + `
 		if !strings.Contains(signature, "(") {
 			continue
 		}
-		oid, err := resolveFunctionSignature(txn, d.Get("schema").(string), d.Get("object_type").(string), signature)
+		oid, err := resolveFunctionSignature(txn, d.Get("schema").(string), signature)
 		if err != nil {
 			return false, err
 		}
@@ -686,7 +686,7 @@ WHERE grantee = $2` + grantorClause(d, "") + `
 // resolveFunctionSignature returns the OID (as a string) of the function, procedure or routine written
 // `name(argument list)` in the schema, or "" when there is none. The argument list is what a GRANT accepts:
 // argument modes and names are dropped and PostgreSQL resolves the types, ignoring their modifiers.
-func resolveFunctionSignature(txn *sql.Tx, schemaName, objectType, signature string) (string, error) {
+func resolveFunctionSignature(txn *sql.Tx, schemaName, signature string) (string, error) {
 	signature = strings.TrimSpace(signature)
 	open := strings.Index(signature, "(")
 	if open < 0 || !strings.HasSuffix(signature, ")") {
@@ -694,39 +694,26 @@ func resolveFunctionSignature(txn *sql.Tx, schemaName, objectType, signature str
 	}
 	name := signature[:open]
 
-	// The OUT arguments are not part of the identity of a function, but they are one of a procedure
-	// (PostgreSQL 14 and above): a procedure is looked for with them, then without them.
-	withOut := []string{}
-	withoutOut := []string{}
+	// The OUT arguments are dropped, for a function and for a procedure: GRANT ON PROCEDURE p(IN a int, OUT b int)
+	// designates the procedure of the input arguments (a int), not a procedure p(int, int) which could exist too.
+	types := []string{}
 	for _, arg := range splitTopLevel(signature[open+1 : len(signature)-1]) {
 		mode, argType, err := parseFunctionArgument(txn, arg)
 		if err != nil {
 			return "", err
 		}
-		if argType == "" {
+		if argType == "" || mode == "OUT" {
 			continue
 		}
-		withOut = append(withOut, argType)
-		if mode != "OUT" {
-			withoutOut = append(withoutOut, argType)
-		}
+		types = append(types, argType)
 	}
 
-	candidates := [][]string{withoutOut}
-	if objectType != "function" && len(withOut) != len(withoutOut) {
-		candidates = [][]string{withOut, withoutOut}
+	qualified := fmt.Sprintf("%s.%s(%s)", pq.QuoteIdentifier(schemaName), pq.QuoteIdentifier(name), strings.Join(types, ","))
+	oid, ok, err := softQueryString(txn, "SELECT to_regprocedure($1)::oid::text", qualified)
+	if err != nil || !ok {
+		return "", err
 	}
-	for _, types := range candidates {
-		qualified := fmt.Sprintf("%s.%s(%s)", pq.QuoteIdentifier(schemaName), pq.QuoteIdentifier(name), strings.Join(types, ","))
-		oid, ok, err := softQueryString(txn, "SELECT to_regprocedure($1)::oid::text", qualified)
-		if err != nil {
-			return "", err
-		}
-		if ok && oid != "" {
-			return oid, nil
-		}
-	}
-	return "", nil
+	return oid, nil
 }
 
 // splitTopLevel splits a list at the commas which are neither in parentheses or brackets nor in a quoted identifier.
@@ -1155,7 +1142,7 @@ JOIN pg_roles ON pg_roles.oid = proowner
 WHERE nspname = $1 AND proname = $2`
 			args := []any{schemaName, name}
 			if strings.Contains(name, "(") {
-				oid, err := resolveFunctionSignature(txn, schemaName, objectType, name)
+				oid, err := resolveFunctionSignature(txn, schemaName, name)
 				if err != nil {
 					return nil, err
 				}
