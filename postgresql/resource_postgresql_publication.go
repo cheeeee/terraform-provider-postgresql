@@ -301,9 +301,6 @@ type pubTable struct {
 	// only is true for ONLY (the descendants are not published), star is true to
 	// write the descendants explicitly (*)
 	only, star bool
-	// onlyKnown is false for the tables read from the catalog whose descendants
-	// can not tell ONLY from the default (no descendants, partitioned table)
-	onlyKnown  bool
 	columns    []string
 	filter     string
 	filterNorm string
@@ -585,26 +582,19 @@ func pubTablesFromRels(txn *sql.Tx, rels []pubRel, explicit, priorOnly map[int64
 		}
 		sort.Strings(t.columns)
 		// The descendants which are not tables of the configuration themselves tell ONLY from the default.
-		own, missing, unexplained := 0, 0, 0
+		// Without any (no descendants, a partitioned table), ONLY is what the configuration says.
+		missing, unexplained := 0, 0
 		for _, o := range descendants[r.oid] {
 			if explicit[o] {
 				continue
 			}
-			own++
 			if !inPub[o] {
 				missing++
 			} else if len(publishers[o]) == 0 {
 				unexplained++
 			}
 		}
-		if own > 0 {
-			t.onlyKnown = true
-			if explicit[r.oid] && priorOnly[r.oid] && unexplained == 0 {
-				t.only = true
-			} else {
-				t.only = missing > 0
-			}
-		}
+		t.only = missing > 0 || (priorOnly[r.oid] && unexplained == 0)
 		tables = append(tables, t)
 	}
 	return tables, nil
@@ -1087,7 +1077,7 @@ func readPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubNam
 	blocksMode := d.Get(pubTableAttr).(*schema.Set).Len() > 0
 
 	// What the configuration says about the tables: the descendants asked explicitly,
-	// the name of the table, ONLY when it can not be read, the row filter as written.
+	// the name of the table, ONLY as long as the rows agree with it, the row filter as written.
 	explicit := map[int64]bool{}
 	priorOnly := map[int64]bool{}
 	prior := map[int64]pubTable{}
@@ -1123,19 +1113,15 @@ func readPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubNam
 		name := pubTableDisplayName(txn, d, t)
 		names = append(names, name)
 
-		only := t.only
 		filter := t.filter
 		if p, ok := prior[t.oid]; ok {
-			if !t.onlyKnown {
-				only = p.only
-			}
 			// the row filter as written, as long as PostgreSQL has the form it had given for it
 			if p.filter != "" && (p.filterNorm == "" || p.filterNorm == t.filter) {
 				filter = p.filter
 			}
 		}
 		// without blocks in the configuration only the tables with options are listed in blocks
-		if !blocksMode && len(t.columns) == 0 && t.filter == "" && !(t.onlyKnown && t.only) {
+		if !blocksMode && len(t.columns) == 0 && t.filter == "" && !t.only {
 			continue
 		}
 		columns := make([]any, len(t.columns))
@@ -1144,7 +1130,7 @@ func readPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubNam
 		}
 		blocks = append(blocks, map[string]any{
 			pubTableNameAttr:          name,
-			pubTableOnlyAttr:          only,
+			pubTableOnlyAttr:          t.only,
 			pubTableColumnsAttr:       columns,
 			pubTableRowFilterAttr:     filter,
 			pubTableRowFilterNormAttr: t.filter,

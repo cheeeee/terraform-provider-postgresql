@@ -3324,6 +3324,66 @@ resource "postgresql_grant" "test" {
 	}
 }
 
+// The types of all the arguments designate a procedure or a routine, never a function, and only when
+// the signature has no OUT argument: with one, PostgreSQL looks for the input arguments only.
+func TestAccPostgresqlResolveRoutineAllArgumentTypes(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dsn := testPostgresDSN(t)
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeDB(t, db)
+	var version int
+	if err := db.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version < 140000 {
+		t.Skipf("a procedure has OUT arguments since PostgreSQL 14, not in %d", version)
+	}
+	dbExecute(t, dsn, "CREATE SCHEMA test_allres_schema")
+	defer dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_allres_schema CASCADE")
+	dbExecute(t, dsn, "CREATE PROCEDURE test_allres_schema.p(a integer, OUT b numeric) AS $$ begin b := 1; end $$ LANGUAGE plpgsql")
+	dbExecute(t, dsn, "CREATE FUNCTION test_allres_schema.f(a integer, OUT b numeric) AS $$ select 1.0 $$ LANGUAGE SQL")
+
+	for _, test := range []struct{ objectType, signature, want string }{
+		{"procedure", "p(integer)", "test_allres_schema.p(integer)"},
+		{"procedure", "p(integer, numeric)", "test_allres_schema.p(integer)"},
+		{"routine", "p(integer, numeric)", "test_allres_schema.p(integer)"},
+		{"routine", "f(integer, numeric)", "test_allres_schema.f(integer)"},
+		{"procedure", "p(IN a integer, OUT b numeric)", "test_allres_schema.p(integer)"},
+		// not the types of all the arguments
+		{"procedure", "p(integer, text)", ""},
+		{"procedure", "p(integer, numeric, numeric)", ""},
+		// a function is not designated by its OUT arguments, and it is not a procedure
+		{"function", "f(integer, numeric)", ""},
+		{"function", "p(integer, numeric)", ""},
+		{"procedure", "f(integer, numeric)", ""},
+		// with an OUT argument the other ones are the input arguments, there is no procedure p(integer, numeric)
+		{"procedure", "p(IN integer, IN numeric, OUT text)", ""},
+	} {
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		oid, err := resolveFunctionSignature(txn, "test_allres_schema", test.objectType, test.signature)
+		if err != nil {
+			t.Errorf("%s %s: %v", test.objectType, test.signature, err)
+		}
+		got := ""
+		if oid != "" {
+			if err := txn.QueryRow("SELECT $1::oid::regprocedure::text", oid).Scan(&got); err != nil {
+				t.Errorf("%s %s returned %q: %v", test.objectType, test.signature, oid, err)
+			}
+		}
+		if got != test.want {
+			t.Errorf("%s %s = %q, want %q", test.objectType, test.signature, got, test.want)
+		}
+		_ = txn.Rollback()
+	}
+}
+
 func TestAccPostgresqlGrantFunctionOutArguments(t *testing.T) {
 	skipIfNotAcc(t)
 
