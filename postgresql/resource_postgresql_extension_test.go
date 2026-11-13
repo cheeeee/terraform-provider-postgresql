@@ -238,7 +238,7 @@ func testAccCheckExtensionAbsent(database, extName string) resource.TestCheckFun
 // older than its default version, and the default version. It skips the test if there is none.
 func testAccExtensionOldAndDefaultVersion(t *testing.T, extName string) (string, string) {
 	config := getTestConfig(t)
-	db, err := sql.Open("postgres", config.connStr("postgres"))
+	db, err := sql.Open(testDriverName, config.connStr("postgres"))
 	if err != nil {
 		t.Fatalf("could not open connection pool: %v", err)
 	}

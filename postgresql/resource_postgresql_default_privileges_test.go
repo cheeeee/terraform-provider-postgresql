@@ -476,7 +476,7 @@ var testDefaultPrivilegesClasses = []defaultPrivilegesObjectClass{
 // testServerVersionNum returns the server_version_num of the test database.
 func testServerVersionNum(t *testing.T) int {
 	config := getTestConfig(t)
-	db, err := sql.Open("postgres", config.connStr("postgres"))
+	db, err := sql.Open(testDriverName, config.connStr("postgres"))
 	if err != nil {
 		t.Fatalf("could not open connection pool: %v", err)
 	}
@@ -493,7 +493,7 @@ func testServerVersionNum(t *testing.T) int {
 // for the owner, the schema (empty for global defaults) and the object class.
 func testCheckDefaultPrivilegesACL(t *testing.T, dbName string, class defaultPrivilegesObjectClass, owner, roleName, schema string, expected []string, grantOption bool) error {
 	config := getTestConfig(t)
-	db, err := sql.Open("postgres", config.connStr(dbName))
+	db, err := sql.Open(testDriverName, config.connStr(dbName))
 	if err != nil {
 		t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
 	}
@@ -538,7 +538,7 @@ func testCheckDefaultPrivilegesACL(t *testing.T, dbName string, class defaultPri
 // privileges roleName has on an object created by the owner after the default privileges were set.
 func testCheckDefaultPrivilegesEffect(t *testing.T, dbName string, class defaultPrivilegesObjectClass, roleName string, privileges, expected []string) error {
 	config := getTestConfig(t)
-	db, err := sql.Open("postgres", config.connStr(dbName))
+	db, err := sql.Open(testDriverName, config.connStr(dbName))
 	if err != nil {
 		t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
 	}

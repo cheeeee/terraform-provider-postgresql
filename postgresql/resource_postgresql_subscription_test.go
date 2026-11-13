@@ -398,7 +398,7 @@ func newSubTest(t *testing.T) *subTest {
 // their publisher: the slot is unset first. Best effort: it is a cleanup.
 func dropSubscriptions(t *testing.T, dbName string) {
 	config := getTestConfig(t)
-	db, err := sql.Open("postgres", config.connStr(dbName))
+	db, err := sql.Open(testDriverName, config.connStr(dbName))
 	if err != nil {
 		t.Logf("cleanup: could not connect to %s: %v", dbName, err)
 		return
@@ -429,7 +429,7 @@ func dropSubscriptions(t *testing.T, dbName string) {
 // dropSlots drops the logical replication slots of the database of a server (the publisher):
 // a slot which is left blocks the DROP DATABASE. Best effort, it waits for the walsenders to stop.
 func dropSlots(t *testing.T, dsn string) {
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open(testDriverName, dsn)
 	if err != nil {
 		t.Logf("cleanup: could not connect to the publisher: %v", err)
 		return
@@ -535,7 +535,7 @@ func (s *subTest) query(dbName, query string, args ...any) (string, error) {
 }
 
 func queryDB(dsn, query string, args ...any) (string, error) {
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open(testDriverName, dsn)
 	if err != nil {
 		return "", err
 	}
@@ -1967,7 +1967,7 @@ func newRemoteTest(t *testing.T) *remoteTest {
 }
 
 func execDB(dsn, query string) error {
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open(testDriverName, dsn)
 	if err != nil {
 		return err
 	}

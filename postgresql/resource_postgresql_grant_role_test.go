@@ -144,7 +144,7 @@ func TestAccPostgresqlGrantRole(t *testing.T) {
 
 func checkGrantRole(t *testing.T, dsn, role string, grantRole string, withAdmin bool) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
-		db, err := sql.Open("postgres", dsn)
+		db, err := sql.Open(testDriverName, dsn)
 		if err != nil {
 			t.Fatalf("could to create connection pool: %v", err)
 		}
@@ -292,7 +292,7 @@ func testAccCheckRoleSetRole(t *testing.T, role, password, target string, allowe
 		config := getTestConfig(t)
 		config.Username = role
 		config.Password = password
-		db, err := sql.Open("postgres", config.connStr("postgres"))
+		db, err := sql.Open(testDriverName, config.connStr("postgres"))
 		if err != nil {
 			return fmt.Errorf("could not open SQL connection: %v", err)
 		}
@@ -778,7 +778,7 @@ func TestAccPostgresqlGrantRole_GrantorClause(t *testing.T) {
 
 	config := getTestConfig(t)
 	dsn := config.connStr("postgres")
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open(testDriverName, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}

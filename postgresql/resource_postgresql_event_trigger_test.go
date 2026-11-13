@@ -585,7 +585,7 @@ func testAccCheckEventTriggerValue(database, name, expression, expected string) 
 func testAccCheckEventTriggerFires(t *testing.T, database string, fired bool) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		config := getTestConfig(t)
-		db, err := sql.Open("postgres", config.connStr(database))
+		db, err := sql.Open(testDriverName, config.connStr(database))
 		if err != nil {
 			return err
 		}

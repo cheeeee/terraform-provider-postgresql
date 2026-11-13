@@ -128,7 +128,7 @@ func TestAccProviderAzureIdentityAuth(t *testing.T) {
 	})
 
 	// Without the token there is no way in: the server does ask for the password of this role
-	if db, err := sql.Open("postgres", fmt.Sprintf(
+	if db, err := sql.Open(testDriverName, fmt.Sprintf(
 		"host=%s port=%d user=%s password=wrong dbname=postgres sslmode=%s", config.Host, config.Port, admin, config.SSLMode)); err == nil {
 		err = db.Ping()
 		_ = db.Close()
@@ -152,7 +152,7 @@ resource "postgresql_role" "probe" {
 }`, admin, probe)
 
 	probeExists := func(*terraform.State) error {
-		db, err := sql.Open("postgres", dsn)
+		db, err := sql.Open(testDriverName, dsn)
 		if err != nil {
 			return err
 		}
