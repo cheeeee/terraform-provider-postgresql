@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/url"
@@ -858,6 +859,162 @@ func TestSecurityLabelID(t *testing.T) {
 	for _, id := range []string{"", "a.b.c", `"a.b.c.d`, `"a"b.c.d.e`} {
 		if _, err := parseSecurityLabelID(id); err == nil {
 			t.Errorf("parseSecurityLabelID(%q) did not fail", id)
+		}
+	}
+}
+
+func TestSecurityLabelIDAdversarial(t *testing.T) {
+	cases := []struct {
+		id    string
+		parts [4]string
+		fails bool
+	}{
+		// a quote in the object type position is not a quoted part
+		{`db.prov."t".name`, [4]string{"db", "prov", `"t"`, "name"}, false},
+		{`db.prov.type."x.y"`, [4]string{"db", "prov", "type", `"x.y"`}, false},
+		// a quoted part at the end of the ID, an empty quoted part, a doubled quote before the dot
+		{`"".prov.role.r`, [4]string{"", "prov", "role", "r"}, false},
+		{`"a""".prov.role.r`, [4]string{`a"`, "prov", "role", "r"}, false},
+		{`"""".prov.role.r`, [4]string{`"`, "prov", "role", "r"}, false},
+		{`db."p""q.r".role.r`, [4]string{"db", `p"q.r`, "role", "r"}, false},
+		// a quote at the end, unterminated, followed by something else than a dot
+		{`"a"`, [4]string{}, true},
+		{`"a`, [4]string{}, true},
+		{`"`, [4]string{}, true},
+		{`""`, [4]string{}, true},
+		{`db."p"`, [4]string{}, true},
+		{`db."p`, [4]string{}, true},
+		{`"a"b.c.d.e`, [4]string{}, true},
+		{`db."a"b.c.d`, [4]string{}, true},
+		{`"a""`, [4]string{}, true},
+		{`db.prov.role`, [4]string{}, true},
+	}
+	for _, c := range cases {
+		parts, err := parseSecurityLabelID(c.id)
+		if c.fails {
+			if err == nil {
+				t.Errorf("parseSecurityLabelID(%q) = %q, expected an error", c.id, parts)
+			}
+			continue
+		}
+		if err != nil || parts != c.parts {
+			t.Errorf("parseSecurityLabelID(%q) = %q, %v; expected %q", c.id, parts, err, c.parts)
+		}
+	}
+}
+
+func TestCutQuotedIDPart(t *testing.T) {
+	cases := []struct {
+		in, part, rest string
+		ok             bool
+	}{
+		{`"a".b`, "a", "b", true},
+		{`"a".`, "a", "", true},
+		{`"a.b".c.d`, "a.b", "c.d", true},
+		{`"a""b".c`, `a"b`, "c", true},
+		{`"""".c`, `"`, "c", true},
+		{`"".c`, "", "c", true},
+		{`"a"`, "", "", false},
+		{`"a`, "", "", false},
+		{`"a""`, "", "", false},
+		{`"`, "", "", false},
+		{`""`, "", "", false},
+		{`"a"b.c`, "", "", false},
+		{`"a"b`, "", "", false},
+	}
+	for _, c := range cases {
+		part, rest, ok := cutQuotedIDPart(c.in)
+		if part != c.part || rest != c.rest || ok != c.ok {
+			t.Errorf("cutQuotedIDPart(%q) = %q, %q, %v; expected %q, %q, %v", c.in, part, rest, ok, c.part, c.rest, c.ok)
+		}
+	}
+}
+
+func TestSecurityLabelImportInvalidID(t *testing.T) {
+	d := resourcePostgreSQLSecurityLabel().TestResourceData()
+	d.SetId("not-an-id")
+	if _, err := resourcePostgreSQLSecurityLabelImport(context.Background(), d, nil); err == nil {
+		t.Error("the import of an invalid ID did not fail")
+	}
+	d.SetId("db.dummy.role.r")
+	if _, err := resourcePostgreSQLSecurityLabelImport(context.Background(), d, nil); err != nil {
+		t.Errorf("the import of a valid ID failed: %v", err)
+	}
+	if got := d.Get(securityLabelObjectNameAttr).(string); got != "r" {
+		t.Errorf("object_name = %q, expected r", got)
+	}
+}
+
+func TestSecurityLabelNamesColumnAndRoutine(t *testing.T) {
+	column := securityLabelObjectTypes["column"]
+	name, lookup, raw, err := securityLabelNames(column, "t.c")
+	if err != nil || name != `"t"."c"` || lookup != `"t"` || raw != "c" {
+		t.Errorf("column t.c = %q, %q, %q, %v", name, lookup, raw, err)
+	}
+	name, lookup, raw, err = securityLabelNames(column, "s.t.c")
+	if err != nil || name != `"s"."t"."c"` || lookup != `"s"."t"` || raw != "c" {
+		t.Errorf("column s.t.c = %q, %q, %q, %v", name, lookup, raw, err)
+	}
+	if _, _, _, err := securityLabelNames(column, "c"); err == nil {
+		t.Error("a column without table did not fail")
+	}
+	for in, want := range map[string][2]string{
+		"(int)":  {"", "(int)"},
+		"(":      {"(", ""},
+		"f(int)": {"f", "(int)"},
+	} {
+		if n, sig := splitRoutineName(in); n != want[0] || sig != want[1] {
+			t.Errorf("splitRoutineName(%q) = %q, %q; expected %q, %q", in, n, sig, want[0], want[1])
+		}
+	}
+}
+
+func TestSecurityLabelSchemaFlags(t *testing.T) {
+	// no empty name among the object types, one name per type
+	if len(securityLabelObjectTypeNames) != len(securityLabelObjectTypes) {
+		t.Errorf("%d names for %d object types", len(securityLabelObjectTypeNames), len(securityLabelObjectTypes))
+	}
+	for _, n := range securityLabelObjectTypeNames {
+		if _, ok := securityLabelObjectTypes[n]; !ok {
+			t.Errorf("%q is not an object type", n)
+		}
+	}
+
+	// the object type is case-sensitive
+	validate := resourcePostgreSQLSecurityLabel().Schema[securityLabelObjectTypeAttr].ValidateFunc
+	if _, errs := validate("table", securityLabelObjectTypeAttr); len(errs) != 0 {
+		t.Errorf("table refused: %v", errs)
+	}
+	for _, v := range []string{"TABLE", "Table", ""} {
+		if _, errs := validate(v, securityLabelObjectTypeAttr); len(errs) == 0 {
+			t.Errorf("object type %q accepted", v)
+		}
+	}
+
+	// the database, the object name and the object type cannot be changed in place
+	r := resourcePostgreSQLSecurityLabel()
+	state := &terraform.InstanceState{ID: "d.dummy.table.t", Attributes: map[string]string{
+		"id": "d.dummy.table.t", securityLabelDatabaseAttr: "d", securityLabelProviderAttr: "dummy",
+		securityLabelObjectTypeAttr: "table", securityLabelObjectNameAttr: "t", securityLabelLabelAttr: "x",
+	}}
+	base := map[string]any{
+		securityLabelDatabaseAttr: "d", securityLabelProviderAttr: "dummy",
+		securityLabelObjectTypeAttr: "table", securityLabelObjectNameAttr: "t", securityLabelLabelAttr: "x",
+	}
+	for attr, value := range map[string]string{
+		securityLabelDatabaseAttr:   "other",
+		securityLabelObjectTypeAttr: "view",
+		securityLabelObjectNameAttr: "u",
+		securityLabelProviderAttr:   "other",
+	} {
+		raw := map[string]any{}
+		for k, v := range base {
+			raw[k] = v
+		}
+		raw[attr] = value
+		diff, err := r.Diff(context.Background(), state, terraform.NewResourceConfigRaw(raw), nil)
+		if err != nil || diff == nil || !diff.RequiresNew() {
+			t.Errorf("changing %s does not replace the resource (diff %v, err %v)", attr, diff, err)
 		}
 	}
 }
