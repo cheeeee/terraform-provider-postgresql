@@ -92,6 +92,14 @@ The same tests in the different environments:
 - [4] the end-to-end test needs privileges of the master user of a managed service (extensions, pgaudit), it is run without superuser on AWS RDS.
 <!-- test-matrix:end -->
 
+How the provider logs in to the managed services is tested without any cloud account on every change:
+
+| Login | Test |
+|---|---|
+| AWS RDS IAM (`aws_rds_iam_auth`, with an assumed role, a profile and `aws_rds_iam_region`) | `tests/floci_iam.sh`, against [Floci](https://github.com/floci-io/floci), a local emulator of AWS: its RDS is a PostgreSQL container behind a proxy which checks the signature, the region, the endpoint and the session of the token. The same test runs on a real RDS instance (`rds-test.yml`). |
+| Azure (`azure_identity_auth`) | `TestAcquireAzureOauthToken`, `TestAccProviderAzureIdentityAuth`: a local identity endpoint gives the token, which has to be asked for the databases of Azure and to be the password the provider logs in with. No server of Azure checks the token. |
+| Google Cloud SQL (`scheme = "gcppostgres"`) | `TestGCPConnStrInstance`: the instance and the database asked to the Cloud SQL proxy. The connection itself and `gcp_iam_impersonate_service_account` are not tested. |
+
 Requirements
 ------------
 

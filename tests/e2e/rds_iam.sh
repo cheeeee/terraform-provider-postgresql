@@ -14,6 +14,10 @@
 #   RDS_IAM_USER  name of the IAM user to create when the current credentials are the
 #                 ones of the root user of the account, which cannot assume a role
 # Everything it creates is deleted at the end (and by rds_down.sh).
+#
+# It also runs against an emulator of AWS (tests/floci_iam.sh), which checks the token like
+# RDS does but answers with another message: IAM_REFUSED is the message of a refused token.
+# PGPORT is the port of the instance, E2E_PSQL another command to run psql (see e2e_local.sh).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -25,6 +29,8 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 : "${RDS_NAME:?RDS_NAME must be set}"
 : "${RDS_IAM_ROLE:?RDS_IAM_ROLE must be set}"
 : "${RDS_IAM_USER:?RDS_IAM_USER must be set}"
+PGPORT=${PGPORT:-5432}
+IAM_REFUSED=${IAM_REFUSED:-PAM authentication failed}
 TERRAFORM=${E2E_TERRAFORM:-terraform}
 REGION=$AWS_REGION
 DB_USER=tfpg_iam_admin
@@ -34,7 +40,11 @@ RELEASED=1.28.0
 WORK=$(mktemp -d)
 
 sql() {
-    PGPASSWORD=$PGPASSWORD psql "host=$PGHOST port=5432 user=$PGUSER dbname=postgres sslmode=require" -v ON_ERROR_STOP=1 -qAt -c "$1"
+    if [ -n "${E2E_PSQL:-}" ]; then
+        $E2E_PSQL -d postgres -v ON_ERROR_STOP=1 -qAt -c "$1"
+    else
+        PGPASSWORD=$PGPASSWORD psql "host=$PGHOST port=$PGPORT user=$PGUSER dbname=postgres sslmode=require" -v ON_ERROR_STOP=1 -qAt -c "$1"
+    fi
 }
 
 delete_iam() {
@@ -154,7 +164,7 @@ provider_installation {
 }
 RC
 export TF_IN_AUTOMATION=1
-export TF_VAR_pg_host=$PGHOST TF_VAR_pg_user=$DB_USER
+export TF_VAR_pg_host=$PGHOST TF_VAR_pg_port=$PGPORT TF_VAR_pg_user=$DB_USER
 
 # use_provider [<version>]: a new directory with the configuration, for the provider built from
 # the sources or for a released version
@@ -201,7 +211,7 @@ expect_login() {
         if tf "$mode" apply -input=false -no-color -auto-approve "$@" > "$WORK/apply.txt" 2>&1; then
             break
         fi
-        if [ "$attempt" = 12 ] || ! grep -q "PAM authentication failed" "$WORK/apply.txt"; then
+        if [ "$attempt" = 12 ] || ! grep -q "$IAM_REFUSED" "$WORK/apply.txt"; then
             cat "$WORK/apply.txt"
             echo "FAIL: $name"
             exit 1
@@ -251,7 +261,7 @@ expect_error "without any region the provider says so" "could not find the AWS r
 # The role is known by the database now: a failure of the released version is not a delay of IAM
 use_provider "$RELEASED"
 expect_error "the released version $RELEASED fails with the same configuration (the bug which is fixed)" \
-    "PAM authentication failed" env -var "iam_role_arn=$role_arn" -var "iam_region=$REGION"
+    "$IAM_REFUSED" env -var "iam_role_arn=$role_arn" -var "iam_region=$REGION"
 
 echo
 echo "All the IAM authentication checks passed"
