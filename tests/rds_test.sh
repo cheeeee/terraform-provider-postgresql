@@ -26,4 +26,5 @@ export PGSUPERUSER=false
 export TEST_PUBLISHER_HOST=127.0.0.1
 
 cd "$HERE/.."
-go test ./postgresql -count=1 -v -timeout 60m -run "${RDS_TESTS:-Parameter}"
+# RDS_TEST_TIMEOUT: the whole suite needs several hours on a remote instance
+go test ./postgresql -count=1 -v -timeout "${RDS_TEST_TIMEOUT:-60m}" -run "${RDS_TESTS:-Parameter}"
