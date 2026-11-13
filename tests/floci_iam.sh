@@ -22,7 +22,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 PGVERSION=${PGVERSION:-17}
-FLOCI_IMAGE=${FLOCI_IMAGE:-floci/floci:2.4.0}
+# The image is the one of this digest (version 2.4.0): it is given the socket of Docker
+FLOCI_IMAGE=${FLOCI_IMAGE:-floci/floci:2.4.0@sha256:5ee85db604c4aa74ac76e07ea5cc83086f37bb472bf3dbb97e34019e48efae9c}
 FLOCI_PORT=${FLOCI_PORT:-4566}
 FLOCI_RDS_PORT=${FLOCI_RDS_PORT:-7001}
 CONTAINER=${FLOCI_NAME:-tfpg-floci}
