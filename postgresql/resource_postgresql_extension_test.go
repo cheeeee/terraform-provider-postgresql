@@ -443,7 +443,9 @@ func TestAccPostgresqlExtension_SchemaRename(t *testing.T) {
 }
 
 func testAccPostgresqlExtensionSetSchemaConfig(extSchemaResource string) string {
-	schemaLine := ""
+	// Without a schema in its configuration the extension stays in the schema where it is, "bar":
+	// it still has to be dropped before this schema (the two are destroyed at the same time otherwise).
+	schemaLine := "  depends_on = [postgresql_schema.bar]\n"
 	if extSchemaResource != "" {
 		schemaLine = fmt.Sprintf("  schema = postgresql_schema.%s.name\n", extSchemaResource)
 	}
