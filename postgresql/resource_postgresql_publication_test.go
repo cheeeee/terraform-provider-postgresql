@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
 
@@ -1496,6 +1497,16 @@ func TestAccPostgresqlPublication_RowFilter(t *testing.T) {
 		columns = ["val", "test_column_one"]
 	}`)
 
+	refiltered := testPubConfig(dbName, `
+	table {
+		name       = "test_schema.test_table_1"
+		row_filter = "val = 'x'"
+	}
+	table {
+		name    = "test_schema.test_table_2"
+		columns = ["val", "test_column_one"]
+	}`)
+
 	testPubTestCase(t, func() { testCheckCompatibleVersion(t, featurePubRowFilter) }, testPubInPlace([]resource.TestStep{
 		{
 			// the plan after the apply is empty: the expression is kept as it is written
@@ -1539,6 +1550,11 @@ func TestAccPostgresqlPublication_RowFilter(t *testing.T) {
 		{
 			Config: removed,
 			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubFiltersQuery, "test_table_1=;test_table_2="),
+		},
+		{
+			// a filter added to a table which has none
+			Config: refiltered,
+			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubFiltersQuery, "test_table_1=(val = 'x'::text);test_table_2="),
 		},
 	}))
 }
@@ -1783,6 +1799,12 @@ func TestAccPostgresqlPublication_ConflictingAttributes(t *testing.T) {
 			ExpectError: regexp.MustCompile(`expected publish_generated_columns to be one of`),
 			PlanOnly:    true,
 		},
+		{
+			// the values are case sensitive
+			Config:      testPubConfig(dbName, `publish_generated_columns = "Stored"`),
+			ExpectError: regexp.MustCompile(`expected publish_generated_columns to be one of`),
+			PlanOnly:    true,
+		},
 	})
 }
 
@@ -1822,4 +1844,372 @@ func TestAccPostgresqlPublication_UnsupportedClauses(t *testing.T) {
 			})
 		})
 	}
+
+	// the refusal when the publication exists
+	t.Run("schemas_update", func(t *testing.T) {
+		testPubTestCase(t, func() { testCheckIncompatibleVersion(t, featurePubSchema) }, []resource.TestStep{
+			{Config: testPubConfig(dbName, `tables = ["test_schema.test_table_1"]`)},
+			{Config: testPubConfig(dbName, `schemas = ["test_schema"]`), ExpectError: regexp.MustCompile(`schemas.*version 15`)},
+		})
+	})
+}
+
+func TestPublicationSetToStringsNil(t *testing.T) {
+	if got := publicationSetToStrings((*schema.Set)(nil)); got != nil {
+		t.Fatalf("a nil set has no elements, got %v", got)
+	}
+	if got := publicationSetToStrings(nil); got != nil {
+		t.Fatalf("no value has no elements, got %v", got)
+	}
+	if got := publicationSetToStrings(schema.NewSet(schema.HashString, []any{"a"})); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+// the inheritance fixture of the tests of the descendants: par has the descendant chi
+// which has the descendant grandchi, par1 has the only descendant chi1
+func testPubInheritanceFixture(t *testing.T, dbName string) {
+	testPubExec(t, dbName,
+		"CREATE TABLE test_schema.par (id int, val text)",
+		"CREATE TABLE test_schema.chi () INHERITS (test_schema.par)",
+		"CREATE TABLE test_schema.grandchi () INHERITS (test_schema.chi)",
+		"CREATE TABLE test_schema.par1 (id int)",
+		"CREATE TABLE test_schema.chi1 () INHERITS (test_schema.par1)",
+		"CREATE TABLE test_schema.other (id int)",
+	)
+}
+
+// a descendant asked for explicitly is a table of the configuration, not one which PostgreSQL adds with its parent
+func TestAccPostgresqlPublication_ExplicitDescendants(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	dbName, _ := getTestDBNames(dbSuffix)
+	testPubInheritanceFixture(t, dbName)
+
+	all := "test_schema.chi,test_schema.grandchi,test_schema.par"
+	parOnly := testPubConfig(dbName, `tables = ["test_schema.par"]`)
+	parAndChi := testPubConfig(dbName, `tables = ["test_schema.par", "test_schema.chi"]`)
+	blocks := testPubConfig(dbName, `
+	table {
+		name = "test_schema.par"
+	}
+	table {
+		name = "test_schema.chi"
+	}`)
+	other := testPubConfig(dbName, `
+	table {
+		name = "test_schema.other"
+	}`)
+	bothOnly := testPubConfig(dbName, `
+	table {
+		name = "test_schema.par"
+		only = true
+	}
+	table {
+		name = "test_schema.chi"
+		only = true
+	}`)
+	parOnlyBlock := testPubConfig(dbName, `
+	table {
+		name = "test_schema.par"
+		only = true
+	}`)
+
+	testPubTestCase(t, nil, testPubInPlace([]resource.TestStep{
+		{
+			Config: parOnly,
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, all),
+				resource.TestCheckResourceAttr(testPubResource, "tables.#", "1"),
+			),
+		},
+		{
+			// chi is already in the publication, with the descendants of par: nothing to do, and it is listed
+			Config: parAndChi,
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, all),
+				resource.TestCheckResourceAttr(testPubResource, "tables.#", "2"),
+			),
+		},
+		testPubImportStep("tables.", "table."),
+		{
+			// the same tables as blocks
+			Config: blocks,
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, all),
+				resource.TestCheckResourceAttr(testPubResource, "table.#", "2"),
+			),
+		},
+		{
+			// grandchi belongs to par and to chi, it is dropped once
+			Config: other,
+			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "test_schema.other"),
+		},
+		{
+			Config: bothOnly,
+			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "test_schema.chi,test_schema.par"),
+		},
+		{
+			// the descendant is removed from the configuration, the table is kept
+			Config: parOnlyBlock,
+			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "test_schema.par"),
+		},
+	}))
+}
+
+// ONLY of a table which has exactly one descendant
+func TestAccPostgresqlPublication_OneDescendant(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	dbName, _ := getTestDBNames(dbSuffix)
+	testPubInheritanceFixture(t, dbName)
+
+	only := testPubConfig(dbName, `
+	table {
+		name = "test_schema.par1"
+		only = true
+	}`)
+	star := testPubConfig(dbName, `
+	table {
+		name = "test_schema.par1"
+	}`)
+
+	testPubTestCase(t, nil, testPubInPlace([]resource.TestStep{
+		{
+			Config: only,
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "test_schema.par1"),
+				resource.TestCheckResourceAttr(testPubResource, "table.0.only", "true"),
+			),
+		},
+		// the imported table is ONLY: PostgreSQL has not added its descendant
+		testPubImportStep(),
+		{
+			Config: star,
+			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "test_schema.chi1,test_schema.par1"),
+		},
+		testPubImportStep("table.", "tables."),
+		{
+			Config: only,
+			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "test_schema.par1"),
+		},
+	}))
+}
+
+// the tables which the configuration does not change are not dropped and added again
+func TestAccPostgresqlPublication_UnchangedTablesAreKept(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	createTestTables(t, dbSuffix, []string{"test_schema.test_table_1", "test_schema.test_table_2", "test_schema.test_table_3"}, "")
+	dbName, _ := getTestDBNames(dbSuffix)
+	testPubInheritanceFixture(t, dbName)
+
+	blocks := `
+	table {
+		name = "test_schema.test_table_1"
+		only = true
+	}
+	table {
+		name       = "test_schema.test_table_2"
+		columns    = ["val", "test_column_one"]
+		row_filter = "test_column_one IS NOT NULL"
+	}
+	table {
+		name = "test_schema.par"
+	}
+	table {
+		name = "test_schema.par1"
+		only = true
+	}`
+	before := testPubConfig(dbName, blocks)
+	after := testPubConfig(dbName, blocks+`
+	table {
+		name = "test_schema.test_table_3"
+	}`)
+
+	// the rows of pg_publication_rel of the tables which are not changed
+	oids := `SELECT COALESCE(string_agg(c.relname || '=' || r.oid, ',' ORDER BY c.relname), '')
+		FROM pg_catalog.pg_publication_rel r
+		JOIN pg_catalog.pg_publication p ON p.oid = r.prpubid
+		JOIN pg_catalog.pg_class c ON c.oid = r.prrelid
+		WHERE p.pubname = $1 AND c.relname <> 'test_table_3'`
+	var kept string
+	testPubTestCase(t, func() {
+		testCheckCompatibleVersion(t, featurePubColumnList)
+		testCheckCompatibleVersion(t, featurePubRowFilter)
+	}, []resource.TestStep{
+		{
+			Config: before,
+			Check: func(_ *terraform.State) error {
+				var err error
+				kept, err = testPubCatalog(dbName, "pub", oids)
+				return err
+			},
+		},
+		{
+			Config: after,
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery,
+					"test_schema.chi,test_schema.grandchi,test_schema.par,test_schema.par1,test_schema.test_table_1,test_schema.test_table_2,test_schema.test_table_3"),
+				func(_ *terraform.State) error {
+					got, err := testPubCatalog(dbName, "pub", oids)
+					if err != nil {
+						return err
+					}
+					if got != kept {
+						return fmt.Errorf("the tables which did not change have been added again: %s, was %s", got, kept)
+					}
+					return nil
+				},
+			),
+		},
+	})
+}
+
+// the name of a table as it is written in the configuration, not the one with its schema
+func TestAccPostgresqlPublication_UnqualifiedNames(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	dbName, _ := getTestDBNames(dbSuffix)
+	testPubExec(t, dbName, "CREATE TABLE public.unq (id int)", "CREATE TABLE public.unq2 (id int)")
+
+	list := testPubConfig(dbName, `tables = ["unq"]`)
+	block := testPubConfig(dbName, `
+	table {
+		name = "unq2"
+	}`)
+
+	testPubTestCase(t, nil, []resource.TestStep{
+		{
+			Config: list,
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "public.unq"),
+				resource.TestCheckResourceAttr(testPubResource, "tables.0", "unq"),
+			),
+		},
+		{
+			Config: block,
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "public.unq2"),
+				resource.TestCheckResourceAttr(testPubResource, "table.0.name", "unq2"),
+			),
+		},
+	})
+}
+
+// the tables are handled in the order of their names: the first one which does not exist is the one of the error
+func TestAccPostgresqlPublication_MissingTables(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	createTestTables(t, dbSuffix, []string{"test_schema.test_table_1"}, "")
+	dbName, _ := getTestDBNames(dbSuffix)
+
+	list := func(names ...string) string {
+		return testPubConfig(dbName, `tables = ["`+strings.Join(names, `", "`)+`"]`)
+	}
+	blocks := func(names ...string) string {
+		body := ""
+		for _, n := range names {
+			body += `
+	table {
+		name = "` + n + `"
+	}`
+		}
+		return testPubConfig(dbName, body)
+	}
+	dup := testPubConfig(dbName, `
+	table {
+		name = "test_schema.test_table_1"
+	}
+	table {
+		name = "test_schema.test_table_1"
+		only = true
+	}`)
+
+	testPubTestCase(t, nil, []resource.TestStep{
+		{Config: list("test_schema.zz_missing", "test_schema.aa_missing"), ExpectError: regexp.MustCompile(`aa_missing`)},
+		{Config: blocks("test_schema.zz_missing", "test_schema.aa_missing"), ExpectError: regexp.MustCompile(`aa_missing`)},
+		{Config: dup, ExpectError: regexp.MustCompile(`'test_schema.test_table_1' is duplicated for attribute .table.`)},
+		{Config: list("test_schema.test_table_1")},
+		// the same checks when the publication exists
+		{Config: list("test_schema.zz_missing", "test_schema.aa_missing"), ExpectError: regexp.MustCompile(`aa_missing`)},
+		{Config: blocks("test_schema.zz_missing", "test_schema.aa_missing"), ExpectError: regexp.MustCompile(`aa_missing`)},
+		{Config: dup, ExpectError: regexp.MustCompile(`'test_schema.test_table_1' is duplicated for attribute .table.`)},
+	})
+}
+
+// the excluded tables of ALL TABLES EXCEPT: a descendant which is asked for is listed as it is written
+func TestAccPostgresqlPublication_ExceptDescendants(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	dbName, _ := getTestDBNames(dbSuffix)
+	testPubInheritanceFixture(t, dbName)
+
+	config := testPubConfig(dbName, `
+	all_tables    = true
+	except_tables = ["test_schema.par", "test_schema.chi"]`)
+
+	testPubTestCase(t,
+		func() {
+			testCheckCompatibleVersion(t, featurePubAllSequences)
+			testCheckCanCreatePublication(t, true)
+		},
+		[]resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPublicationCatalog(dbName, "pub", testPubExceptQuery, "test_schema.chi,test_schema.grandchi,test_schema.par"),
+					resource.TestCheckResourceAttr(testPubResource, "except_tables.#", "2"),
+				),
+			},
+		})
+}
+
+// the schema is dropped before a table with a column list of this schema is added
+// (a publication of a schema can not have a column list)
+func TestAccPostgresqlPublication_SchemaReplacedByColumnList(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	createTestTables(t, dbSuffix, []string{"test_schema.test_table_1"}, "")
+	dbName, _ := getTestDBNames(dbSuffix)
+
+	schema := testPubConfig(dbName, `schemas = ["test_schema"]`)
+	columns := testPubConfig(dbName, `
+	table {
+		name    = "test_schema.test_table_1"
+		columns = ["val"]
+	}`)
+
+	testPubTestCase(t,
+		func() {
+			testCheckCompatibleVersion(t, featurePubSchema)
+			testCheckCanExecute(t, "create a publication for the tables of a schema", "CREATE PUBLICATION tf_probe_schema FOR TABLES IN SCHEMA public")
+		},
+		testPubInPlace([]resource.TestStep{
+			{
+				Config: schema,
+				Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubSchemasQuery, "test_schema"),
+			},
+			{
+				Config: columns,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPublicationCatalog(dbName, "pub", testPubSchemasQuery, ""),
+					testAccCheckPublicationCatalog(dbName, "pub", testPubColumnsQuery, "test_table_1(val)"),
+				),
+			},
+		}))
 }
