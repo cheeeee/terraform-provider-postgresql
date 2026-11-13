@@ -231,7 +231,7 @@ func TestAccPostgresqlDatabase_OwnerMemberOfRDSIAM(t *testing.T) {
 
 	// rds_iam only exists on AWS RDS, where the test is skipped: it would lock the connected user out.
 	var exists bool
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open(testDriverName, dsn)
 	if err != nil {
 		t.Fatalf("could not open SQL connection: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestAccPostgresqlDatabase_OwnerMemberOfRDSIAMWithIAMUser(t *testing.T) {
 	dsn := config.connStr("postgres")
 
 	var exists bool
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open(testDriverName, dsn)
 	if err != nil {
 		t.Fatalf("could not open SQL connection: %v", err)
 	}
@@ -513,7 +513,7 @@ func checkTableOwnership(
 	t *testing.T, dsn, owner, tableName string,
 ) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
-		db, err := sql.Open("postgres", dsn)
+		db, err := sql.Open(testDriverName, dsn)
 		if err != nil {
 			t.Fatalf("could not create connection pool: %v", err)
 		}
@@ -1075,7 +1075,7 @@ func testDatabaseOptionSteps(t *testing.T, minVersion int, clause, config string
 // testQueryDatabase returns the first column of the first row returned by a query on the server.
 func testQueryDatabase(t *testing.T, query string, args ...any) string {
 	config := getTestConfig(t)
-	db, err := sql.Open("postgres", config.connStr("postgres"))
+	db, err := sql.Open(testDriverName, config.connStr("postgres"))
 	if err != nil {
 		t.Fatalf("could not open SQL connection: %v", err)
 	}
@@ -1448,7 +1448,7 @@ resource "postgresql_database" "drop_open_db" {
 `,
 				Check: func(*terraform.State) error {
 					var err error
-					pool, err = sql.Open("postgres", config.connStr(dbName))
+					pool, err = sql.Open(testDriverName, config.connStr(dbName))
 					if err != nil {
 						return fmt.Errorf("could not open SQL connection: %w", err)
 					}
@@ -1568,7 +1568,7 @@ func TestAccPostgresqlDatabase_Tablespace(t *testing.T) {
 
 	dbExecute(t, dsn, fmt.Sprintf("DROP TABLESPACE IF EXISTS %s", tablespace))
 	func() {
-		db, err := sql.Open("postgres", dsn)
+		db, err := sql.Open(testDriverName, dsn)
 		if err != nil {
 			t.Fatalf("could not open SQL connection: %v", err)
 		}
@@ -2097,7 +2097,7 @@ func testCheckSessionTerminated(conn *sql.Conn) error {
 // testOpenSession opens a session on the database and checks it works.
 func testOpenSession(t *testing.T, dbName string) (*sql.DB, *sql.Conn) {
 	config := getTestConfig(t)
-	pool, err := sql.Open("postgres", config.connStr(dbName))
+	pool, err := sql.Open(testDriverName, config.connStr(dbName))
 	if err != nil {
 		t.Fatalf("could not open SQL connection: %v", err)
 	}
@@ -2208,7 +2208,7 @@ func TestDatabaseStartTransactionError(t *testing.T) {
 	config := getTestConfig(t)
 	client := config.NewClient("postgres")
 
-	closed, err := sql.Open("postgres", config.connStr("postgres"))
+	closed, err := sql.Open(testDriverName, config.connStr("postgres"))
 	if err != nil {
 		t.Fatalf("could not open SQL connection: %v", err)
 	}

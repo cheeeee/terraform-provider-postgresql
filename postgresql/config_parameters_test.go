@@ -172,7 +172,7 @@ func TestAccConfigParameters_UnknownListParameter(t *testing.T) {
 	}()
 
 	config := getTestConfig(t)
-	db, err := sql.Open("postgres", config.connStr("postgres"))
+	db, err := sql.Open(testDriverName, config.connStr("postgres"))
 	if err != nil {
 		t.Fatalf("could not open SQL connection: %v", err)
 	}
@@ -317,7 +317,7 @@ func testAccCheckSessionParameter(t *testing.T, role, password, dbName, name, ex
 		config := getTestConfig(t)
 		config.Username = role
 		config.Password = password
-		db, err := sql.Open("postgres", config.connStr(dbName))
+		db, err := sql.Open(testDriverName, config.connStr(dbName))
 		if err != nil {
 			return fmt.Errorf("could not open SQL connection: %w", err)
 		}
@@ -341,7 +341,7 @@ func testAccCheckSessionParameter(t *testing.T, role, password, dbName, name, ex
 // the minimum, the maximum and the default value (with its unit) of a number.
 func testSettableParameters(t *testing.T, reserved map[string]string) map[string][]string {
 	config := getTestConfig(t)
-	db, err := sql.Open("postgres", config.connStr("postgres"))
+	db, err := sql.Open(testDriverName, config.connStr("postgres"))
 	if err != nil {
 		t.Fatalf("could not open SQL connection: %v", err)
 	}

@@ -238,7 +238,7 @@ func testAccCheckExtensionAbsent(database, extName string) resource.TestCheckFun
 // older than its default version, and the default version. It skips the test if there is none.
 func testAccExtensionOldAndDefaultVersion(t *testing.T, extName string) (string, string) {
 	config := getTestConfig(t)
-	db, err := sql.Open("postgres", config.connStr("postgres"))
+	db, err := sql.Open(testDriverName, config.connStr("postgres"))
 	if err != nil {
 		t.Fatalf("could not open connection pool: %v", err)
 	}
@@ -443,7 +443,9 @@ func TestAccPostgresqlExtension_SchemaRename(t *testing.T) {
 }
 
 func testAccPostgresqlExtensionSetSchemaConfig(extSchemaResource string) string {
-	schemaLine := ""
+	// Without a schema in its configuration the extension stays in the schema where it is, "bar":
+	// it still has to be dropped before this schema (the two are destroyed at the same time otherwise).
+	schemaLine := "  depends_on = [postgresql_schema.bar]\n"
 	if extSchemaResource != "" {
 		schemaLine = fmt.Sprintf("  schema = postgresql_schema.%s.name\n", extSchemaResource)
 	}

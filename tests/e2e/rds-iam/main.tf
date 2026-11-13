@@ -5,6 +5,11 @@ variable "pg_host" {
   type = string
 }
 
+variable "pg_port" {
+  type    = number
+  default = 5432
+}
+
 variable "pg_user" {
   description = "Role of the database which is a member of rds_iam"
   type        = string
@@ -27,7 +32,7 @@ variable "iam_role_arn" {
 
 provider "postgresql" {
   host      = var.pg_host
-  port      = 5432
+  port      = var.pg_port
   username  = var.pg_user
   sslmode   = "require"
   superuser = false

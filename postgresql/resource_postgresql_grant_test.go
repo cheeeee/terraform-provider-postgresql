@@ -1541,7 +1541,7 @@ func TestAccPostgresqlGrantOwnerPG15(t *testing.T) {
 			// Change the owner to the new pg_database_owner role
 			func() {
 				config := getTestConfig(t)
-				db, err := sql.Open("postgres", config.connStr(dbName))
+				db, err := sql.Open(testDriverName, config.connStr(dbName))
 				if err != nil {
 					t.Fatalf("could not connect to database %s: %v", dbName, err)
 				}
@@ -1796,7 +1796,7 @@ func testPostgresDSN(t *testing.T) string {
 // testExecSession runs the statements one after the other in the same session, which is needed
 // for the settings which apply to the following statement (e.g.: allow_in_place_tablespaces).
 func testExecSession(t *testing.T, dsn string, statements ...string) {
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open(testDriverName, dsn)
 	if err != nil {
 		t.Fatalf("could not create connection pool: %v", err)
 	}
@@ -1875,7 +1875,7 @@ func hclStringList(values []string) string {
 // privilege of the catalogs is expected with a *.
 func testCheckGrantedObject(t *testing.T, c grantedObjectCase, role string, expected []string, withOption bool) resource.TestCheckFunc {
 	return func(*terraform.State) error {
-		db, err := sql.Open("postgres", testPostgresDSN(t))
+		db, err := sql.Open(testDriverName, testPostgresDSN(t))
 		if err != nil {
 			t.Fatalf("could not open connection pool: %v", err)
 		}
@@ -1928,7 +1928,7 @@ func testEffectivePrivilege(t *testing.T, c grantedObjectCase, privilege string)
 		return err == nil, nil
 	}
 
-	db, err := sql.Open("postgres", testPostgresDSN(t))
+	db, err := sql.Open(testDriverName, testPostgresDSN(t))
 	if err != nil {
 		t.Fatalf("could not open connection pool: %v", err)
 	}
@@ -2571,7 +2571,7 @@ func TestQuoteIdentifyIdent(t *testing.T) {
 // testFunctionPrivilege checks, in the catalog, whether role can execute the function with this exact signature.
 func testFunctionPrivilege(t *testing.T, role, signature string, want bool) error {
 	var got bool
-	db, err := sql.Open("postgres", testPostgresDSN(t))
+	db, err := sql.Open(testDriverName, testPostgresDSN(t))
 	if err != nil {
 		return err
 	}
@@ -2820,7 +2820,7 @@ resource "postgresql_grant" "test" {
 // "grantor:PRIVILEGE" sorted, e.g. {"test_own_owner:SELECT"}.
 func testCheckGrantors(t *testing.T, aclQuery string, want []string) resource.TestCheckFunc {
 	return func(*terraform.State) error {
-		db, err := sql.Open("postgres", testPostgresDSN(t))
+		db, err := sql.Open(testDriverName, testPostgresDSN(t))
 		if err != nil {
 			return err
 		}
@@ -3268,7 +3268,7 @@ func TestAccPostgresqlGrantRoutineAllArgumentTypes(t *testing.T) {
 			dsn := testPostgresDSN(t)
 			// before the setup, which creates a procedure with an OUT argument
 			var version int
-			conn, err := sql.Open("postgres", dsn)
+			conn, err := sql.Open(testDriverName, dsn)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3330,7 +3330,7 @@ func TestAccPostgresqlResolveRoutineAllArgumentTypes(t *testing.T) {
 	skipIfNotAcc(t)
 
 	dsn := testPostgresDSN(t)
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open(testDriverName, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3393,7 +3393,7 @@ func TestAccPostgresqlGrantFunctionOutArguments(t *testing.T) {
 			if kind == "procedure" {
 				// before the setup, which creates a procedure with an OUT argument
 				var version int
-				conn, err := sql.Open("postgres", dsn)
+				conn, err := sql.Open(testDriverName, dsn)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -3500,7 +3500,7 @@ func TestAccPostgresqlResolveFunctionSignature(t *testing.T) {
 	defer testSetupOverloads(t)()
 	dbExecute(t, testPostgresDSN(t), "CREATE FUNCTION test_ov_schema.f_one() RETURNS int AS $$ select 1 $$ LANGUAGE SQL")
 
-	db, err := sql.Open("postgres", testPostgresDSN(t))
+	db, err := sql.Open(testDriverName, testPostgresDSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}

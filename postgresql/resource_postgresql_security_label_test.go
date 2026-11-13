@@ -273,7 +273,7 @@ resource "postgresql_security_label" "test" {
 // testAccSecurityLabelQuery returns the label of an object as pg_seclabels lists it, or sql.ErrNoRows.
 func testAccSecurityLabelQuery(t *testing.T, dbName, catalogType, catalogName, provider string) (string, error) {
 	cfg := getTestConfig(t)
-	db, err := sql.Open("postgres", cfg.connStr(dbName))
+	db, err := sql.Open(testDriverName, cfg.connStr(dbName))
 	if err != nil {
 		t.Fatalf("could not create connection pool: %v", err)
 	}
