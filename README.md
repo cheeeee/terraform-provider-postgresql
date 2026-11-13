@@ -22,6 +22,15 @@ terraform {
 It works the same way with [Terraform](https://www.terraform.io/) and with [OpenTofu](https://opentofu.org/):
 the acceptance and end-to-end tests are run with both of them.
 
+Credits
+-------
+
+Besides the work of the maintainers and contributors of the upstream provider, this fork includes work which is not merged upstream:
+
+- `postgresql_event_trigger`: [Fabiano Soares Honorato](https://github.com/Fabianoshz) ([cyrilgdn/terraform-provider-postgresql#463](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/463)), with fixes by [Simon Engledew](https://github.com/simon-engledew) in [his fork](https://github.com/simon-engledew/terraform-provider-postgresql).
+- `password_authentication`, the SCRAM-SHA-256 hash of the passwords: [Oleksii Yashchenko](https://github.com/tuxslayer) ([cyrilgdn/terraform-provider-postgresql#690](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/690)).
+- The AWS region kept when a role is assumed for the RDS IAM authentication: [Kamal Kailasa Babu](https://github.com/kamal-kailasababu) ([cyrilgdn/terraform-provider-postgresql#687](https://github.com/cyrilgdn/terraform-provider-postgresql/pull/687)).
+
 Test matrix
 -----------
 
