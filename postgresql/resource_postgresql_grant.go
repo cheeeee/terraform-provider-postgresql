@@ -1127,7 +1127,7 @@ WHERE pg_largeobject_metadata.oid::text = ANY($1)`
 	if err != nil {
 		return nil, fmt.Errorf("error while looking for the owners of %s objects: %w", objectType, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	owners := []string{}
 	for rows.Next() {
@@ -1156,7 +1156,7 @@ WHERE pg_namespace.nspname = $1 AND pg_class.relname = ANY($2)`, schemaName, pq.
 		if err != nil {
 			return nil, fmt.Errorf("error while looking for the owners of %s objects: %w", objectType, err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 		for rows.Next() {
 			var owner string
 			if err := rows.Scan(&owner); err != nil {
@@ -1192,7 +1192,7 @@ WHERE nspname = $1 AND proname = $2`
 			for rows.Next() {
 				var owner string
 				if err := rows.Scan(&owner); err != nil {
-					rows.Close()
+					_ = rows.Close()
 					return nil, fmt.Errorf("could not scan the owner of %s %s: %w", objectType, name, err)
 				}
 				if !sliceContainsStr(owners, owner) {
@@ -1200,7 +1200,7 @@ WHERE nspname = $1 AND proname = $2`
 				}
 			}
 			err = rows.Err()
-			rows.Close()
+			_ = rows.Close()
 			if err != nil {
 				return nil, err
 			}

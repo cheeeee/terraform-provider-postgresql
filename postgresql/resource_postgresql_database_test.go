@@ -1463,7 +1463,7 @@ resource "postgresql_database" "drop_open_db" {
 			{
 				Config: "# the database is removed while a session is connected to it\n",
 				Check: func(*terraform.State) error {
-					defer pool.Close()
+					defer func() { _ = pool.Close() }()
 					return testCheckSessionTerminated(conn)
 				},
 			},
@@ -2139,7 +2139,7 @@ func TestAccPostgresqlDatabase_DropMechanisms(t *testing.T) {
 
 	t.Run("terminateBConnections", func(t *testing.T) {
 		pool, conn := testOpenSession(t, dbName)
-		defer pool.Close()
+		defer func() { _ = pool.Close() }()
 		// (also when the subtest fails: the next one connects to the database)
 		defer dbExecute(t, admin, "ALTER DATABASE "+dbName+" ALLOW_CONNECTIONS true")
 
@@ -2160,7 +2160,7 @@ func TestAccPostgresqlDatabase_DropMechanisms(t *testing.T) {
 	t.Run("with_force", func(t *testing.T) {
 		testSkipIfOlderThan(t, 130000, "DROP DATABASE ... WITH (FORCE)")
 		pool, conn := testOpenSession(t, dbName)
-		defer pool.Close()
+		defer func() { _ = pool.Close() }()
 
 		dbExecute(t, admin, "DROP DATABASE "+dbName+" WITH (FORCE)")
 		if err := testCheckSessionTerminated(conn); err != nil {

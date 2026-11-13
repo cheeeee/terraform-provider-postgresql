@@ -474,7 +474,7 @@ func getPublicationRels(txn *sql.Tx, db *DBConnection, pubName string, except bo
 	if err != nil {
 		return nil, fmt.Errorf("could not get the tables of the publication: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var rels []pubRel
 	for rows.Next() {
@@ -496,7 +496,7 @@ func inheritanceDescendants(txn *sql.Tx, oid int64) ([]int64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var oids []int64
 	for rows.Next() {
 		var o int64
@@ -522,7 +522,7 @@ func pubTableDescendants(txn *sql.Tx, oid int64) ([]pubRel, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var rels []pubRel
 	for rows.Next() {
 		var r pubRel
@@ -968,7 +968,7 @@ func resourcePostgreSQLPublicationReadImpl(db *DBConnection, d *schema.ResourceD
 		if err != nil {
 			return fmt.Errorf("could not get publication schemas: %w", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 		for rows.Next() {
 			var schemaName string
 			if err := rows.Scan(&schemaName); err != nil {
@@ -1015,7 +1015,7 @@ func readPubAllTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pub
 	if err != nil {
 		return fmt.Errorf("could not get publication tables: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var tables []string
 	for rows.Next() {
 		var table string

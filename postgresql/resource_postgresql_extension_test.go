@@ -187,7 +187,7 @@ func testAccCheckExtensionFunctionsSchema(n, schema string) resource.TestCheckFu
 		if err != nil {
 			return fmt.Errorf("error reading the functions of the extension: %w", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		var total int
 		for rows.Next() {
@@ -242,7 +242,7 @@ func testAccExtensionOldAndDefaultVersion(t *testing.T, extName string) (string,
 	if err != nil {
 		t.Fatalf("could not open connection pool: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	var oldVersion, defaultVersion string
 	err = db.QueryRow(

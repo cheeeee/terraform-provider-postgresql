@@ -1365,7 +1365,7 @@ func resourcePostgreSQLRoleImport(_ context.Context, d *schema.ResourceData, met
 	if err != nil {
 		return nil, fmt.Errorf("error reading the databases of role %s: %w", d.Id(), err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var blocks []any
 	for rows.Next() {

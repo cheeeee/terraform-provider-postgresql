@@ -539,7 +539,7 @@ func queryDB(dsn, query string, args ...any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	var result sql.NullString
 	if err := db.QueryRow(query, args...).Scan(&result); err != nil {
@@ -1971,7 +1971,7 @@ func execDB(dsn, query string) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	_, err = db.Exec(query)
 	return err
 }

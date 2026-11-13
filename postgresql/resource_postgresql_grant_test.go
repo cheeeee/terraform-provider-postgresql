@@ -3682,7 +3682,7 @@ func TestSoftQueryStringErrors(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() { _ = db.Close() }()
 			txn, err := db.Begin()
 			if err != nil {
 				t.Fatal(err)

@@ -765,10 +765,13 @@ func setAlterOwnership(db *DBConnection, d *schema.ResourceData) error {
 	dbName := d.Get(dbNameAttr).(string)
 
 	lockTxn, err := startTransaction(db.client, dbName)
-	if err := pgLockRole(lockTxn, currentUser); err != nil {
+	if err != nil {
 		return err
 	}
 	defer deferredRollback(lockTxn)
+	if err := pgLockRole(lockTxn, currentUser); err != nil {
+		return err
+	}
 
 	currentOwner, err := getDatabaseOwner(db, dbName)
 	if err != nil {

@@ -589,7 +589,7 @@ func testAccCheckEventTriggerFires(t *testing.T, database string, fired bool) re
 		if err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		_, err = db.Exec("CREATE TABLE test_event_trigger_fires (id int)")
 		if !fired {
