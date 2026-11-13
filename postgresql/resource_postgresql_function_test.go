@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"github.com/lib/pq"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
 
@@ -811,6 +813,15 @@ resource "postgresql_function" "cost" {
 					testAccFunctionCall("SELECT public.tf_cost()", "2"),
 				),
 			},
+			{
+				// CREATE OR REPLACE FUNCTION states a cost of 1, which is not the default of this language
+				Config: strings.Replace(config(`cost = 1`), "RETURN 1", "RETURN 3", 1),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.procost", "1"),
+					testAccFunctionCall("SELECT public.tf_cost()", "3"),
+				),
+			},
 		},
 	})
 }
@@ -1308,6 +1319,14 @@ resource "postgresql_function" "dummy" {
     obj_file = "/opt/dummy_seclabel/dummy_seclabel"
     body = "dummy_seclabel_dummy"
 }
+
+# without body, the link symbol is the name of the function
+resource "postgresql_function" "symbol" {
+    name = "dummy_seclabel_dummy"
+    returns = "void"
+    language = "c"
+    obj_file = "/opt/dummy_seclabel/dummy_seclabel"
+}
 `, volatility)
 	}
 	var cOID string
@@ -1337,6 +1356,8 @@ resource "postgresql_function" "dummy" {
 					testAccFunctionCall("SELECT public.tf_lang_c('Abc', 'aBC')", "true"),
 					testAccFunctionProp("postgresql_function.dummy", "p.probin || ',' || p.prosrc", "/opt/dummy_seclabel/dummy_seclabel,dummy_seclabel_dummy"),
 					testAccFunctionCall("SELECT public.tf_lang_dummy() IS NULL", "false"),
+					testAccFunctionProp("postgresql_function.symbol", "p.probin || ',' || p.prosrc", "/opt/dummy_seclabel/dummy_seclabel,dummy_seclabel_dummy"),
+					resource.TestCheckResourceAttr("postgresql_function.symbol", "body", "dummy_seclabel_dummy"),
 				),
 			},
 			{
@@ -1361,6 +1382,12 @@ resource "postgresql_function" "dummy" {
 			},
 			{
 				ResourceName:            "postgresql_function.dummy",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"drop_cascade"},
+			},
+			{
+				ResourceName:            "postgresql_function.symbol",
 				ImportState:             true,
 				ImportStateVerify:       true,
 				ImportStateVerifyIgnore: []string{"drop_cascade"},
@@ -2271,6 +2298,222 @@ resource "postgresql_function" "c" {
 					testAccFunctionProp(res, "p.probin", "/opt/dummy_seclabel/dummy_seclabel.so"),
 					resource.TestCheckResourceAttr(res, "obj_file", "/opt/dummy_seclabel/dummy_seclabel.so"),
 					testAccFunctionCall("SELECT public.tf_obj_file_change() IS NULL", "false"),
+				),
+			},
+		},
+	})
+}
+
+// The mode of an argument is case sensitive
+func TestFunctionArgModeValidation(t *testing.T) {
+	arg := resourcePostgreSQLFunction().Schema[funcArgAttr].Elem.(*schema.Resource)
+	validate := arg.Schema[funcArgModeAttr].ValidateFunc
+	for _, mode := range []string{"IN", "OUT", "INOUT", "VARIADIC"} {
+		if _, errs := validate(mode, funcArgModeAttr); len(errs) != 0 {
+			t.Errorf("%s is refused: %v", mode, errs)
+		}
+	}
+	for _, mode := range []string{"in", "Out", "inout", "variadic", "BOTH"} {
+		if _, errs := validate(mode, funcArgModeAttr); len(errs) == 0 {
+			t.Errorf("%s is accepted", mode)
+		}
+	}
+}
+
+// A new SQL-standard body changes the deparsed body that PostgreSQL stores: it is unknown in the plan
+func TestFunctionDiffSQLBodyDeparsedIsUnknown(t *testing.T) {
+	r := resourcePostgreSQLFunction()
+	state := func(id string) *terraform.InstanceState {
+		d := schema.TestResourceDataRaw(t, r.Schema, map[string]any{"name": "f", "language": "sql", "sql_body": "RETURN 1"})
+		d.SetId(id)
+		d.Set(funcCostAttr, 100.0)
+		d.Set(funcRowsAttr, 0.0)
+		d.Set(funcOwnerAttr, "postgres")
+		d.Set(funcSQLBodyDeparsedAttr, "RETURN 1")
+		return d.State()
+	}
+	diff := func(id, sqlBody string) *terraform.InstanceDiff {
+		config := terraform.NewResourceConfigRaw(map[string]any{"name": "f", "language": "sql", "sql_body": sqlBody})
+		d, err := r.Diff(context.Background(), state(id), config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+
+	d := diff("postgres.public.f()", "RETURN 2")
+	if a := d.Attributes[funcSQLBodyDeparsedAttr]; a == nil || !a.NewComputed {
+		t.Errorf("%s is known after a change of %s: %+v", funcSQLBodyDeparsedAttr, funcSQLBodyAttr, d.Attributes)
+	}
+	if d := diff("postgres.public.f()", "RETURN 1"); d != nil && d.Attributes[funcSQLBodyDeparsedAttr] != nil && d.Attributes[funcSQLBodyDeparsedAttr].NewComputed {
+		t.Errorf("%s is changed without a change of %s: %+v", funcSQLBodyDeparsedAttr, funcSQLBodyAttr, d.Attributes[funcSQLBodyDeparsedAttr])
+	}
+}
+
+// CREATE FUNCTION must not replace a function which exists
+func TestAccPostgresqlFunction_AlreadyExists(t *testing.T) {
+	const config = `
+resource "postgresql_function" "exists" {
+    name = "tf_already_exists"
+    returns = "integer"
+    body = "BEGIN RETURN 1; END;"
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccFunctionPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					testAccFunctionExec(t, "CREATE FUNCTION public.tf_already_exists() RETURNS integer LANGUAGE sql AS 'SELECT 42'")
+					t.Cleanup(func() { testAccFunctionExec(t, "DROP FUNCTION IF EXISTS public.tf_already_exists()") })
+				},
+				Config:      config,
+				ExpectError: regexp.MustCompile("already exists"),
+			},
+		},
+	})
+}
+
+// Changing window replaces the function: CREATE OR REPLACE FUNCTION cannot change its kind
+func TestAccPostgresqlFunction_WindowReplace(t *testing.T) {
+	config := func(attributes string) string {
+		return fmt.Sprintf(`
+resource "postgresql_function" "window" {
+    name = "tf_window_replace"
+    returns = "bigint"
+    language = "internal"
+    volatility = "IMMUTABLE"
+    parallel = "SAFE"
+    %s
+}
+`, attributes)
+	}
+	var oid string
+	const res = "postgresql_function.window"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			testCheckCanExecute(
+				t, "create an internal window function",
+				"CREATE FUNCTION public.tf_probe_window_replace() RETURNS bigint LANGUAGE internal WINDOW AS 'window_row_number'",
+			)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(`window = true
+    body = "window_row_number"`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.prokind", "w"),
+				),
+			},
+			{
+				Config: config(`body = "int8inc_any"`),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionProp(res, "p.prokind", "f"),
+					testAccFunctionProp(res, "p.prosrc", "int8inc_any"),
+					resource.TestCheckResourceAttr(res, "window", "false"),
+				),
+			},
+		},
+	})
+}
+
+// An update runs the statements it needs and no other: ALTER FUNCTION for what it can alter, CREATE OR
+// REPLACE FUNCTION only for what it cannot, and the dependencies on extensions are only touched when they change.
+// An event trigger records the DDL commands which are run on the function.
+func TestAccPostgresqlFunction_UpdateStatements(t *testing.T) {
+	config := func(attributes string, extensions string) string {
+		return fmt.Sprintf(`
+resource "postgresql_extension" "trgm" {
+    name = "pg_trgm"
+}
+
+resource "postgresql_extension" "citext" {
+    name = "citext"
+}
+
+resource "postgresql_function" "stmt" {
+    name = "tf_stmt"
+    returns = "integer"
+    depends_on_extensions = %s
+    %s
+}
+`, extensions, attributes)
+	}
+	const body = `body = "BEGIN RETURN 1; END;"`
+	const trgm = `[postgresql_extension.trgm.name]`
+	const both = `[postgresql_extension.trgm.name, postgresql_extension.citext.name]`
+	installTrigger := func() {
+		testAccFunctionExec(t,
+			"DROP TABLE IF EXISTS public.tf_ddl_log",
+			"CREATE TABLE public.tf_ddl_log (id serial, tag text)",
+			"CREATE OR REPLACE FUNCTION public.tf_ddl_log_fn() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN "+
+				"INSERT INTO public.tf_ddl_log (tag) SELECT command_tag FROM pg_event_trigger_ddl_commands() WHERE object_identity = 'public.tf_stmt()'; END $$",
+			"DROP EVENT TRIGGER IF EXISTS tf_ddl_log",
+			"CREATE EVENT TRIGGER tf_ddl_log ON ddl_command_end EXECUTE FUNCTION public.tf_ddl_log_fn()",
+		)
+		t.Cleanup(func() {
+			testAccFunctionExec(t,
+				"DROP EVENT TRIGGER IF EXISTS tf_ddl_log",
+				"DROP FUNCTION IF EXISTS public.tf_ddl_log_fn()",
+				"DROP TABLE IF EXISTS public.tf_ddl_log",
+			)
+		})
+	}
+	commands := func(expected string) resource.TestCheckFunc {
+		return testAccFunctionCall("SELECT COALESCE(string_agg(tag, ', ' ORDER BY id), '') FROM public.tf_ddl_log", expected)
+	}
+	var oid string
+	const res = "postgresql_function.stmt"
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccFunctionPreCheck(t)
+			testCheckCanCreateExtension(t, "pg_trgm", "citext")
+			testCheckCanExecute(
+				t, "create an event trigger",
+				"CREATE FUNCTION public.tf_probe_event() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN END'",
+				"CREATE EVENT TRIGGER tf_probe_event ON ddl_command_end EXECUTE FUNCTION public.tf_probe_event()",
+			)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlFunctionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(body, trgm),
+				Check:  testAccFunctionOID(res, &oid),
+			},
+			{
+				// the cost is altered, nothing else is run
+				PreConfig: installTrigger,
+				Config:    config(body+"\n    cost = 7", trgm),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionProp(res, "p.procost", "7"),
+					commands("ALTER FUNCTION"),
+				),
+			},
+			{
+				// a dependency is added, the one which stays is not touched
+				PreConfig: func() { testAccFunctionExec(t, "TRUNCATE public.tf_ddl_log") },
+				Config:    config(body+"\n    cost = 7", both),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					commands("ALTER FUNCTION"),
+				),
+			},
+			{
+				// a new body is a CREATE OR REPLACE FUNCTION, then the dependencies it drops are restored
+				PreConfig: func() { testAccFunctionExec(t, "TRUNCATE public.tf_ddl_log") },
+				Config:    config(strings.Replace(body, "RETURN 1", "RETURN 2", 1)+"\n    cost = 7", both),
+				Check: resource.ComposeTestCheckFunc(
+					testAccFunctionOID(res, &oid),
+					testAccFunctionCall("SELECT public.tf_stmt()", "2"),
+					commands("CREATE FUNCTION, ALTER FUNCTION, ALTER FUNCTION"),
 				),
 			},
 		},
