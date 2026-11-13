@@ -3,6 +3,8 @@ package postgresql
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -202,4 +204,61 @@ func TestBuildRDSAuthToken_AssumeRoleError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "could not assume AWS role") {
 		t.Fatalf("expected the error of the role, got %v (token %q)", err, token)
 	}
+}
+
+// assumeRDSRole is run against a local server which answers like the AWS STS API: nothing is sent to AWS.
+func TestAssumeRDSRole(t *testing.T) {
+	var requested url.Values
+	respond := func(status int, body string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = r.ParseForm()
+			requested = r.PostForm
+			w.Header().Set("Content-Type", "text/xml")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+		}))
+	}
+	config := func(server *httptest.Server) aws.Config {
+		return aws.Config{
+			Region:           "ca-central-1",
+			Credentials:      credentials.NewStaticCredentialsProvider("AKIABASE", "base-secret", ""),
+			BaseEndpoint:     aws.String(server.URL),
+			RetryMaxAttempts: 1,
+		}
+	}
+	const role = "arn:aws:iam::123456789012:role/connect"
+
+	t.Run("credentials of the role", func(t *testing.T) {
+		server := respond(http.StatusOK, `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult>
+<Credentials><AccessKeyId>AKIAASSUMED</AccessKeyId><SecretAccessKey>assumed-secret</SecretAccessKey>
+<SessionToken>assumed-token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials>
+</AssumeRoleResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></AssumeRoleResponse>`)
+		defer server.Close()
+
+		provider, err := assumeRDSRole(context.Background(), config(server), role)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		creds, err := provider.Retrieve(context.Background())
+		if err != nil || creds.AccessKeyID != "AKIAASSUMED" || creds.SecretAccessKey != "assumed-secret" || creds.SessionToken != "assumed-token" {
+			t.Errorf("unexpected credentials %+v (%v)", creds, err)
+		}
+		if requested.Get("Action") != "AssumeRole" || requested.Get("RoleArn") != role || requested.Get("RoleSessionName") != "TerraformPostgresqlProvider" {
+			t.Errorf("unexpected request: %v", requested)
+		}
+	})
+
+	t.Run("refused", func(t *testing.T) {
+		server := respond(http.StatusForbidden, `<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type>
+<Code>AccessDenied</Code><Message>not allowed</Message></Error><RequestId>1</RequestId></ErrorResponse>`)
+		defer server.Close()
+
+		provider, err := assumeRDSRole(context.Background(), config(server), role)
+		if err == nil || !strings.Contains(err.Error(), "could not assume AWS role") || !strings.Contains(err.Error(), "not allowed") {
+			t.Fatalf("expected the error of the role, got %v (%v)", err, provider)
+		}
+		if provider != nil {
+			t.Errorf("no credentials expected, got %v", provider)
+		}
+	})
 }

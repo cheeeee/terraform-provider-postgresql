@@ -76,6 +76,12 @@ func TestScramSHA256Password(t *testing.T) {
 			expected: "SCRAM-SHA-256$4096:ylTYggKWmWbq607V6FryHg==$wVJfgzEDJfftLpP+F7k9ZL0jX4hFZ4Kg+MDWjUIFTwg=:eKf6tHIDnm5c4NP8nBvChEyxmSknSjL7SD61q7pKf0o=",
 		},
 		{
+			// the soft hyphen would be removed if the string was prepared
+			name:     "bidirectional string with a character which is mapped is kept as-is",
+			password: "a\u05D0\u00ADb",
+			expected: "SCRAM-SHA-256$4096:ym54IhmWEq/xFGyflsIz+w==$1kNO5JABWSEJjlWZpMziHpejR4Xni+dJCeUV+V/Yo9o=:kvYtZSO0A//k5J2l9583XL1ikJrqwKlqDy3kvdkHZsQ=",
+		},
+		{
 			name:     "a zero width space is mapped to a space",
 			password: "a\u200Bb",
 			expected: "SCRAM-SHA-256$4096:J1Lkqo7NRMxfDAly3QweMw==$g7vYqXULyyV5soL+AcuyJ4HpJzBVQN+sYXpfdNKMGmM=:Rwpmfz6bYNUdigKzVSLAqARKrU4y0aQbE8AV28LyUJ0=",
@@ -171,6 +177,7 @@ func TestSaslprepPassword(t *testing.T) {
 		{"characters Unicode 3.2 does not assign are kept as-is", "\u1D2C\u1D2E", "\u1D2C\u1D2E"},
 		{"the direction is checked before the normalization", "a\u2135b", "a\u05D0b"},
 		{"right-to-left string", "\u05D0\u05D1", "\u05D0\u05D1"},
+		{"bidirectional string with a character which is mapped is kept as-is", "a\u05D0\u00ADb", "a\u05D0\u00ADb"},
 		{"combining characters are composed", "a\u0323\u0302", "\u1EAD"},
 		{"Hangul jamo are composed", "\u1100\u1161\u11A8", "\uAC01"},
 		{"a character outside of the BMP is not composed", "\U00020041\u0301", "\U00020041\u0301"},
