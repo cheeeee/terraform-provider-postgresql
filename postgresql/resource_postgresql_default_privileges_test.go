@@ -1229,3 +1229,47 @@ func TestAccPostgresqlDefaultPrivilegesSchemaRevokeNoEffect(t *testing.T) {
 		},
 	})
 }
+
+// The look at the privileges of a schema resource with `privileges = []` (the warning of
+// warnDefaultPrivilegesRevokeNoEffect) only runs for that case, and fails on a role which does
+// not exist before anything is revoked: the error tells which case ran.
+func TestAccPostgresqlDefaultPrivilegesSchemaRevokeNoEffectUnknownRole(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+
+	config := getTestConfig(t)
+	dbName, roleName := getTestDBNames(dbSuffix)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				// schema + no privileges: the warning looks for the role first
+				Config:      testDefaultPrivilegesResource("test", dbName, config.Username, "no_such_role", "test_schema", "table", "[]"),
+				ExpectError: regexp.MustCompile("could not find oid for role no_such_role"),
+			},
+			{
+				// ... then for the owner (a role which is not a superuser fails earlier, when it
+				// checks whether the owner is one)
+				Config:      testDefaultPrivilegesResource("test", dbName, "no_such_owner", roleName, "test_schema", "table", "[]"),
+				ExpectError: regexp.MustCompile("could not (find oid for|check if) role no_such_owner"),
+			},
+			{
+				// privileges given: no look at the privileges, the REVOKE fails first
+				Config:      testDefaultPrivilegesResource("test", dbName, config.Username, "no_such_role", "test_schema", "table", `["SELECT"]`),
+				ExpectError: regexp.MustCompile(`role "no_such_role" does not exist`),
+			},
+			{
+				// no schema: no look at the privileges either
+				Config:      testDefaultPrivilegesResource("test", dbName, config.Username, "no_such_role", "", "table", "[]"),
+				ExpectError: regexp.MustCompile(`role "no_such_role" does not exist`),
+			},
+		},
+	})
+}
