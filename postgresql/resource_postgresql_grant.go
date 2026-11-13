@@ -661,7 +661,7 @@ WHERE grantee = $2` + grantorClause(d, "") + `
 		if !strings.Contains(signature, "(") {
 			continue
 		}
-		oid, err := resolveFunctionSignature(txn, d.Get("schema").(string), signature)
+		oid, err := resolveFunctionSignature(txn, d.Get("schema").(string), d.Get("object_type").(string), signature)
 		if err != nil {
 			return false, err
 		}
@@ -686,7 +686,7 @@ WHERE grantee = $2` + grantorClause(d, "") + `
 // resolveFunctionSignature returns the OID (as a string) of the function, procedure or routine written
 // `name(argument list)` in the schema, or "" when there is none. The argument list is what a GRANT accepts:
 // argument modes and names are dropped and PostgreSQL resolves the types, ignoring their modifiers.
-func resolveFunctionSignature(txn *sql.Tx, schemaName, signature string) (string, error) {
+func resolveFunctionSignature(txn *sql.Tx, schemaName, objectType, signature string) (string, error) {
 	signature = strings.TrimSpace(signature)
 	open := strings.Index(signature, "(")
 	if open < 0 || !strings.HasSuffix(signature, ")") {
@@ -697,12 +697,17 @@ func resolveFunctionSignature(txn *sql.Tx, schemaName, signature string) (string
 	// The OUT arguments are dropped, for a function and for a procedure: GRANT ON PROCEDURE p(IN a int, OUT b int)
 	// designates the procedure of the input arguments (a int), not a procedure p(int, int) which could exist too.
 	types := []string{}
+	outArguments := false
 	for _, arg := range splitTopLevel(signature[open+1 : len(signature)-1]) {
 		mode, argType, err := parseFunctionArgument(txn, arg)
 		if err != nil {
 			return "", err
 		}
-		if argType == "" || mode == "OUT" {
+		if argType == "" {
+			continue
+		}
+		if mode == "OUT" {
+			outArguments = true
 			continue
 		}
 		types = append(types, argType)
@@ -710,10 +715,38 @@ func resolveFunctionSignature(txn *sql.Tx, schemaName, signature string) (string
 
 	qualified := fmt.Sprintf("%s.%s(%s)", pq.QuoteIdentifier(schemaName), pq.QuoteIdentifier(name), strings.Join(types, ","))
 	oid, ok, err := softQueryString(txn, "SELECT to_regprocedure($1)::oid::text", qualified)
-	if err != nil || !ok {
+	if err != nil || ok {
+		return oid, err
+	}
+	if objectType == "function" || outArguments {
+		return "", nil
+	}
+	// GRANT ON PROCEDURE p(int, int) and GRANT ON ROUTINE p(int, int) also designate p(a int, OUT b int):
+	// a list of types without OUT is matched with all the arguments too (PostgreSQL 14 and above).
+	allTypes, err := pq.Array(types).Value()
+	if err != nil {
 		return "", err
 	}
-	return oid, nil
+	oid, _, err = softQueryString(txn, routineOfAllArgumentsQuery(schemaName, name, objectType), allTypes.(string))
+	return oid, err
+}
+
+// routineOfAllArgumentsQuery returns the query which finds the procedure (or the routine) whose arguments of
+// every mode have the types given as its parameter, an array of names of types.
+func routineOfAllArgumentsQuery(schemaName, name, objectType string) string {
+	kinds := "'p'"
+	if objectType == "routine" {
+		kinds = "'p', 'f'"
+	}
+	return fmt.Sprintf(`
+SELECT p.oid::text
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = %s AND p.proname = %s AND p.prokind IN (%s) AND p.proallargtypes IS NOT NULL
+  AND ARRAY(
+    SELECT a.argtype FROM unnest(p.proallargtypes, p.proargmodes) WITH ORDINALITY AS a(argtype, argmode, position)
+    WHERE a.argmode <> 't' ORDER BY a.position
+  )::oid[] = $1::regtype[]::oid[]`, pq.QuoteLiteral(schemaName), pq.QuoteLiteral(name), kinds)
 }
 
 // splitTopLevel splits a list at the commas which are neither in parentheses or brackets nor in a quoted identifier.
@@ -1142,7 +1175,7 @@ JOIN pg_roles ON pg_roles.oid = proowner
 WHERE nspname = $1 AND proname = $2`
 			args := []any{schemaName, name}
 			if strings.Contains(name, "(") {
-				oid, err := resolveFunctionSignature(txn, schemaName, name)
+				oid, err := resolveFunctionSignature(txn, schemaName, objectType, name)
 				if err != nil {
 					return nil, err
 				}

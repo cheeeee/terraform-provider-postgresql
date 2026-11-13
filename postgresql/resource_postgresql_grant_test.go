@@ -3241,6 +3241,89 @@ resource "postgresql_grant" "test" {
 // TestAccPostgresqlGrantFunctionOutArguments grants a function and a procedure given with an OUT argument, next to
 // another one whose input arguments are the arguments with their OUT: PostgreSQL ignores the OUT arguments, so
 // the grant (and the read of its privileges) is on the one which has the input arguments only.
+// GRANT ON PROCEDURE p(integer, integer) designates p(a integer, OUT b integer) too: a list of types
+// without modes is matched with the arguments of every mode (PostgreSQL 14 and above). The privileges
+// are read from that procedure, a change made outside is planned.
+func TestAccPostgresqlGrantRoutineAllArgumentTypes(t *testing.T) {
+	skipIfNotAcc(t)
+
+	for _, test := range []struct{ name, objectType, create, revoke string }{
+		{
+			"procedure", "procedure",
+			"CREATE PROCEDURE test_allargs_schema.r(a integer, OUT b numeric(10,2), VARIADIC c double precision[]) AS $$ begin b := 1; end $$ LANGUAGE plpgsql",
+			"REVOKE EXECUTE ON PROCEDURE test_allargs_schema.r(integer, double precision[]) FROM test_allargs_role",
+		},
+		{
+			"routine_procedure", "routine",
+			"CREATE PROCEDURE test_allargs_schema.r(a integer, OUT b numeric(10,2), VARIADIC c double precision[]) AS $$ begin b := 1; end $$ LANGUAGE plpgsql",
+			"REVOKE EXECUTE ON PROCEDURE test_allargs_schema.r(integer, double precision[]) FROM test_allargs_role",
+		},
+		{
+			"routine_function", "routine",
+			"CREATE FUNCTION test_allargs_schema.r(a integer, OUT b numeric(10,2), VARIADIC c double precision[]) AS $$ select 1.0 $$ LANGUAGE SQL",
+			"REVOKE EXECUTE ON FUNCTION test_allargs_schema.r(integer, double precision[]) FROM test_allargs_role",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dsn := testPostgresDSN(t)
+			// before the setup, which creates a procedure with an OUT argument
+			var version int
+			conn, err := sql.Open("postgres", dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeDB(t, conn)
+			if err := conn.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
+				t.Fatal(err)
+			}
+			if version < 140000 {
+				t.Skipf("the types of the OUT arguments designate a routine since PostgreSQL 14, not in %d", version)
+			}
+			dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_allargs_role LOGIN PASSWORD '%s'", testRolePassword))
+			dbExecute(t, dsn, "CREATE SCHEMA test_allargs_schema")
+			dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_allargs_schema TO test_allargs_role")
+			dbExecute(t, dsn, test.create)
+			dbExecute(t, dsn, "REVOKE ALL ON ALL ROUTINES IN SCHEMA test_allargs_schema FROM PUBLIC")
+			defer func() {
+				dbExecute(t, dsn, "DROP SCHEMA IF EXISTS test_allargs_schema CASCADE")
+				dbExecute(t, dsn, "DROP ROLE IF EXISTS test_allargs_role")
+			}()
+
+			config := fmt.Sprintf(`
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_allargs_role"
+  schema      = "test_allargs_schema"
+  object_type = "%s"
+  privileges  = ["EXECUTE"]
+  objects     = ["r(integer, numeric(10,2), double precision[])"]
+}
+`, test.objectType)
+			check := func(*terraform.State) error {
+				return testFunctionPrivilege(t, "test_allargs_role", "test_allargs_schema.r(integer,double precision[])", true)
+			}
+			resource.Test(t, resource.TestCase{
+				PreCheck: func() {
+					testAccPreCheck(t)
+					testCheckCompatibleVersion(t, featurePrivileges)
+					testCheckCompatibleVersion(t, featureProcedure)
+				},
+				Providers: testAccProviders,
+				Steps: []resource.TestStep{
+					{Config: config, Check: check},
+					{
+						PreConfig:          func() { dbExecute(t, dsn, test.revoke) },
+						Config:             config,
+						PlanOnly:           true,
+						ExpectNonEmptyPlan: true,
+					},
+					{Config: config, Check: check},
+				},
+			})
+		})
+	}
+}
+
 func TestAccPostgresqlGrantFunctionOutArguments(t *testing.T) {
 	skipIfNotAcc(t)
 
@@ -3383,7 +3466,7 @@ func TestAccPostgresqlResolveFunctionSignature(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		oid, err := resolveFunctionSignature(txn, "test_ov_schema", signature)
+		oid, err := resolveFunctionSignature(txn, "test_ov_schema", "function", signature)
 		if err != nil {
 			t.Errorf("resolveFunctionSignature(%q): %v", signature, err)
 		}
@@ -3403,7 +3486,7 @@ func TestAccPostgresqlResolveFunctionSignature(t *testing.T) {
 // A malformed signature is refused before any query: there is no transaction to use.
 func TestResolveFunctionSignatureMalformed(t *testing.T) {
 	for _, signature := range []string{"f", "f(integer", "f integer)", "abc)", ""} {
-		if oid, err := resolveFunctionSignature(nil, "s", signature); oid != "" || err != nil {
+		if oid, err := resolveFunctionSignature(nil, "s", "function", signature); oid != "" || err != nil {
 			t.Errorf("resolveFunctionSignature(%q) = %q, %v, want no function and no error", signature, oid, err)
 		}
 	}
