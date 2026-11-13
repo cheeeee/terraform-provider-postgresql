@@ -378,7 +378,7 @@ func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) er
 		if newOwner.(string) != "" {
 			rolesToGrant = append(rolesToGrant, newOwner.(string))
 		}
-		if oldOwner.(string) != "" && oldOwner.(string) != newOwner.(string) {
+		if oldOwner.(string) != "" {
 			rolesToGrant = append(rolesToGrant, oldOwner.(string))
 		}
 	}
