@@ -3704,3 +3704,46 @@ func TestGrantedByRequiresNew(t *testing.T) {
 		}
 	}
 }
+
+// TestAccPostgresqlGrantFunctionDroppedOutside drops, outside of Terraform, a function which the configuration
+// grants with its signature: reading it is not an error (there is nothing to read), and the apply which follows
+// the creation of a new function grants it again.
+func TestAccPostgresqlGrantFunctionDroppedOutside(t *testing.T) {
+	skipIfNotAcc(t)
+	defer testSetupOverloads(t)()
+	dsn := testPostgresDSN(t)
+
+	config := `
+resource "postgresql_grant" "test" {
+  database    = "postgres"
+  role        = "test_ov_role"
+  schema      = "test_ov_schema"
+  object_type = "function"
+  privileges  = ["EXECUTE"]
+  objects     = ["f_ov(integer)"]
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{Config: config, Check: testCheckOverloads(t, true, false)},
+			{
+				PreConfig: func() { dbExecute(t, dsn, "DROP FUNCTION test_ov_schema.f_ov(integer)") },
+				Config:    config,
+				PlanOnly:  true,
+			},
+			{
+				PreConfig: func() {
+					dbExecute(t, dsn, "CREATE FUNCTION test_ov_schema.f_ov(a integer) RETURNS int AS $$ select 1 $$ LANGUAGE SQL")
+					dbExecute(t, dsn, "REVOKE ALL ON FUNCTION test_ov_schema.f_ov(integer) FROM PUBLIC")
+				},
+				Config: config,
+				Check:  testCheckOverloads(t, true, false),
+			},
+		},
+	})
+}
