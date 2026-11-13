@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"regexp"
@@ -128,6 +129,26 @@ resource "postgresql_physical_replication_slot" "myslot" {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlPhysicalReplicationSlotReserved("physical_slot", true),
 				),
+			},
+			// immediately_reserve is computed: leaving it out keeps a slot which has reserved WAL.
+			{
+				Config: `
+resource "postgresql_physical_replication_slot" "myslot" {
+  name = "physical_slot"
+}
+`,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckPostgresqlPhysicalReplicationSlotReserved("physical_slot", true),
+					resource.TestCheckResourceAttr("postgresql_physical_replication_slot.myslot", "immediately_reserve", "true"),
+				),
+			},
+			{
+				Config: `
+resource "postgresql_physical_replication_slot" "myslot" {
+  name = "physical_slot"
+}
+`,
+				PlanOnly: true,
 			},
 			// A slot which has not reserved WAL, created outside of Terraform, shows up in the plan.
 			{
@@ -321,4 +342,45 @@ func testAccCheckPostgresqlPhysicalReplicationSlotDestroy(s *terraform.State) er
 	}
 
 	return nil
+}
+
+// immediately_reserve is computed: it is not known before the slot is created, and a slot which
+// has reserved WAL is not replaced when the configuration does not set it or sets false.
+func TestPhysicalReplicationSlotImmediatelyReserveDiff(t *testing.T) {
+	r := resourcePostgreSQLPhysicalReplicationSlot()
+	diff := func(state *terraform.InstanceState, raw map[string]any) *terraform.InstanceDiff {
+		d, err := r.Diff(context.Background(), state, terraform.NewResourceConfigRaw(raw), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+
+	d := diff(nil, map[string]any{"name": "s"})
+	if d == nil || d.Attributes["immediately_reserve"] == nil || !d.Attributes["immediately_reserve"].NewComputed {
+		t.Errorf("immediately_reserve is not computed on creation: %v", d)
+	}
+
+	// the plan of a new slot shows the value which is set, false included
+	d = diff(nil, map[string]any{"name": "s", "immediately_reserve": false})
+	if d == nil || d.Attributes["immediately_reserve"] == nil || d.Attributes["immediately_reserve"].New != "false" {
+		t.Errorf("the plan of a new slot does not show immediately_reserve = false: %v", d)
+	}
+
+	reserved := func() *terraform.InstanceState {
+		return &terraform.InstanceState{ID: "s", Attributes: map[string]string{"id": "s", "name": "s", "immediately_reserve": "true"}}
+	}
+	for name, raw := range map[string]map[string]any{
+		"omitted": {"name": "s"},
+		"false":   {"name": "s", "immediately_reserve": false},
+	} {
+		if d := diff(reserved(), raw); d != nil && !d.Empty() {
+			t.Errorf("a reserved slot is changed when immediately_reserve is %s: %v", name, d)
+		}
+	}
+
+	unreserved := &terraform.InstanceState{ID: "s", Attributes: map[string]string{"id": "s", "name": "s", "immediately_reserve": "false"}}
+	if d := diff(unreserved, map[string]any{"name": "s", "immediately_reserve": true}); d == nil || !d.RequiresNew() {
+		t.Errorf("reserving the WAL of a slot does not replace it: %v", d)
+	}
 }

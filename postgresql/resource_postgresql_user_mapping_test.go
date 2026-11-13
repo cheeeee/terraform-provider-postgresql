@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -347,6 +348,13 @@ func TestAccPostgresqlUserMapping_Import(t *testing.T) {
 				ImportState:       true,
 				ImportStateId:     "remote_um_import.myserver_um_import",
 				ImportStateVerify: true,
+			},
+			// the ID of a mapping which does not exist is refused
+			{
+				ResourceName:  "postgresql_user_mapping.remote",
+				ImportState:   true,
+				ImportStateId: "nobody_um_import.myserver_um_import",
+				ExpectError:   regexp.MustCompile(`(?i)cannot import non-existent remote object`),
 			},
 		},
 	})
