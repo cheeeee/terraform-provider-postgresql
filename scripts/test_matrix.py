@@ -145,8 +145,13 @@ def merge_versions(marks):
     return f"{PASS} ({', '.join(passed)})"
 
 
+# Tests which only check that a configuration is refused, before anything is created: they pass everywhere
+# and do not show that the area works in an environment.
+VALIDATION_ONLY = {"TestAccPostgresqlEventTrigger_FilterMultiple", "TestAccPostgresqlEventTrigger_LoginUnsupported"}
+
+
 def area_results(tests, pattern):
-    return [result for name, result in tests.items() if re.search(pattern, name)]
+    return [result for name, result in tests.items() if re.search(pattern, name) and name not in VALIDATION_ONLY]
 
 
 def e2e_mark(info, checks="e2e"):
