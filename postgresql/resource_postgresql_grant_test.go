@@ -3659,3 +3659,40 @@ func TestAccPostgresqlGrantGrantedByReplace(t *testing.T) {
 		},
 	})
 }
+
+// TestGrantedByRequiresNew checks that the plan replaces the grant when its grantor changes: the grantor is the
+// one whose privileges are revoked by the destruction.
+func TestGrantedByRequiresNew(t *testing.T) {
+	r := resourcePostgreSQLGrant()
+	state := &terraform.InstanceState{
+		ID: "r_d_s_table",
+		Attributes: map[string]string{
+			"id":                "r_d_s_table",
+			"database":          "d",
+			"role":              "r",
+			"schema":            "s",
+			"object_type":       "table",
+			"granted_by":        "first",
+			"with_grant_option": "false",
+			"privileges.#":      "1",
+			fmt.Sprintf("privileges.%d", schema.HashString("SELECT")): "SELECT",
+		},
+	}
+	for grantedBy, wantReplace := range map[string]bool{"first": false, "second": true} {
+		config := terraform.NewResourceConfigRaw(map[string]any{
+			"database":    "d",
+			"role":        "r",
+			"schema":      "s",
+			"object_type": "table",
+			"granted_by":  grantedBy,
+			"privileges":  []any{"SELECT"},
+		})
+		diff, err := r.Diff(context.Background(), state, config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := diff != nil && diff.RequiresNew(); got != wantReplace {
+			t.Errorf("granted_by %q: the plan replaces the grant: %v, expected %v", grantedBy, got, wantReplace)
+		}
+	}
+}
