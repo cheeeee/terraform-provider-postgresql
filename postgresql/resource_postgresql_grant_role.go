@@ -169,12 +169,10 @@ func resourcePostgreSQLGrantRoleUpdate(db *DBConnection, d *schema.ResourceData)
 	defer deferredRollback(txn)
 
 	// The options are changed in place: GRANT ... WITH <option> to enable one,
-	// REVOKE <option> OPTION FOR to disable it.
+	// REVOKE <option> OPTION FOR to disable it. An option which is not in the
+	// configuration is never changed by a plan (its argument is computed).
 	for _, option := range grantRoleOptions {
 		if !d.HasChange(option.attr) {
-			continue
-		}
-		if _, configured := rawConfigBool(d, option.attr); !configured && option.attr != grantRoleWithAdminOptionAttr {
 			continue
 		}
 
