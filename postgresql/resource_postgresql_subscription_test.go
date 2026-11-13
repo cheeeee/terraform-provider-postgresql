@@ -496,8 +496,9 @@ func (s *subTest) configFull(name, slotResource, conninfoSuffix string, publicat
 		database = "%[1]s"
 		plugin   = "pgoutput"
 		lifecycle {
-			// a subscription with two_phase = true turns the slot to two-phase decoding
-			ignore_changes = [two_phase]
+			// a subscription with two_phase = true turns the slot to two-phase decoding,
+			// and with failover = true to a slot which is synchronized to the standbys
+			ignore_changes = [two_phase, failover]
 		}
 	}
 	resource "postgresql_replication_slot" "test_slot2" {
@@ -505,8 +506,9 @@ func (s *subTest) configFull(name, slotResource, conninfoSuffix string, publicat
 		database = "%[1]s"
 		plugin   = "pgoutput"
 		lifecycle {
-			// a subscription with two_phase = true turns the slot to two-phase decoding
-			ignore_changes = [two_phase]
+			// a subscription with two_phase = true turns the slot to two-phase decoding,
+			// and with failover = true to a slot which is synchronized to the standbys
+			ignore_changes = [two_phase, failover]
 		}
 	}
 	resource "postgresql_subscription" "test_sub" {
@@ -874,6 +876,15 @@ func TestAccPostgresqlSubscription_BinaryStreaming(t *testing.T) {
 				PlanOnly:           true,
 				ExpectNonEmptyPlan: true,
 			},
+			{
+				Config: s.config(name, []string{"pub1"}, "binary = true\nstreaming = \"off\""),
+				Check:  s.catalog(name, "subbinary", "true"),
+			},
+			{
+				// the option which is no more in the configuration is left as it is: no diff
+				Config: s.config(name, []string{"pub1"}, ""),
+				Check:  s.catalog(name, "subbinary", "true"),
+			},
 		},
 	})
 }
@@ -935,6 +946,18 @@ func TestAccPostgresqlSubscription_TwoPhaseDisableOnError(t *testing.T) {
 				PlanOnly:           true,
 				ExpectNonEmptyPlan: true,
 			},
+			{
+				Config: s.config(name, []string{"pub1"}, "two_phase = true\ndisable_on_error = true"),
+				Check:  s.catalog(name, "subdisableonerr", "true"),
+			},
+			{
+				// the options which are no more in the configuration are left as they are: no diff
+				Config: s.config(name, []string{"pub1"}, ""),
+				Check: resource.ComposeTestCheckFunc(
+					s.catalog(name, "subtwophasestate <> 'd'", "true"),
+					s.catalog(name, "subdisableonerr", "true"),
+				),
+			},
 		},
 	})
 }
@@ -988,6 +1011,15 @@ func TestAccPostgresqlSubscription_RunAsOwnerOrigin(t *testing.T) {
 				Config:             s.config(name, []string{"pub1"}, "run_as_owner = false\norigin = \"any\"\nstreaming = \"off\""),
 				PlanOnly:           true,
 				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: s.config(name, []string{"pub1"}, "run_as_owner = true\norigin = \"any\"\nstreaming = \"off\""),
+				Check:  s.catalog(name, "subrunasowner", "true"),
+			},
+			{
+				// the option which is no more in the configuration is left as it is: no diff
+				Config: s.config(name, []string{"pub1"}, ""),
+				Check:  s.catalog(name, "subrunasowner", "true"),
 			},
 		},
 	})
@@ -1067,6 +1099,15 @@ func TestAccPostgresqlSubscription_Failover(t *testing.T) {
 					s.catalog(name, "subenabled", "true"),
 				),
 			},
+			{
+				Config: s.config(name, []string{"pub1"}, "failover = true"),
+				Check:  s.catalog(name, "subfailover", "true"),
+			},
+			{
+				// the option which is no more in the configuration is left as it is: no diff
+				Config: s.config(name, []string{"pub1"}, ""),
+				Check:  s.catalog(name, "subfailover", "true"),
+			},
 		},
 	})
 }
@@ -1101,6 +1142,15 @@ func TestAccPostgresqlSubscription_RetainDeadTuples(t *testing.T) {
 				Config:             s.config(name, []string{"pub1"}, "enabled = true\nretain_dead_tuples = false"),
 				PlanOnly:           true,
 				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: s.config(name, []string{"pub1"}, "enabled = true\nretain_dead_tuples = true"),
+				Check:  s.catalog(name, "subretaindeadtuples", "true"),
+			},
+			{
+				// the option which is no more in the configuration is left as it is: no diff
+				Config: s.config(name, []string{"pub1"}, ""),
+				Check:  s.catalog(name, "subretaindeadtuples", "true"),
 			},
 		},
 	})
@@ -1140,6 +1190,18 @@ func TestAccPostgresqlSubscription_WalReceiverTimeout(t *testing.T) {
 				Config:             s.config(name, []string{"pub1"}, "wal_receiver_timeout = \"1min\"\nretain_dead_tuples = true\nmax_retention_duration = 60000"),
 				PlanOnly:           true,
 				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: s.config(name, []string{"pub1"}, "wal_receiver_timeout = \"1min\"\nretain_dead_tuples = true\nmax_retention_duration = 60000"),
+				Check:  s.catalog(name, "subwalrcvtimeout", "1min"),
+			},
+			{
+				// the options which are no more in the configuration are left as they are: no diff
+				Config: s.config(name, []string{"pub1"}, ""),
+				Check: resource.ComposeTestCheckFunc(
+					s.catalog(name, "submaxretention", "60000"),
+					s.catalog(name, "subwalrcvtimeout", "1min"),
+				),
 			},
 		},
 	})
@@ -2009,6 +2071,20 @@ func TestAccPostgresqlSubscription_CreateSlotOnRemotePublisher(t *testing.T) {
 			},
 			s.importStep(),
 			{
+				// an imported subscription is supposed to have created its slot (create_slot = true)
+				ResourceName: subRes,
+				ImportState:  true,
+				ImportStateCheck: func(states []*terraform.InstanceState) error {
+					if len(states) != 1 {
+						return fmt.Errorf("expected one imported resource, got %d", len(states))
+					}
+					if got := states[0].Attributes["create_slot"]; got != "true" {
+						return fmt.Errorf("create_slot of the imported subscription is %q, expected true", got)
+					}
+					return nil
+				},
+			},
+			{
 				// create_slot = true is used only at the creation: no diff, no replacement
 				Config: r.config(name, "create_slot = false"),
 				Check:  s.sameOID(name, &oid),
@@ -2156,6 +2232,262 @@ func TestAccPostgresqlSubscription_CreateSlotDisabled(t *testing.T) {
 					r.slots(name+":true"),
 					s.replicated("test_schema.test_table_1", 2),
 					s.sameOID(name, &oid),
+				),
+			},
+		},
+	})
+}
+
+// The values of the attributes are case sensitive: the server and the state use these spellings.
+func TestAccPostgresqlSubscription_InvalidValues(t *testing.T) {
+	s := newSubTest(t)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:  s.preCheck(),
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config:      s.config("tf_sub_invalid", []string{"pub1"}, `synchronous_commit = "ON"`),
+				ExpectError: regexp.MustCompile(`expected synchronous_commit to be one of`),
+			},
+			{
+				Config:      s.config("tf_sub_invalid", []string{"pub1"}, `origin = "ANY"`),
+				ExpectError: regexp.MustCompile(`expected origin to be one of`),
+			},
+		},
+	})
+}
+
+// The connection string holds a password: it is hidden from the output of Terraform.
+func TestSubscriptionSchemaConninfoIsSensitive(t *testing.T) {
+	if !resourcePostgreSQLSubscription().Schema["conninfo"].Sensitive {
+		t.Fatal("conninfo of postgresql_subscription must be sensitive")
+	}
+}
+
+// database cannot be altered (the subscription is created again in the other database) and, when it
+// is left out, is the one of the provider and stays what it is.
+func TestAccPostgresqlSubscription_Database(t *testing.T) {
+	s := newSubTest(t)
+	const name = "tf_sub_database"
+	suffix2, teardown2 := setupTestDatabase(t, true, true)
+	t.Cleanup(teardown2)
+	t.Cleanup(func() { coolDown() })
+	createTestTables(t, suffix2, []string{"test_schema.test_table_1", "test_schema.test_table_2"}, "")
+	db2, _ := getTestDBNames(suffix2)
+	t.Cleanup(func() { dropSubscriptions(t, db2) })
+
+	inSub := s.config(name, []string{"pub1"}, "")
+	inDB2 := strings.Replace(inSub, `database     = "`+s.dbSub+`"`, `database     = "`+db2+`"`, 1)
+	left := strings.Replace(inDB2, `database     = "`+db2+`"`, ``, 1)
+	count := func(db, expected string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			got, err := s.query(db, "SELECT count(*)::text FROM pg_catalog.pg_subscription WHERE subname = $1 AND subdbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = $2)", name, db)
+			if err != nil {
+				return err
+			}
+			if got != expected {
+				return fmt.Errorf("%s subscriptions %s in %s, expected %s", got, name, db, expected)
+			}
+			return nil
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     s.preCheck(),
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: inSub,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(subRes, "database", s.dbSub),
+					count(s.dbSub, "1"), count(db2, "0"),
+				),
+			},
+			{
+				// replaced: dropped in the first database and created in the other
+				Config: inDB2,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(subRes, "database", db2),
+					count(s.dbSub, "0"), count(db2, "1"),
+				),
+			},
+			{
+				Config:   left,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// subscriptionWorker is the process id of the apply worker of the subscription.
+func (s *subTest) workerPID(name string) (string, error) {
+	var got string
+	for i := 0; i < 60; i++ {
+		var err error
+		got, err = s.query(s.dbSub, "SELECT pid::text FROM pg_catalog.pg_stat_subscription WHERE subname = $1 AND relid IS NULL AND pid IS NOT NULL", name)
+		if err == nil && got != "" {
+			return got, nil
+		}
+		time.Sleep(time.Second)
+	}
+	return "", fmt.Errorf("no apply worker for subscription %s", name)
+}
+
+func (s *subTest) rememberWorker(name string, pid *string) resource.TestCheckFunc {
+	return func(_ *terraform.State) (err error) {
+		*pid, err = s.workerPID(name)
+		return err
+	}
+}
+
+// sameWorker checks that the apply worker has not been stopped, which disabling the
+// subscription does.
+func (s *subTest) sameWorker(name string, pid *string) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		time.Sleep(3 * time.Second)
+		got, err := s.workerPID(name)
+		if err != nil {
+			return err
+		}
+		if got != *pid {
+			return fmt.Errorf("the apply worker of %s has been restarted (pid %s, was %s): the subscription has been disabled", name, got, *pid)
+		}
+		return nil
+	}
+}
+
+// An option which the server alters in an enabled subscription (synchronous_commit) is altered without disabling
+// the subscription, whatever the other options of the configuration are (those which need it are unchanged).
+func TestAccPostgresqlSubscription_AlterWithoutDisabling(t *testing.T) {
+	s := newSubTest(t)
+	const name = "tf_sub_keep_worker"
+	version := testServerVersionNum(t)
+	var pid string
+	options := func(commit string) string {
+		o := fmt.Sprintf("synchronous_commit = %q", commit)
+		if version >= 140000 {
+			o += "\nbinary = false"
+		}
+		if version >= 150000 {
+			o += "\ntwo_phase = false\ndisable_on_error = false"
+		}
+		if version >= 170000 {
+			o += "\nfailover = false"
+		}
+		if version >= 190000 {
+			o += "\nretain_dead_tuples = false"
+		}
+		return o
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     s.preCheck(),
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: s.config(name, []string{"pub1"}, options("local")),
+				Check:  s.rememberWorker(name, &pid),
+			},
+			{
+				Config: s.config(name, []string{"pub1"}, options("remote_write")),
+				Check: resource.ComposeTestCheckFunc(
+					s.catalog(name, "subsynccommit", "remote_write"),
+					s.catalog(name, "subenabled", "true"),
+					s.sameWorker(name, &pid),
+				),
+			},
+			{
+				// the publications as well
+				Config: s.config(name, []string{"pub1", "pub2"}, options("remote_write")),
+				Check: resource.ComposeTestCheckFunc(
+					s.publications(name, "test_publication_1,test_publication_2"),
+					s.catalog(name, "subenabled", "true"),
+				),
+			},
+		},
+	})
+}
+
+// A failed update keeps the state it had: the next plan renames the subscription (the statements
+// which did not run are not recorded as done).
+func TestAccPostgresqlSubscription_FailedUpdate(t *testing.T) {
+	s := newSubTest(t)
+	const name = "tf_sub_failed"
+	const renamed = "tf_sub_failed_renamed"
+	var oid string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     s.preCheck(),
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: s.config(name, []string{"pub1"}, ""),
+				Check:  s.rememberOID(name, &oid),
+			},
+			{
+				// the owner fails before the rename
+				Config:      s.config(renamed, []string{"pub1"}, `owner = "tf_no_such_role"`),
+				ExpectError: regexp.MustCompile(`tf_no_such_role`),
+			},
+			{
+				Config: s.config(renamed, []string{"pub1"}, ""),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(subRes, "name", renamed),
+					s.catalog(renamed, "subname", renamed),
+					s.sameOID(renamed, &oid),
+				),
+			},
+		},
+	})
+}
+
+// connect = true is the default: the subscription connects to the publisher, so it is enabled.
+func TestAccPostgresqlSubscription_ConnectTrue(t *testing.T) {
+	s := newSubTest(t)
+	const name = "tf_sub_connect"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     s.preCheck(),
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: s.config(name, []string{"pub1"}, "connect = true"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(subRes, "connect", "true"),
+					resource.TestCheckResourceAttr(subRes, "enabled", "true"),
+					s.catalog(name, "subenabled", "true"),
+					s.insert("test_schema.test_table_1", "connected"),
+					s.replicated("test_schema.test_table_1", 1),
+				),
+			},
+		},
+	})
+}
+
+// connect = false with enabled = false, and create_slot left to its default (true): the subscription
+// is created without a slot, and destroyed without looking for the slot on the publisher.
+func TestAccPostgresqlSubscription_ConnectFalseDefaultCreateSlot(t *testing.T) {
+	s := newSubTest(t)
+	const name = "tf_sub_noconnect_default"
+	config := strings.Replace(s.config(name, []string{"pub1"}, "connect = false\nenabled = false"), "create_slot  = false", "", 1)
+	config = strings.Replace(config, `slot_name    = postgresql_replication_slot.test_slot.name`, ``, 1)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     s.preCheck(),
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(subRes, "create_slot", "true"),
+					s.catalog(name, "subenabled", "false"),
+					s.slots("test_slot,test_slot2"),
 				),
 			},
 		},
