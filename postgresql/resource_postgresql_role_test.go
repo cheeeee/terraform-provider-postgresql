@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -1333,6 +1334,12 @@ resource "postgresql_role" "dbp_rejected" {
 				Config:      roleConfig(block("postgres", `{ role = "foo" }`)),
 				ExpectError: regexp.MustCompile(`"role" cannot be set here`),
 			},
+			// refused when the plan is made, before anything is applied
+			{
+				Config:      roleConfig(block("postgres", `{ work_mem = "1MB" }`) + block("postgres", `{ lock_timeout = "1s" }`)),
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`the database "postgres" is defined twice`),
+			},
 			{
 				Config:      roleConfig(block("postgres", `{ Work_Mem = "1MB" }`)),
 				ExpectError: regexp.MustCompile(`is not a valid parameter name`),
@@ -2524,6 +2531,198 @@ resource "postgresql_role" "vu_nologin" {
 			{
 				Config: roleConfig(``),
 				Check:  testAccCheckRoleValidUntil("vu_role", "infinity"),
+			},
+		},
+	})
+}
+
+// A password which is removed outside of Terraform, and a password which is added while the
+// configuration says NULL, are changes of the plan (the provider reads the passwords of a superuser).
+func TestAccPostgresqlRole_PasswordDrift(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := `
+resource "postgresql_role" "pwdd_role" {
+  name     = "pwdd_role"
+  login    = true
+  password = "pwdd1"
+}
+
+resource "postgresql_role" "pwdd_null_role" {
+  name     = "pwdd_null_role"
+  login    = true
+  password = "NULL"
+}
+`
+	noPassword := func(role string) resource.TestCheckFunc {
+		return testAccCheckRoleStoredPassword(role, func(stored string) error {
+			if stored != "" {
+				return fmt.Errorf("the role has a password: %q", stored)
+			}
+			return nil
+		})
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testSuperuserPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoleCanLogin(t, "pwdd_role", "pwdd1"),
+					noPassword("pwdd_null_role"),
+				),
+			},
+			{
+				PreConfig:          func() { dbExecute(t, dsn, "ALTER ROLE pwdd_role PASSWORD NULL") },
+				Config:             roleConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: roleConfig,
+				Check:  testAccCheckRoleCanLogin(t, "pwdd_role", "pwdd1"),
+			},
+			{
+				// an md5 hash: the provider cannot tell whether a SCRAM-SHA-256 hash is the one of the state
+				PreConfig:          func() { dbExecute(t, dsn, "ALTER ROLE pwdd_null_role PASSWORD 'md5c98cbfeb6a347a47eb8e96cfb4c4b890'") },
+				Config:             roleConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: roleConfig,
+				Check:  noPassword("pwdd_null_role"),
+			},
+		},
+	})
+}
+
+// PostgreSQL before 10 does not know SCRAM-SHA-256 and has no UNENCRYPTED PASSWORD to refuse: with
+// the version of the server set by the configuration of the provider, encrypted_password = false is accepted.
+func TestAccPostgresqlRole_PasswordUnencryptedOldServer(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureScramSHA256)
+		},
+		ProviderFactories: map[string]func() (*schema.Provider, error){
+			"postgresql": func() (*schema.Provider, error) { return testAccProvider, nil },
+		},
+		CheckDestroy: func(s *terraform.State) error {
+			resetDBRegistry()
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				PreConfig: resetDBRegistry,
+				Config: `
+provider "postgresql" {
+  expected_version = "9.6.0"
+}
+
+resource "postgresql_role" "unencrypted_old_role" {
+  name               = "unencrypted_old_role"
+  password           = "pwd"
+  encrypted_password = false
+}`,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+// The databases in which the role has parameters are put in the state by the import (the function is
+// called as it is: a step of import cannot tell a missing resource from an empty one).
+func TestAccPostgresqlRole_ImportFunction(t *testing.T) {
+	skipIfNotAcc(t)
+	testAccPreCheck(t)
+	testCheckCompatibleVersion(t, featurePrivileges)
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	for _, role := range []string{"rim_with", "rim_without"} {
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS "+role)
+		dbExecute(t, dsn, "CREATE ROLE "+role)
+	}
+	t.Cleanup(func() {
+		for _, role := range []string{"rim_with", "rim_without"} {
+			dbExecute(t, dsn, "DROP ROLE IF EXISTS "+role)
+		}
+	})
+	dbExecute(t, dsn, "ALTER ROLE rim_with IN DATABASE template1 SET work_mem TO '3MB'")
+	dbExecute(t, dsn, "ALTER ROLE rim_with IN DATABASE postgres SET work_mem TO '4MB'")
+
+	databases := func(role string) []string {
+		d := resourcePostgreSQLRole().TestResourceData()
+		d.SetId(role)
+		imported, err := resourcePostgreSQLRoleImport(context.Background(), d, testAccProvider.Meta())
+		if err != nil {
+			t.Fatalf("%s: %v", role, err)
+		}
+		if len(imported) != 1 || imported[0].Id() != role {
+			t.Fatalf("%s: expected the role itself, got %v", role, imported)
+		}
+		names := []string{}
+		for _, block := range imported[0].Get(roleDatabaseParametersAttr).(*schema.Set).List() {
+			names = append(names, block.(map[string]any)["database"].(string))
+		}
+		sort.Strings(names)
+		return names
+	}
+	if got := databases("rim_with"); !reflect.DeepEqual(got, []string{"postgres", "template1"}) {
+		t.Errorf("databases of rim_with: got %v", got)
+	}
+	if got := databases("rim_without"); len(got) != 0 {
+		t.Errorf("databases of rim_without: got %v", got)
+	}
+}
+
+// A parameter of a database which is changed outside of Terraform is a change of the plan, even if
+// the new value is spelled like a list and the old one is the same list: only the parameters which
+// are lists are compared as such.
+func TestAccPostgresqlRole_DatabaseParametersDrift(t *testing.T) {
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+
+	roleConfig := `
+resource "postgresql_role" "dbpd_role" {
+  name = "dbpd_role"
+  database_parameters {
+    database   = "postgres"
+    parameters = { application_name = "a,b" }
+  }
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featurePrivileges)
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: roleConfig,
+				Check:  testAccCheckRoleDatabaseConfig("dbpd_role", "postgres", []string{"application_name=a,b"}),
+			},
+			{
+				PreConfig:          func() { dbExecute(t, dsn, "ALTER ROLE dbpd_role IN DATABASE postgres SET application_name TO 'a, b'") },
+				Config:             roleConfig,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: roleConfig,
+				Check:  testAccCheckRoleDatabaseConfig("dbpd_role", "postgres", []string{"application_name=a,b"}),
 			},
 		},
 	})

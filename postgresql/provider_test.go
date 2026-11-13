@@ -43,3 +43,17 @@ func testAccPreCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The values of password_authentication are lowercase, as they are documented.
+func TestProviderPasswordAuthenticationValidation(t *testing.T) {
+	validate := Provider().Schema["password_authentication"].ValidateFunc
+	for value, valid := range map[string]bool{
+		"password": true, "scram-sha-256": true,
+		"Password": false, "PASSWORD": false, "SCRAM-SHA-256": false, "scram": false, "": false,
+	} {
+		_, errs := validate(value, "password_authentication")
+		if (len(errs) == 0) != valid {
+			t.Errorf("%q: valid is %t, errors %v", value, valid, errs)
+		}
+	}
+}

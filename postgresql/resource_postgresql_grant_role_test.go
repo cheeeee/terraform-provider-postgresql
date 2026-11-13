@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/hashicorp/go-cty/cty"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
@@ -742,10 +743,162 @@ func grantRoleOptionsSupported() bool {
 }
 
 func TestGrantRoleImportCandidates(t *testing.T) {
-	got := grantRoleImportCandidates("a_b_c_true")
-	want := [][2]string{{"a", "b_c_true"}, {"a_b", "c_true"}, {"a_b_c", "true"}, {"a", "b_c"}, {"a_b", "c"}}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("got %v, want %v", got, want)
+	tests := []struct {
+		id   string
+		want [][2]string
+	}{
+		{"a_b_c_true", [][2]string{{"a", "b_c_true"}, {"a_b", "c_true"}, {"a_b_c", "true"}, {"a", "b_c"}, {"a_b", "c"}}},
+		{"a_b", [][2]string{{"a", "b"}}},
+		{"a_b_false", [][2]string{{"a", "b_false"}, {"a_b", "false"}, {"a", "b"}}},
+		// an underscore at the start or at the end of the ID separates no name from another
+		{"_a_b", [][2]string{{"_a", "b"}}},
+		{"a_b_", [][2]string{{"a", "b_"}}},
+		{"_ab", nil},
+		{"ab_", nil},
+		{"_", nil},
+		{"__", nil},
+		{"ab", nil},
+		{"", nil},
+		// once the suffix is removed, the ID ends with an underscore
+		{"a__true", [][2]string{{"a", "_true"}, {"a_", "true"}}},
+	}
+	for _, test := range tests {
+		got := grantRoleImportCandidates(test.id)
+		if fmt.Sprint(got) != fmt.Sprint(test.want) {
+			t.Errorf("%q: got %v, want %v", test.id, got, test.want)
+		}
+	}
+}
+
+// grantRoleResourceData builds the data a resource function receives in a real run: the
+// state, the diff of the plan and the raw configuration (null for an attribute which is not
+// written in the configuration).
+func grantRoleResourceData(t *testing.T, state *terraform.InstanceState, config map[string]any, rawConfig cty.Value) *schema.ResourceData {
+	t.Helper()
+	s := schema.InternalMap(resourcePostgreSQLGrantRole().Schema)
+	diff, err := s.Diff(context.Background(), state, terraform.NewResourceConfigRaw(config), nil, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff == nil {
+		diff = &terraform.InstanceDiff{}
+	}
+	diff.RawConfig = rawConfig
+	d, err := s.Data(state, diff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+func grantRoleRawConfig(attrs map[string]cty.Value) cty.Value {
+	raw := map[string]cty.Value{"role": cty.StringVal("a"), "grant_role": cty.StringVal("b")}
+	for attr, value := range attrs {
+		raw[attr] = value
+	}
+	return cty.ObjectVal(raw)
+}
+
+func TestRawConfigBool(t *testing.T) {
+	object := grantRoleRawConfig(map[string]cty.Value{"with_inherit_option": cty.NullVal(cty.Bool)})
+	tests := []struct {
+		name         string
+		raw          cty.Value
+		expected, ok bool
+	}{
+		{"attribute true", grantRoleRawConfig(map[string]cty.Value{"with_set_option": cty.True}), true, true},
+		{"attribute false", grantRoleRawConfig(map[string]cty.Value{"with_set_option": cty.False}), false, true},
+		{"attribute null", grantRoleRawConfig(map[string]cty.Value{"with_set_option": cty.NullVal(cty.Bool)}), false, false},
+		{"attribute unknown", grantRoleRawConfig(map[string]cty.Value{"with_set_option": cty.UnknownVal(cty.Bool)}), false, false},
+		{"attribute missing from the object", cty.ObjectVal(map[string]cty.Value{"role": cty.StringVal("a")}), false, false},
+		{"unknown configuration", cty.UnknownVal(object.Type()), false, false},
+		{"configuration which is not an object", cty.MapVal(map[string]cty.Value{"with_set_option": cty.True}), false, false},
+	}
+	for _, test := range tests {
+		d := grantRoleResourceData(t, nil, map[string]any{"role": "a", "grant_role": "b"}, test.raw)
+		if value, ok := rawConfigBool(d, "with_set_option"); value != test.expected || ok != test.ok {
+			t.Errorf("%s: got (%t, %t), want (%t, %t)", test.name, value, ok, test.expected, test.ok)
+		}
+	}
+
+	// no configuration at all
+	d := schema.TestResourceDataRaw(t, resourcePostgreSQLGrantRole().Schema, map[string]any{"role": "a", "grant_role": "b"})
+	if value, ok := rawConfigBool(d, "with_set_option"); value || ok {
+		t.Errorf("null configuration: got (%t, %t), want (false, false)", value, ok)
+	}
+}
+
+// The options of the configuration are written once in the GRANT of a new membership, and
+// the options of the arguments only when the options are changed in place.
+func TestCreateGrantRoleQueryOptions(t *testing.T) {
+	grant := func(role string) string {
+		return fmt.Sprintf("GRANT %s TO %s", pq.QuoteIdentifier("b"), pq.QuoteIdentifier("a")) + role
+	}
+	admin, inherit, set := grantRoleOptions[0], grantRoleOptions[1], grantRoleOptions[2]
+
+	tests := []struct {
+		name     string
+		config   map[string]any
+		raw      map[string]cty.Value
+		only     []grantRoleOption
+		expected string
+	}{
+		{
+			name:     "options of the configuration",
+			config:   map[string]any{"with_admin_option": true, "with_inherit_option": false, "with_set_option": true},
+			raw:      map[string]cty.Value{"with_admin_option": cty.True, "with_inherit_option": cty.False, "with_set_option": cty.True},
+			expected: grant(" WITH ADMIN OPTION, INHERIT FALSE, SET TRUE"),
+		},
+		{
+			name:     "admin option written false is not an option of the statement",
+			config:   map[string]any{"with_admin_option": false, "with_set_option": true},
+			raw:      map[string]cty.Value{"with_admin_option": cty.False, "with_set_option": cty.True},
+			expected: grant(" WITH SET TRUE"),
+		},
+		{
+			name:     "option which is not in the configuration",
+			config:   map[string]any{"with_inherit_option": true},
+			raw:      map[string]cty.Value{"with_inherit_option": cty.True, "with_set_option": cty.NullVal(cty.Bool)},
+			expected: grant(" WITH INHERIT TRUE"),
+		},
+		{
+			name:     "one option only",
+			config:   map[string]any{"with_admin_option": true, "with_inherit_option": true},
+			raw:      map[string]cty.Value{"with_admin_option": cty.True, "with_inherit_option": cty.True},
+			only:     []grantRoleOption{inherit},
+			expected: grant(" WITH INHERIT TRUE"),
+		},
+		{
+			name:     "one option only, set to false",
+			config:   map[string]any{"with_set_option": false},
+			raw:      map[string]cty.Value{"with_set_option": cty.False},
+			only:     []grantRoleOption{set},
+			expected: grant(" WITH SET FALSE"),
+		},
+		{
+			name:     "the admin option only",
+			config:   map[string]any{"with_admin_option": true},
+			raw:      map[string]cty.Value{"with_admin_option": cty.True},
+			only:     []grantRoleOption{admin},
+			expected: grant(" WITH ADMIN OPTION"),
+		},
+		{
+			name:     "two options only",
+			config:   map[string]any{"with_admin_option": true, "with_inherit_option": false, "with_set_option": true},
+			raw:      map[string]cty.Value{"with_admin_option": cty.True, "with_inherit_option": cty.False, "with_set_option": cty.True},
+			only:     []grantRoleOption{inherit, set},
+			expected: grant(" WITH INHERIT FALSE, SET TRUE"),
+		},
+	}
+	for _, test := range tests {
+		config := map[string]any{"role": "a", "grant_role": "b"}
+		for k, v := range test.config {
+			config[k] = v
+		}
+		d := grantRoleResourceData(t, nil, config, grantRoleRawConfig(test.raw))
+		if got := createGrantRoleQuery(d, test.only...); got != test.expected {
+			t.Errorf("%s: got %q, want %q", test.name, got, test.expected)
+		}
 	}
 }
 
@@ -805,4 +958,168 @@ resource "postgresql_grant_role" "gri" {
 			{Config: grantConfig(`with_admin_option = false`), ResourceName: "postgresql_grant_role.gri", ImportState: true, ImportStateVerify: true},
 		},
 	})
+}
+
+// testGrantRoleUpdate runs the Update of a membership the way Terraform does for a plan
+// which changes the attributes of the configuration, from a state which is given as is
+// (it can differ from the catalog, or lack the attributes of a former version).
+func testGrantRoleUpdate(t *testing.T, state map[string]string, config map[string]any, raw map[string]cty.Value) *schema.ResourceData {
+	t.Helper()
+	client := testAccProvider.Meta().(*Client)
+	db, err := client.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := &terraform.InstanceState{ID: state["role"] + "_" + state["grant_role"], Attributes: state}
+	d := grantRoleResourceData(t, instance, config, grantRoleRawConfig(raw))
+	if err := resourcePostgreSQLGrantRoleUpdate(db, d); err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+// The Update changes the options which are changed by the plan, and only these ones.
+func TestAccPostgresqlGrantRole_UpdateChangedOptionsOnly(t *testing.T) {
+	skipIfNotAcc(t)
+	testAccPreCheck(t)
+	testCheckCompatibleVersion(t, featurePrivileges)
+	db, err := testAccProvider.Meta().(*Client).Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	const member, granted = "gup_member", "gup_granted"
+
+	setup := func(t *testing.T) string {
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS "+member)
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS "+granted)
+		dbExecute(t, dsn, "CREATE ROLE "+granted)
+		dbExecute(t, dsn, "CREATE ROLE "+member)
+		dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s WITH ADMIN OPTION", granted, member))
+		t.Cleanup(func() {
+			dbExecute(t, dsn, "DROP ROLE IF EXISTS "+member)
+			dbExecute(t, dsn, "DROP ROLE IF EXISTS "+granted)
+		})
+		m, err := readMembership(testAccProvider.Meta().(*Client), member, granted)
+		if err != nil || m == nil {
+			t.Fatalf("membership not found: %v", err)
+		}
+		return m.grantor
+	}
+	baseState := func(grantor string, admin bool) map[string]string {
+		return map[string]string{
+			"role": member, "grant_role": granted, "grantor": grantor, "with_admin_option": strconv.FormatBool(admin),
+		}
+	}
+	baseConfig := func(admin bool) map[string]any {
+		return map[string]any{"role": member, "grant_role": granted, "with_admin_option": admin}
+	}
+	expect := func(t *testing.T, want membershipOptions) {
+		t.Helper()
+		got, err := readMembership(testAccProvider.Meta().(*Client), member, granted)
+		if err != nil || got == nil {
+			t.Fatalf("membership not found: %v", err)
+		}
+		if !db.featureSupported(featureRoleMembershipOptions) {
+			want.inherit, want.set = true, true
+		}
+		want.grantor = got.grantor
+		if *got != want {
+			t.Errorf("membership: expected %+v, got %+v", want, *got)
+		}
+	}
+
+	// An option which is not in the configuration is never part of the plan (a computed
+	// argument keeps its value, a state from a provider which did not know the option has
+	// none): the Update does not write it.
+	t.Run("options which are not in the configuration", func(t *testing.T) {
+		grantor := setup(t)
+		raw := map[string]cty.Value{
+			"with_admin_option": cty.False, "with_inherit_option": cty.NullVal(cty.Bool), "with_set_option": cty.NullVal(cty.Bool),
+		}
+		for name, state := range map[string]map[string]string{
+			"state of a former version": baseState(grantor, true),
+			"state with the options":    {"with_inherit_option": "true", "with_set_option": "true"},
+		} {
+			for k, v := range baseState(grantor, true) {
+				if _, ok := state[k]; !ok {
+					state[k] = v
+				}
+			}
+			d := testGrantRoleUpdate(t, state, baseConfig(false), raw)
+			if d.HasChange("with_inherit_option") || d.HasChange("with_set_option") {
+				t.Errorf("%s: the plan changes an option which is not in the configuration", name)
+			}
+			expect(t, membershipOptions{admin: false, inherit: true, set: true})
+			dbExecute(t, dsn, fmt.Sprintf("GRANT %s TO %s WITH ADMIN OPTION", granted, member))
+		}
+	})
+
+	// The state says that the admin option is off while it is on in the catalog (a plan without refresh):
+	// only what the plan changes is written.
+	t.Run("options which are not changed", func(t *testing.T) {
+		testCheckCompatibleVersion(t, featureRoleMembershipOptions)
+		grantor := setup(t)
+		state := baseState(grantor, false)
+		state["with_inherit_option"] = "true"
+		state["with_set_option"] = "true"
+		config := baseConfig(false)
+		config["with_inherit_option"] = false
+		config["with_set_option"] = true
+		testGrantRoleUpdate(t, state, config, map[string]cty.Value{
+			"with_admin_option": cty.False, "with_inherit_option": cty.False, "with_set_option": cty.True,
+		})
+		expect(t, membershipOptions{admin: true, inherit: false, set: true})
+	})
+}
+
+// The import function splits the ID in the names of the role and of the granted role.
+func TestAccPostgresqlGrantRole_ImportFunction(t *testing.T) {
+	skipIfNotAcc(t)
+	testAccPreCheck(t)
+	testCheckCompatibleVersion(t, featurePrivileges)
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	roles := []string{"gim_m", "gim_m_x", "x_g", "g", "gim_ab", "gim_c"}
+	for _, role := range roles {
+		dbExecute(t, dsn, "DROP ROLE IF EXISTS "+role)
+		dbExecute(t, dsn, "CREATE ROLE "+role)
+	}
+	t.Cleanup(func() {
+		for _, role := range roles {
+			dbExecute(t, dsn, "DROP ROLE IF EXISTS "+role)
+		}
+	})
+	dbExecute(t, dsn, "GRANT gim_c TO gim_ab")
+	// "gim_m_x_g" is gim_m member of x_g, or gim_m_x member of g
+	dbExecute(t, dsn, "GRANT x_g TO gim_m")
+	dbExecute(t, dsn, "GRANT g TO gim_m_x")
+
+	tests := []struct {
+		id, role, grantRole, expectedError string
+	}{
+		{id: "gim_ab_gim_c", role: "gim_ab", grantRole: "gim_c"},
+		{id: "gim_ab_gim_c_false", role: "gim_ab", grantRole: "gim_c"},
+		{id: "gim_c_gim_ab", expectedError: "no membership found"},
+		{id: "gim_m_x_g", expectedError: "ambiguous"},
+	}
+	for _, test := range tests {
+		d := resourcePostgreSQLGrantRole().TestResourceData()
+		d.SetId(test.id)
+		imported, err := resourcePostgreSQLGrantRoleImport(context.Background(), d, testAccProvider.Meta())
+		if test.expectedError != "" {
+			if err == nil || !regexp.MustCompile(test.expectedError).MatchString(err.Error()) {
+				t.Errorf("%s: expected the error %q, got %v", test.id, test.expectedError, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: %v", test.id, err)
+			continue
+		}
+		if len(imported) != 1 || imported[0].Get("role") != test.role || imported[0].Get("grant_role") != test.grantRole {
+			t.Errorf("%s: expected the membership of %s in %s, got %v", test.id, test.role, test.grantRole, imported)
+		}
+	}
 }
