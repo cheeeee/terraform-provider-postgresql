@@ -378,30 +378,26 @@ func pubTablesFromBlocks(v any) []pubTable {
 }
 
 // getDesiredPubTables returns the tables of the configuration, from the blocks
-// `table` or from the attribute `tables`, and whether they come from the blocks.
-func getDesiredPubTables(d *schema.ResourceData) ([]pubTable, bool, error) {
+// `table` or from the attribute `tables` (a set: its elements are unique).
+func getDesiredPubTables(d *schema.ResourceData) ([]pubTable, error) {
 	if v := d.Get(pubTableAttr); v.(*schema.Set).Len() > 0 {
 		tables := pubTablesFromBlocks(v)
 		seen := map[string]bool{}
 		for _, t := range tables {
 			if seen[t.name] {
-				return nil, true, fmt.Errorf("'%s' is duplicated for attribute `%s`", t.name, pubTableAttr)
+				return nil, fmt.Errorf("'%s' is duplicated for attribute `%s`", t.name, pubTableAttr)
 			}
 			seen[t.name] = true
 		}
-		return tables, true, nil
+		return tables, nil
 	}
 
-	list := d.Get(pubTablesAttr).(*schema.Set).List()
-	if elem, ok := isUniqueArr(list); !ok {
-		return nil, false, fmt.Errorf("'%s' is duplicated for attribute `%s`", elem.(string), pubTablesAttr)
-	}
 	var tables []pubTable
-	for _, t := range list {
+	for _, t := range d.Get(pubTablesAttr).(*schema.Set).List() {
 		tables = append(tables, pubTable{name: t.(string)})
 	}
 	sort.Slice(tables, func(i, j int) bool { return tables[i].name < tables[j].name })
-	return tables, false, nil
+	return tables, nil
 }
 
 // checkPubFeatures refuses the options of the tables and the schemas which the server does not have.
@@ -597,7 +593,7 @@ func setPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubName
 		return nil
 	}
 
-	want, _, err := getDesiredPubTables(d)
+	want, err := getDesiredPubTables(d)
 	if err != nil {
 		return err
 	}
@@ -1169,7 +1165,7 @@ func getTablesForPublication(db *DBConnection, d *schema.ResourceData) (string, 
 		return "FOR " + all, nil
 	}
 
-	tables, _, err := getDesiredPubTables(d)
+	tables, err := getDesiredPubTables(d)
 	if err != nil {
 		return "", err
 	}
