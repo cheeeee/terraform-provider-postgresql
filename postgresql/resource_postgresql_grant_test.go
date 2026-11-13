@@ -3368,6 +3368,7 @@ func TestAccPostgresqlResolveFunctionSignature(t *testing.T) {
 		"f_ov(integer))":   "",
 		"f_ov(no_such_t)":  "",
 		"f_nothing(text)":  "",
+		"(integer)":        "", // no name
 		"f_ov(text, text)": "",
 	} {
 		txn, err := db.Begin()
