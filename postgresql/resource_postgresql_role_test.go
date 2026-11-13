@@ -2608,13 +2608,16 @@ resource "postgresql_role" "pwdd_null_role" {
 // PostgreSQL before 10 does not know SCRAM-SHA-256 and has no UNENCRYPTED PASSWORD to refuse: with
 // the version of the server set by the configuration of the provider, encrypted_password = false is accepted.
 func TestAccPostgresqlRole_PasswordUnencryptedOldServer(t *testing.T) {
+	t.Cleanup(resetDBRegistry)
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureScramSHA256)
 		},
+		// A provider of its own: the provider of the other tests, which the helpers of the tests use
+		// too, must not keep this version. The connections opened with it are dropped at the end.
 		ProviderFactories: map[string]func() (*schema.Provider, error){
-			"postgresql": func() (*schema.Provider, error) { return testAccProvider, nil },
+			"postgresql": func() (*schema.Provider, error) { return Provider(), nil },
 		},
 		CheckDestroy: func(s *terraform.State) error {
 			resetDBRegistry()
