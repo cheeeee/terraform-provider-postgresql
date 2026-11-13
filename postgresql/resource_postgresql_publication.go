@@ -307,8 +307,6 @@ type pubTable struct {
 	columns    []string
 	filter     string
 	filterNorm string
-	// members are the relations of the publication (quoted names) this table stands for
-	members []string
 }
 
 // clause returns the table as PostgreSQL expects it after TABLE.
@@ -320,6 +318,12 @@ func (t pubTable) clause() string {
 	case t.star:
 		clause += " *"
 	}
+	return clause + t.options()
+}
+
+// options returns the column list and the row filter of the table.
+func (t pubTable) options() string {
+	clause := ""
 	if len(t.columns) > 0 {
 		quoted := make([]string, len(t.columns))
 		for i, c := range t.columns {
@@ -507,16 +511,48 @@ func inheritanceDescendants(txn *sql.Tx, oid int64) ([]int64, error) {
 	return oids, rows.Err()
 }
 
+// pubTableDescendants returns the descendants of a table which PostgreSQL publishes with it: the tables
+// which inherit from it (the partitions of a partitioned table are not rows of a publication).
+func pubTableDescendants(txn *sql.Tx, oid int64) ([]pubRel, error) {
+	rows, err := txn.Query(
+		"WITH RECURSIVE d(oid) AS (SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class p ON p.oid = i.inhparent "+
+			"WHERE i.inhparent = $1::oid AND p.relkind = 'r' "+
+			"UNION SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN d ON i.inhparent = d.oid) "+
+			"SELECT c.oid::bigint, n.nspname, c.relname FROM d JOIN pg_catalog.pg_class c ON c.oid = d.oid "+
+			"JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace ORDER BY n.nspname, c.relname",
+		oid,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var rels []pubRel
+	for rows.Next() {
+		var r pubRel
+		if err := rows.Scan(&r.oid, &r.schema, &r.name); err != nil {
+			return nil, err
+		}
+		rels = append(rels, r)
+	}
+	return rels, rows.Err()
+}
+
 // pubTablesFromRels groups the rows of a publication in tables: a descendant of
 // another table of the publication stands for the descendants of this table
 // (they are added by PostgreSQL), unless it is in explicit (it has been asked).
-func pubTablesFromRels(txn *sql.Tx, rels []pubRel, explicit map[int64]bool) ([]pubTable, error) {
+//
+// The rows do not tell why a descendant is published. priorOnly gives the tables of explicit
+// which are ONLY in the configuration: it is kept as long as the rows agree with it, which is
+// when their descendants in the publication are the ones of another table of the configuration.
+func pubTablesFromRels(txn *sql.Tx, rels []pubRel, explicit, priorOnly map[int64]bool) ([]pubTable, error) {
 	inPub := map[int64]bool{}
 	for _, r := range rels {
 		inPub[r.oid] = true
 	}
 	descendants := map[int64][]int64{}
 	collapsed := map[int64]bool{}
+	// publishers: the tables of the configuration which publish a relation as one of their descendants
+	publishers := map[int64][]int64{}
 	for _, r := range rels {
 		if r.kind != "r" {
 			continue
@@ -530,13 +566,12 @@ func pubTablesFromRels(txn *sql.Tx, rels []pubRel, explicit map[int64]bool) ([]p
 			if inPub[o] && !explicit[o] {
 				collapsed[o] = true
 			}
+			if explicit[r.oid] && !priorOnly[r.oid] {
+				publishers[o] = append(publishers[o], r.oid)
+			}
 		}
 	}
 
-	byOid := map[int64]pubRel{}
-	for _, r := range rels {
-		byOid[r.oid] = r
-	}
 	var tables []pubTable
 	for _, r := range rels {
 		if collapsed[r.oid] {
@@ -547,35 +582,41 @@ func pubTablesFromRels(txn *sql.Tx, rels []pubRel, explicit map[int64]bool) ([]p
 			name:    r.schema + "." + r.name,
 			columns: r.columns,
 			filter:  r.filter,
-			members: []string{pq.QuoteIdentifier(r.schema) + "." + pq.QuoteIdentifier(r.name)},
 		}
 		sort.Strings(t.columns)
-		all := true
+		// The descendants which are not tables of the configuration themselves tell ONLY from the default.
+		own, missing, unexplained := 0, 0, 0
 		for _, o := range descendants[r.oid] {
+			if explicit[o] {
+				continue
+			}
+			own++
 			if !inPub[o] {
-				all = false
-			} else if collapsed[o] {
-				m := byOid[o]
-				t.members = append(t.members, pq.QuoteIdentifier(m.schema)+"."+pq.QuoteIdentifier(m.name))
+				missing++
+			} else if len(publishers[o]) == 0 {
+				unexplained++
 			}
 		}
-		if len(descendants[r.oid]) > 0 {
+		if own > 0 {
 			t.onlyKnown = true
-			t.only = !all
+			if explicit[r.oid] && priorOnly[r.oid] && unexplained == 0 {
+				t.only = true
+			} else {
+				t.only = missing > 0
+			}
 		}
 		tables = append(tables, t)
 	}
 	return tables, nil
 }
 
-// pubTableEqual tells whether the table asked has the options of the table of the publication.
+// pubRelEqual tells whether a row of the publication has the options of the table which publishes it.
 // old are the tables of the state of Terraform, by oid: a row filter is not compared
 // as a text, because PostgreSQL stores a normalized form of it.
-func pubTableEqual(want, have pubTable, old map[int64]pubTable) bool {
-	if strings.Join(want.columns, ",") != strings.Join(have.columns, ",") {
-		return false
-	}
-	if have.onlyKnown && want.only != have.only {
+func pubRelEqual(want pubTable, have pubRel, old map[int64]pubTable) bool {
+	columns := append([]string{}, have.columns...)
+	sort.Strings(columns)
+	if strings.Join(want.columns, ",") != strings.Join(columns, ",") {
 		return false
 	}
 	switch {
@@ -601,17 +642,38 @@ func setPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubName
 		return err
 	}
 
-	explicit := map[int64]bool{}
-	wantByOid := map[int64]pubTable{}
+	// The rows the publication must have: the tables asked and, unless ONLY, their descendants with the
+	// options of the table. A descendant asked for itself has its own options.
+	type row struct {
+		name  string
+		table pubTable
+	}
+	rowOf := map[int64]row{}
+	var order []int64
 	for i := range want {
 		if want[i].oid, err = resolvePubTable(txn, want[i].name); err != nil {
 			return err
 		}
-		if _, dup := wantByOid[want[i].oid]; dup {
+		if _, dup := rowOf[want[i].oid]; dup {
 			return fmt.Errorf("'%s' is duplicated for attribute `%s`", want[i].name, pubTablesAttr)
 		}
-		explicit[want[i].oid] = true
-		wantByOid[want[i].oid] = want[i]
+		rowOf[want[i].oid] = row{quoteTableName(want[i].name), want[i]}
+		order = append(order, want[i].oid)
+	}
+	for _, w := range want {
+		if w.only {
+			continue
+		}
+		descendants, err := pubTableDescendants(txn, w.oid)
+		if err != nil {
+			return fmt.Errorf("could not get the descendants of %s: %w", w.name, err)
+		}
+		for _, r := range descendants {
+			if _, ok := rowOf[r.oid]; !ok {
+				rowOf[r.oid] = row{pq.QuoteIdentifier(r.schema) + "." + pq.QuoteIdentifier(r.name), w}
+				order = append(order, r.oid)
+			}
+		}
 	}
 
 	// the tables of the state, to compare the row filters
@@ -621,7 +683,6 @@ func setPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubName
 		if oid, err := resolvePubTable(txn, t.name); err == nil {
 			t.oid = oid
 			old[oid] = t
-			explicit[oid] = true
 		}
 	}
 
@@ -629,45 +690,27 @@ func setPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubName
 	if err != nil {
 		return err
 	}
-	have, err := pubTablesFromRels(txn, rels, explicit)
-	if err != nil {
-		return err
-	}
-
-	var drops, adds []string
-	haveByOid := map[int64]pubTable{}
-	for _, h := range have {
-		haveByOid[h.oid] = h
-		if _, ok := wantByOid[h.oid]; !ok {
-			for _, m := range h.members {
-				drops = append(drops, m)
-			}
-		}
-	}
-	for _, w := range want {
-		h, ok := haveByOid[w.oid]
-		if ok && pubTableEqual(w, h, old) {
+	// Row by row: a table which does not change is never dropped, and a descendant which another table
+	// still publishes stays in the publication.
+	upToDate := map[int64]bool{}
+	for _, r := range rels {
+		if wanted, ok := rowOf[r.oid]; ok && pubRelEqual(wanted.table, r, old) {
+			upToDate[r.oid] = true
 			continue
 		}
-		if ok {
-			drops = append(drops, h.members...)
-		}
-		adds = append(adds, w.clause())
-	}
-
-	dropped := map[string]bool{}
-	for _, m := range drops {
-		// a descendant of several tables is a member of all of them
-		if dropped[m] {
-			continue
-		}
-		dropped[m] = true
-		if _, err := txn.Exec(fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE ONLY %s", pq.QuoteIdentifier(pubName), m)); err != nil {
+		name := pq.QuoteIdentifier(r.schema) + "." + pq.QuoteIdentifier(r.name)
+		if _, err := txn.Exec(fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE ONLY %s", pq.QuoteIdentifier(pubName), name)); err != nil {
 			return fmt.Errorf("could not drop a table from the publication: %w", err)
 		}
 	}
-	for _, a := range adds {
-		if _, err := txn.Exec(fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", pq.QuoteIdentifier(pubName), a)); err != nil {
+	for _, oid := range order {
+		if upToDate[oid] {
+			continue
+		}
+		wanted := rowOf[oid]
+		if _, err := txn.Exec(fmt.Sprintf(
+			"ALTER PUBLICATION %s ADD TABLE ONLY %s%s", pq.QuoteIdentifier(pubName), wanted.name, wanted.table.options(),
+		)); err != nil {
 			return fmt.Errorf("could not add a table to the publication: %w", err)
 		}
 	}
@@ -1008,7 +1051,7 @@ func readPubAllTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pub
 				explicit[oid] = true
 			}
 		}
-		except, err := pubTablesFromRels(txn, rels, explicit)
+		except, err := pubTablesFromRels(txn, rels, explicit, nil)
 		if err != nil {
 			return err
 		}
@@ -1046,6 +1089,7 @@ func readPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubNam
 	// What the configuration says about the tables: the descendants asked explicitly,
 	// the name of the table, ONLY when it can not be read, the row filter as written.
 	explicit := map[int64]bool{}
+	priorOnly := map[int64]bool{}
 	prior := map[int64]pubTable{}
 	// (`tables` is Computed: it keeps the tables of the state when the blocks are used)
 	if !blocksMode {
@@ -1060,6 +1104,7 @@ func readPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubNam
 			t.oid = oid
 			prior[oid] = t
 			explicit[oid] = true
+			priorOnly[oid] = t.only
 		}
 	}
 
@@ -1067,7 +1112,7 @@ func readPubTables(txn *sql.Tx, db *DBConnection, d *schema.ResourceData, pubNam
 	if err != nil {
 		return err
 	}
-	tables, err := pubTablesFromRels(txn, rels, explicit)
+	tables, err := pubTablesFromRels(txn, rels, explicit, priorOnly)
 	if err != nil {
 		return err
 	}

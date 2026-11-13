@@ -1879,6 +1879,129 @@ func testPubInheritanceFixture(t *testing.T, dbName string) {
 	)
 }
 
+// A table and one of its descendants are both in the configuration, one of them ONLY: the rows of the
+// publication do not tell which one publishes the descendants of the descendant, the configuration does.
+func TestAccPostgresqlPublication_NestedDescendants(t *testing.T) {
+	skipIfNotAcc(t)
+
+	dbSuffix, teardown := setupTestDatabase(t, true, true)
+	defer teardown()
+	dbName, _ := getTestDBNames(dbSuffix)
+	testPubInheritanceFixture(t, dbName)
+
+	all := "test_schema.chi,test_schema.grandchi,test_schema.par"
+	blocks := func(parOnly, chiOnly bool) string {
+		return testPubConfig(dbName, fmt.Sprintf(`
+	table {
+		name = "test_schema.par"
+		only = %t
+	}
+	table {
+		name = "test_schema.chi"
+		only = %t
+	}`, parOnly, chiOnly))
+	}
+	other := testPubConfig(dbName, `
+	table {
+		name = "test_schema.other"
+	}`)
+	// the rows of pg_publication_rel: a table which is dropped and added again has a new row
+	rows := `SELECT COALESCE(string_agg(c.relname || '=' || r.oid, ',' ORDER BY c.relname), '')
+		FROM pg_catalog.pg_publication_rel r
+		JOIN pg_catalog.pg_publication p ON p.oid = r.prpubid
+		JOIN pg_catalog.pg_class c ON c.oid = r.prrelid
+		WHERE p.pubname = $1`
+	var kept string
+	only := func(par, chi string) resource.TestCheckFunc {
+		return resource.ComposeTestCheckFunc(
+			resource.TestCheckTypeSetElemNestedAttrs(testPubResource, "table.*", map[string]string{"name": "test_schema.par", "only": par}),
+			resource.TestCheckTypeSetElemNestedAttrs(testPubResource, "table.*", map[string]string{"name": "test_schema.chi", "only": chi}),
+			resource.TestCheckResourceAttr(testPubResource, "table.#", "2"),
+		)
+	}
+
+	testPubTestCase(t, nil, testPubInPlace([]resource.TestStep{
+		{
+			// grandchi is published with chi
+			Config: blocks(true, false),
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, all),
+				only("true", "false"),
+				func(*terraform.State) (err error) {
+					kept, err = testPubCatalog(dbName, "pub", rows)
+					return err
+				},
+			),
+		},
+		{
+			// grandchi is now published with par: no table is dropped
+			Config: blocks(false, true),
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, all),
+				only("false", "true"),
+				func(*terraform.State) error {
+					now, err := testPubCatalog(dbName, "pub", rows)
+					if err != nil {
+						return err
+					}
+					if now != kept {
+						return fmt.Errorf("tables were dropped and added again: the rows were %s, they are %s", kept, now)
+					}
+					return nil
+				},
+			),
+		},
+		{
+			Config: blocks(true, true),
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "test_schema.chi,test_schema.par"), only("true", "true"),
+			),
+		},
+		{
+			// a descendant added outside which no table of the configuration publishes
+			PreConfig: func() {
+				testPubExec(t, dbName, "ALTER PUBLICATION pub ADD TABLE ONLY test_schema.grandchi")
+			},
+			Config:             blocks(true, true),
+			PlanOnly:           true,
+			ExpectNonEmptyPlan: true,
+		},
+		{
+			Config: blocks(true, true),
+			Check: resource.ComposeTestCheckFunc(
+				testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "test_schema.chi,test_schema.par"), only("true", "true"),
+			),
+		},
+		{
+			// grandchi is a descendant of the two tables, it is added once
+			Config: blocks(false, false),
+			Check:  resource.ComposeTestCheckFunc(testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, all), only("false", "false")),
+		},
+		{
+			// a descendant dropped outside
+			PreConfig: func() {
+				testPubExec(t, dbName, "ALTER PUBLICATION pub DROP TABLE ONLY test_schema.grandchi")
+			},
+			Config:             blocks(false, false),
+			PlanOnly:           true,
+			ExpectNonEmptyPlan: true,
+		},
+		{
+			Config: blocks(false, false),
+			Check:  resource.ComposeTestCheckFunc(testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, all), only("false", "false")),
+		},
+		{
+			Config: other,
+			Check:  testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, "test_schema.other"),
+		},
+		{
+			// the two tables are added with their descendants at the same time
+			Config: blocks(false, false),
+			Check:  resource.ComposeTestCheckFunc(testAccCheckPublicationCatalog(dbName, "pub", testPubRelsQuery, all), only("false", "false")),
+		},
+	}))
+}
+
 // a descendant asked for explicitly is a table of the configuration, not one which PostgreSQL adds with its parent
 func TestAccPostgresqlPublication_ExplicitDescendants(t *testing.T) {
 	skipIfNotAcc(t)
