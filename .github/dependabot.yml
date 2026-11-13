@@ -9,6 +9,15 @@ updates:
       go-modules:
         patterns:
           - "*"
+    # The modules the connection to Google Cloud SQL goes through are not updated here: nothing
+    # tests this connection without a Google Cloud account. gocloud.dev 0.49 opens it with another
+    # connector, which reads the host of the provider (project/region/instance and the port) as
+    # another instance: such an update needs a change of the provider and a test on Cloud SQL.
+    ignore:
+      - dependency-name: gocloud.dev
+      - dependency-name: github.com/GoogleCloudPlatform/cloudsql-proxy
+      - dependency-name: google.golang.org/api
+      - dependency-name: cloud.google.com/go/*
 
   - package-ecosystem: github-actions
     directory: /
