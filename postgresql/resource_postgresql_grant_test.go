@@ -3247,6 +3247,21 @@ func TestAccPostgresqlGrantFunctionOutArguments(t *testing.T) {
 	for _, kind := range []string{"function", "procedure"} {
 		t.Run(kind, func(t *testing.T) {
 			dsn := testPostgresDSN(t)
+			if kind == "procedure" {
+				// before the setup, which creates a procedure with an OUT argument
+				var version int
+				conn, err := sql.Open("postgres", dsn)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer closeDB(t, conn)
+				if err := conn.QueryRow("SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
+					t.Fatal(err)
+				}
+				if version < 140000 {
+					t.Skipf("a procedure has OUT arguments since PostgreSQL 14, not in %d", version)
+				}
+			}
 			dbExecute(t, dsn, fmt.Sprintf("CREATE ROLE test_out_role LOGIN PASSWORD '%s'", testRolePassword))
 			dbExecute(t, dsn, "CREATE SCHEMA test_out_schema")
 			dbExecute(t, dsn, "GRANT USAGE ON SCHEMA test_out_schema TO test_out_role")
@@ -3285,13 +3300,6 @@ resource "postgresql_grant" "test" {
 					testCheckCompatibleVersion(t, featurePrivileges)
 					if kind == "procedure" {
 						testCheckCompatibleVersion(t, featureProcedure)
-						db, err := testAccProvider.Meta().(*Client).Connect()
-						if err != nil {
-							t.Fatalf("could not connect to database: %v", err)
-						}
-						if db.version.Major < 14 {
-							t.Skipf("a procedure has OUT arguments since PostgreSQL 14, not in %s", db.version)
-						}
 					}
 				},
 				Providers: testAccProviders,
