@@ -44,6 +44,12 @@ resource "postgresql_user_mapping" "remote" {
 }
 ```
 
+
+~> **Note:** PostgreSQL only shows the options of a user mapping to a superuser, to the mapped user itself and, for
+the mapping of `public`, to the owner of the server. When the provider is connected with another user (for example
+the master user of a managed service, for the mapping of another role), the options are written but cannot be read
+back: a change made outside of Terraform is not detected, and an import does not bring the options.
+
 ## Argument Reference
 
 * `user_name` - (Required) The name of an existing user that is mapped to foreign server. Use `public` to create a so-called public mapping, which is used when no user-specific mapping is applicable.

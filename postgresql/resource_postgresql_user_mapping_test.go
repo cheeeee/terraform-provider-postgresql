@@ -167,10 +167,21 @@ func testAccCheckPostgresqlUserMappingExists(n string) resource.TestCheckFunc {
 	}
 }
 
+// testUserMappingOptionsHidden tells whether PostgreSQL hides the options of the mapping of this user
+// from the connected user: only a superuser reads the options of the mapping of another role.
+func testUserMappingOptionsHidden(client *Client, username string) bool {
+	return !client.config.Superuser && username != "public" && username != client.config.Username
+}
+
 // testAccCheckUserMappingCatalog checks the options of a user mapping in the catalog.
 func testAccCheckUserMappingCatalog(username, serverName string, options map[string]string) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
-		txn, err := startTransaction(testAccProvider.Meta().(*Client), "")
+		client := testAccProvider.Meta().(*Client)
+		if testUserMappingOptionsHidden(client, username) {
+			// (the options of a mapping the connected user can read are checked by TestAccPostgresqlUserMapping_ConnectedUser)
+			return nil
+		}
+		txn, err := startTransaction(client, "")
 		if err != nil {
 			return err
 		}
@@ -329,6 +340,11 @@ func TestAccPostgresqlUserMapping_OptionsAddSetDrop(t *testing.T) {
 
 // A user mapping is imported by its ID: the user name and the server name joined by a dot.
 func TestAccPostgresqlUserMapping_Import(t *testing.T) {
+	// the options of the mapping of another role are not imported by a user who is not a superuser
+	var ignore []string
+	if !getTestConfig(t).Superuser {
+		ignore = []string{"options.%", "options.user", "options.password"}
+	}
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -344,10 +360,11 @@ func TestAccPostgresqlUserMapping_Import(t *testing.T) {
     password = "pass"`),
 			},
 			{
-				ResourceName:      "postgresql_user_mapping.remote",
-				ImportState:       true,
-				ImportStateId:     "remote_um_import.myserver_um_import",
-				ImportStateVerify: true,
+				ResourceName:            "postgresql_user_mapping.remote",
+				ImportState:             true,
+				ImportStateId:           "remote_um_import.myserver_um_import",
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: ignore,
 			},
 			// the ID of a mapping which does not exist is refused
 			{
@@ -371,6 +388,10 @@ func TestAccPostgresqlUserMapping_ChangedOutsideTerraform(t *testing.T) {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureServer)
 			testCheckCanCreateExtension(t, "postgres_fdw")
+			if testUserMappingOptionsHidden(testAccProvider.Meta().(*Client), userName) {
+				t.Skip("PostgreSQL hides the options of the mapping of another role from a user who is not a superuser: " +
+					"see TestAccPostgresqlUserMapping_ConnectedUser")
+			}
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
@@ -393,6 +414,80 @@ func TestAccPostgresqlUserMapping_ChangedOutsideTerraform(t *testing.T) {
 			{
 				Config: config,
 				Check:  testAccCheckUserMappingCatalog(userName, serverName, map[string]string{"password": "pass"}),
+			},
+		},
+	})
+}
+
+// The mapping of the connected user: its options are read by any user, a superuser or not. They are
+// checked in the catalog, a change made outside of Terraform is planned and they are imported.
+func TestAccPostgresqlUserMapping_ConnectedUser(t *testing.T) {
+	const serverName = "myserver_um_self"
+	userName := getTestConfig(t).Username
+	config := func(options string) string {
+		return fmt.Sprintf(`
+resource "postgresql_extension" "ext_postgres_fdw" {
+  name = "postgres_fdw"
+}
+
+resource "postgresql_server" "myserver" {
+  server_name = %q
+  fdw_name    = "postgres_fdw"
+
+  depends_on = [postgresql_extension.ext_postgres_fdw]
+}
+
+resource "postgresql_user_mapping" "self" {
+  server_name = postgresql_server.myserver.server_name
+  user_name   = %q
+  options = {
+%s
+  }
+}
+`, serverName, userName, options)
+	}
+	withPassword := config(`
+    user     = "admin"
+    password = "pass"`)
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testCheckCompatibleVersion(t, featureServer)
+			testCheckCanCreateExtension(t, "postgres_fdw")
+		},
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckPostgresqlUserMappingDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: withPassword,
+				Check:  testAccCheckUserMappingCatalog(userName, serverName, map[string]string{"user": "admin", "password": "pass"}),
+			},
+			{
+				ResourceName:      "postgresql_user_mapping.self",
+				ImportState:       true,
+				ImportStateId:     userName + "." + serverName,
+				ImportStateVerify: true,
+			},
+			{
+				PreConfig: func() {
+					testConfig := getTestConfig(t)
+					dbExecute(t, testConfig.connStr("postgres"),
+						fmt.Sprintf("ALTER USER MAPPING FOR %s SERVER %s OPTIONS (SET password 'changed')",
+							pq.QuoteIdentifier(userName), pq.QuoteIdentifier(serverName)))
+				},
+				Config:             withPassword,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: withPassword,
+				Check:  testAccCheckUserMappingCatalog(userName, serverName, map[string]string{"user": "admin", "password": "pass"}),
+			},
+			{
+				// DROP user, SET password
+				Config: config(`
+    password = "pass2"`),
+				Check: testAccCheckUserMappingCatalog(userName, serverName, map[string]string{"password": "pass2"}),
 			},
 		},
 	})

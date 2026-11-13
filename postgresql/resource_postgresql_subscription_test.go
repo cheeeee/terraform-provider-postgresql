@@ -1701,7 +1701,8 @@ func (s *subTest) ownerRole() (string, func()) {
 		config := getTestConfig(t)
 		t.Cleanup(func() {
 			dbExecute(t, config.connStr("postgres"), fmt.Sprintf(
-				`DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = '%[1]s') THEN DROP OWNED BY %[1]s; DROP ROLE %[1]s; END IF; END $$`, roleName))
+				// (a user who is not a superuser needs the privileges of the role to drop what it owns)
+				`DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = '%[1]s') THEN GRANT %[1]s TO CURRENT_USER; DROP OWNED BY %[1]s; DROP ROLE %[1]s; END IF; END $$`, roleName))
 		})
 		dbExecute(t, config.connStr("postgres"), fmt.Sprintf("CREATE ROLE %s", roleName))
 		if testServerVersionNum(t) >= 160000 {
