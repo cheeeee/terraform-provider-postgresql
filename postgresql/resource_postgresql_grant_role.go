@@ -171,6 +171,10 @@ func resourcePostgreSQLGrantRoleUpdate(db *DBConnection, d *schema.ResourceData)
 	// The options are changed in place: GRANT ... WITH <option> to enable one,
 	// REVOKE <option> OPTION FOR to disable it. An option which is not in the
 	// configuration is never changed by a plan (its argument is computed).
+	grantedBy, err := grantRoleGrantorClause(txn, d)
+	if err != nil {
+		return err
+	}
 	for _, option := range grantRoleOptions {
 		if !d.HasChange(option.attr) {
 			continue
@@ -178,9 +182,9 @@ func resourcePostgreSQLGrantRoleUpdate(db *DBConnection, d *schema.ResourceData)
 
 		var query string
 		if d.Get(option.attr).(bool) {
-			query = createGrantRoleQuery(d, option)
+			query = createGrantRoleQuery(d, grantedBy, option)
 		} else {
-			query = createRevokeRoleOptionQuery(d, option)
+			query = createRevokeRoleOptionQuery(d, grantedBy, option)
 		}
 		if _, err := txn.Exec(query); err != nil {
 			return fmt.Errorf("could not change %s of the grant role: %w", option.sql, err)
@@ -301,17 +305,48 @@ func checkGrantRoleOptions(db *DBConnection, d *schema.ResourceData) error {
 	return nil
 }
 
-func grantRoleGrantorClause(d *schema.ResourceData) string {
-	if grantor, _ := d.Get(grantRoleGrantorAttr).(string); grantor != "" {
-		return " GRANTED BY " + pq.QuoteIdentifier(grantor)
+// grantedByClause returns the GRANTED BY clause of a grantor, nothing without grantor.
+func grantedByClause(grantor string) string {
+	if grantor == "" {
+		return ""
 	}
-	return ""
+	return " GRANTED BY " + pq.QuoteIdentifier(grantor)
+}
+
+// grantRoleGrantorClause returns the GRANTED BY clause of the statements of the membership.
+//
+// The grantor of the configuration is always named. The one which was only read from the catalog
+// is named when the connected user is allowed to (it has the privileges of this role): PostgreSQL
+// can record another role than the one which runs the GRANT (on AWS RDS, the memberships granted
+// by the master user are recorded as granted by rdsadmin, which it cannot name). Without the
+// clause PostgreSQL chooses the same grantor as it did for the GRANT.
+func grantRoleGrantorClause(db QueryAble, d *schema.ResourceData) (string, error) {
+	grantor, _ := d.Get(grantRoleGrantorAttr).(string)
+	if grantor == "" {
+		return "", nil
+	}
+	if config := d.GetRawConfig(); !config.IsNull() && config.IsKnown() && config.Type().IsObjectType() &&
+		config.Type().HasAttribute(grantRoleGrantorAttr) {
+		if value := config.GetAttr(grantRoleGrantorAttr); !value.IsNull() && value.IsKnown() {
+			return grantedByClause(grantor), nil
+		}
+	}
+	var allowed bool
+	if err := db.QueryRow(
+		"SELECT COALESCE((SELECT pg_catalog.pg_has_role(oid, 'USAGE') FROM pg_catalog.pg_roles WHERE rolname = $1), false)", grantor,
+	).Scan(&allowed); err != nil {
+		return "", fmt.Errorf("could not check the grantor %s of the membership: %w", grantor, err)
+	}
+	if !allowed {
+		return "", nil
+	}
+	return grantedByClause(grantor), nil
 }
 
 // createGrantRoleQuery returns the GRANT statement. Without options, it grants
 // the membership with the options which are in the configuration; with options,
 // only these ones (they are changed in place for an existing membership).
-func createGrantRoleQuery(d *schema.ResourceData, only ...grantRoleOption) string {
+func createGrantRoleQuery(d *schema.ResourceData, grantedBy string, only ...grantRoleOption) string {
 	grantRole, _ := d.Get("grant_role").(string)
 	role, _ := d.Get("role").(string)
 
@@ -340,7 +375,7 @@ func createGrantRoleQuery(d *schema.ResourceData, only ...grantRoleOption) strin
 		query += " WITH " + strings.Join(options, ", ")
 	}
 
-	return query + grantRoleGrantorClause(d)
+	return query + grantedBy
 }
 
 func grantRoleOptionSQL(option grantRoleOption, value bool) string {
@@ -350,7 +385,7 @@ func grantRoleOptionSQL(option grantRoleOption, value bool) string {
 	return fmt.Sprintf("%s %s", option.sql, strings.ToUpper(strconv.FormatBool(value)))
 }
 
-func createRevokeRoleQuery(d *schema.ResourceData) string {
+func createRevokeRoleQuery(d *schema.ResourceData, grantedBy string) string {
 	grantRole, _ := d.Get("grant_role").(string)
 	role, _ := d.Get("role").(string)
 
@@ -358,11 +393,11 @@ func createRevokeRoleQuery(d *schema.ResourceData) string {
 		"REVOKE %s FROM %s%s",
 		pq.QuoteIdentifier(grantRole),
 		pq.QuoteIdentifier(role),
-		grantRoleGrantorClause(d),
+		grantedBy,
 	)
 }
 
-func createRevokeRoleOptionQuery(d *schema.ResourceData, option grantRoleOption) string {
+func createRevokeRoleOptionQuery(d *schema.ResourceData, grantedBy string, option grantRoleOption) string {
 	grantRole, _ := d.Get("grant_role").(string)
 	role, _ := d.Get("role").(string)
 
@@ -371,12 +406,16 @@ func createRevokeRoleOptionQuery(d *schema.ResourceData, option grantRoleOption)
 		option.sql,
 		pq.QuoteIdentifier(grantRole),
 		pq.QuoteIdentifier(role),
-		grantRoleGrantorClause(d),
+		grantedBy,
 	)
 }
 
 func grantRole(txn *sql.Tx, d *schema.ResourceData) error {
-	query := createGrantRoleQuery(d)
+	grantedBy, err := grantRoleGrantorClause(txn, d)
+	if err != nil {
+		return err
+	}
+	query := createGrantRoleQuery(d, grantedBy)
 	if _, err := txn.Exec(query); err != nil {
 		return fmt.Errorf("could not execute grant query: %w", err)
 	}
@@ -384,7 +423,11 @@ func grantRole(txn *sql.Tx, d *schema.ResourceData) error {
 }
 
 func revokeRole(txn *sql.Tx, d *schema.ResourceData) error {
-	query := createRevokeRoleQuery(d)
+	grantedBy, err := grantRoleGrantorClause(txn, d)
+	if err != nil {
+		return err
+	}
+	query := createRevokeRoleQuery(d, grantedBy)
 	if _, err := txn.Exec(query); err != nil {
 		return fmt.Errorf("could not execute revoke query: %w", err)
 	}

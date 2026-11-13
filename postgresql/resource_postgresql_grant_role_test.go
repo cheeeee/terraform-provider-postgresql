@@ -49,7 +49,7 @@ func TestCreateGrantRoleQuery(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		out := createGrantRoleQuery(schema.TestResourceDataRaw(t, resourcePostgreSQLGrantRole().Schema, c.resource))
+		out := createGrantRoleQuery(schema.TestResourceDataRaw(t, resourcePostgreSQLGrantRole().Schema, c.resource), "")
 		if out != c.expected {
 			t.Fatalf("error matching output and expected: %#v vs %#v", out, c.expected)
 		}
@@ -88,7 +88,7 @@ func TestRevokeRoleQuery(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		out := createRevokeRoleQuery(schema.TestResourceDataRaw(t, resourcePostgreSQLGrantRole().Schema, c.resource))
+		out := createRevokeRoleQuery(schema.TestResourceDataRaw(t, resourcePostgreSQLGrantRole().Schema, c.resource), "")
 		if out != expected {
 			t.Fatalf("error matching output and expected: %#v vs %#v", out, expected)
 		}
@@ -770,6 +770,73 @@ func TestGrantRoleImportCandidates(t *testing.T) {
 	}
 }
 
+// The grantor which is only read from the catalog is named in the statements when the connected
+// user is allowed to name it. On AWS RDS the memberships granted by the master user are recorded
+// as granted by rdsadmin: GRANTED BY rdsadmin is refused, the statement without it is accepted.
+func TestAccPostgresqlGrantRole_GrantorClause(t *testing.T) {
+	skipIfNotAcc(t)
+
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeDB(t, db)
+	var currentUser string
+	var superuser bool
+	if err := db.QueryRow("SELECT current_user, rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&currentUser, &superuser); err != nil {
+		t.Fatal(err)
+	}
+	// a role the connected user is not a member of: only a superuser has its privileges
+	dbExecute(t, dsn, "DROP ROLE IF EXISTS grc_other")
+	dbExecute(t, dsn, "CREATE ROLE grc_other")
+	defer dbExecute(t, dsn, "DROP ROLE IF EXISTS grc_other")
+	if !superuser {
+		dbExecute(t, dsn, "REVOKE grc_other FROM "+pq.QuoteIdentifier(currentUser))
+	}
+	otherClause := ""
+	if superuser {
+		otherClause = ` GRANTED BY "grc_other"`
+	}
+
+	state := func(grantor string) *terraform.InstanceState {
+		return &terraform.InstanceState{ID: "a_b", Attributes: map[string]string{
+			"role": "a", "grant_role": "b", "with_admin_option": "false", "grantor": grantor,
+		}}
+	}
+	for _, test := range []struct {
+		name     string
+		state    *terraform.InstanceState
+		raw      cty.Value
+		expected string
+	}{
+		{"no grantor", nil, grantRoleRawConfig(nil), ""},
+		{"the connected user, read from the catalog", state(currentUser), grantRoleRawConfig(nil), ` GRANTED BY "` + currentUser + `"`},
+		{"another role, read from the catalog", state("grc_other"), grantRoleRawConfig(nil), otherClause},
+		{"another role, read from the catalog, on destroy", state("grc_other"), cty.NullVal(cty.DynamicPseudoType), otherClause},
+		{"a role which does not exist anymore", state("grc_dropped"), grantRoleRawConfig(nil), ""},
+		// the grantor of the configuration is named in every case: PostgreSQL tells if it is refused
+		{
+			"another role, in the configuration", state("grc_other"),
+			grantRoleRawConfig(map[string]cty.Value{"grantor": cty.StringVal("grc_other")}), ` GRANTED BY "grc_other"`,
+		},
+	} {
+		resourceConfig := map[string]any{"role": "a", "grant_role": "b"}
+		if !test.raw.IsNull() && test.raw.Type().HasAttribute("grantor") {
+			resourceConfig["grantor"] = test.raw.GetAttr("grantor").AsString()
+		}
+		d := grantRoleResourceData(t, test.state, resourceConfig, test.raw)
+		got, err := grantRoleGrantorClause(db, d)
+		if err != nil {
+			t.Errorf("%s: %v", test.name, err)
+		}
+		if got != test.expected {
+			t.Errorf("%s: got %q, want %q", test.name, got, test.expected)
+		}
+	}
+}
+
 // grantRoleResourceData builds the data a resource function receives in a real run: the
 // state, the diff of the plan and the raw configuration (null for an attribute which is not
 // written in the configuration).
@@ -896,7 +963,7 @@ func TestCreateGrantRoleQueryOptions(t *testing.T) {
 			config[k] = v
 		}
 		d := grantRoleResourceData(t, nil, config, grantRoleRawConfig(test.raw))
-		if got := createGrantRoleQuery(d, test.only...); got != test.expected {
+		if got := createGrantRoleQuery(d, grantedByClause(d.Get("grantor").(string)), test.only...); got != test.expected {
 			t.Errorf("%s: got %q, want %q", test.name, got, test.expected)
 		}
 	}
