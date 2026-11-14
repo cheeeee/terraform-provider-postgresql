@@ -12,10 +12,12 @@
 #     repository (OpenID Connect, no stored key);
 #   - the service account of the workflow, tfpg-test-github, with a role of its own: it
 #     creates, reads, connects to and deletes the Cloud SQL instances named tfpg-test-*,
-#     and manages their users; it has no right on IAM;
+#     and manages the users of the instances of the project (Google Cloud cannot limit
+#     this to some instances); it has no right on IAM;
 #   - the service account the provider impersonates in the tests, tfpg-test-connect, which
 #     can only connect and log in to the instances.
-# Nothing here costs money while no test runs. tests/gcp/teardown.sh removes everything.
+# Nothing here costs money while no test runs. To remove everything: delete the two
+# service accounts, the two roles (tfpgTest, tfpgTestUsers) and the pool "github".
 set -euo pipefail
 
 PROJECT=${1:?project}
@@ -25,6 +27,7 @@ ENVIRONMENT=${3:-gcp-test}
 POOL=github
 PROVIDER=github-actions
 ROLE=tfpgTest
+USERS_ROLE=tfpgTestUsers
 WORKFLOW_SA=tfpg-test-github
 CONNECT_SA=tfpg-test-connect
 PREFIX=tfpg-test-
@@ -65,15 +68,20 @@ for account in "$WORKFLOW_SA:Workflow of the tests (GitHub Actions)" "$CONNECT_S
     fi
 done
 
-echo "## Role of the workflow"
-permissions=cloudsql.instances.create,cloudsql.instances.get,cloudsql.instances.delete,cloudsql.instances.connect,cloudsql.users.create,cloudsql.users.list,cloudsql.users.delete
-if g iam roles describe "$ROLE" > /dev/null 2>&1; then
-    g iam roles update "$ROLE" --permissions="$permissions" --stage=GA > /dev/null
-else
-    g iam roles create "$ROLE" --title="terraform-provider-postgresql tests" --stage=GA \
-        --description="Create, connect to and delete the Cloud SQL instances of the tests" \
-        --permissions="$permissions" > /dev/null
-fi
+echo "## Roles of the workflow"
+# role <name> <description> <permissions>
+role() {
+    if g iam roles describe "$1" > /dev/null 2>&1; then
+        g iam roles update "$1" --permissions="$3" --stage=GA > /dev/null
+    else
+        g iam roles create "$1" --title="terraform-provider-postgresql tests" --stage=GA \
+            --description="$2" --permissions="$3" > /dev/null
+    fi
+}
+role "$ROLE" "Create, connect to and delete the Cloud SQL instances of the tests" \
+    cloudsql.instances.create,cloudsql.instances.get,cloudsql.instances.delete,cloudsql.instances.connect
+role "$USERS_ROLE" "Manage the users of the Cloud SQL instances of the tests" \
+    cloudsql.users.create,cloudsql.users.list,cloudsql.users.delete
 
 echo "## Bindings"
 # A service account which has just been created is not known everywhere at once
@@ -91,6 +99,10 @@ retry() {
 retry g projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${workflow_email}" \
     --role="projects/${PROJECT}/roles/${ROLE}" \
     --condition="title=tfpg-test instances,expression=resource.name.startsWith(\"projects/${PROJECT}/instances/${PREFIX}\")" > /dev/null
+# ... and the users of the instances: a condition on the name of the instance is not
+# applied to them, they are allowed on the project
+retry g projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${workflow_email}" \
+    --role="projects/${PROJECT}/roles/${USERS_ROLE}" --condition=None > /dev/null
 # The impersonated account: connect and log in, on the instances of the tests only
 for role in roles/cloudsql.client roles/cloudsql.instanceUser; do
     retry g projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${connect_email}" --role="$role" \
