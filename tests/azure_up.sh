@@ -27,10 +27,11 @@ password="Aa1$(openssl rand -hex 16)"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-# wait_for <path>: until the resource is there (the answer of a PUT is an operation which goes on)
+# wait_for <path> [<attempts>]: until the resource is there (the answer of a PUT is an
+# operation which goes on; when it fails, the resource never comes)
 wait_for() {
-    local path=$1 attempt state
-    for attempt in $(seq 120); do
+    local path=$1 attempts=${2:-120} attempt state
+    for attempt in $(seq "$attempts"); do
         state=$(arm get "$path" 2> /dev/null | python3 -c 'import json,sys; p=json.load(sys.stdin).get("properties",{}); print(p.get("state") or p.get("provisioningState") or "there")' 2> /dev/null || true)
         case "$state" in
         Ready | Succeeded | there)
@@ -39,7 +40,7 @@ wait_for() {
         esac
         sleep 10
     done
-    echo "$AZURE_NAME$path is not available (state: ${state:-unknown})" >&2
+    echo "$AZURE_NAME$path is not available (state: ${state:-unknown}): see the activity log of the resource group" >&2
     return 1
 }
 
@@ -68,12 +69,12 @@ wait_for ""
 echo "PostgreSQL allowed from $ip only"
 echo "{\"properties\": {\"startIpAddress\": \"$ip\", \"endIpAddress\": \"$ip\"}}" > "$work/firewall.json"
 arm put "/firewallRules/tests" "$work/firewall.json" > /dev/null
-wait_for "/firewallRules/tests"
+wait_for "/firewallRules/tests" 30
 
 echo "Administrator of Microsoft Entra: $AZURE_PRINCIPAL_TYPE $AZURE_PRINCIPAL_ID"
 echo "{\"properties\": {\"principalType\": \"$AZURE_PRINCIPAL_TYPE\", \"principalName\": \"$AZURE_PRINCIPAL_NAME\", \"tenantId\": \"$AZURE_TENANT_ID\"}}" > "$work/admin.json"
 arm put "/administrators/$AZURE_PRINCIPAL_ID" "$work/admin.json" > /dev/null
-wait_for "/administrators/$AZURE_PRINCIPAL_ID"
+wait_for "/administrators/$AZURE_PRINCIPAL_ID" 30
 
 host=$(arm get "" | python3 -c 'import json,sys; print(json.load(sys.stdin)["properties"]["fullyQualifiedDomainName"])')
 (
