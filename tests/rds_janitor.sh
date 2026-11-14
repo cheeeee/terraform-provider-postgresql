@@ -6,14 +6,14 @@
 # It fails when it found something, after having deleted it: something left behind is
 # a problem to look at, and it costs money until it is deleted.
 #
-#   RDS_JANITOR_AGE  age in seconds from which a resource is deleted (default: 3 hours,
-#                    a job of the tests lasts less than two)
+#   RDS_JANITOR_AGE  age in seconds from which a resource is deleted (default: 4 hours,
+#                    a job of the tests lasts less than three)
 #   RDS_JANITOR_DRY  set it to 1 to only list what would be deleted
 set -uo pipefail
 
 export AWS_REGION=${AWS_REGION:-ca-central-1}
 export AWS_PAGER=""
-AGE=${RDS_JANITOR_AGE:-10800}
+AGE=${RDS_JANITOR_AGE:-14400}
 DRY=${RDS_JANITOR_DRY:-0}
 PREFIX=tfpg-test-
 

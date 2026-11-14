@@ -8,7 +8,7 @@
 # Without "tests" the whole test suite is run. It needs more than two hours on one
 # instance, so it is split in six parts which run at the same time, each one on its own
 # instance (tests/rds_matrix.py): a version takes about an hour and twelve instances for
-# the two CLIs.
+# the two CLIs (more when the runners are far from the region).
 #
 # On GitHub, the AWS credentials come from a role which only the "rds-test" environment
 # of this repository can assume (OpenID Connect, no stored key). The role, the network
@@ -91,7 +91,7 @@ jobs:
     name: rds (${{ matrix.pgversion }}, ${{ matrix.cli }}, ${{ matrix.shard }})
     runs-on: ubuntu-latest
     environment: rds-test
-    timeout-minutes: 110
+    timeout-minutes: 170
 
     strategy:
       fail-fast: false
@@ -103,9 +103,10 @@ jobs:
       RDS_SUFFIX: ${{ matrix.cli }}-${{ matrix.shard }}
       RDS_TESTS: ${{ matrix.run }}
       RDS_SKIP: ${{ matrix.skip }}
-      # The tests stop before the credentials of the role expire (2 hours): the instance
-      # is deleted with the same credentials.
-      RDS_TEST_TIMEOUT: 80m
+      # The tests stop before the credentials of the role expire (3 hours): the instance
+      # is deleted with the same credentials. A part of the suite needs 20 to 50 minutes
+      # from most runners, and three times more from a runner which is far from the region.
+      RDS_TEST_TIMEOUT: 150m
       # The network of the instances and the role assumed by the provider (empty with act)
       RDS_VPC_NAME: ${{ vars.RDS_VPC_NAME }}
       RDS_SUBNET_GROUP: ${{ vars.RDS_SUBNET_GROUP }}
@@ -148,7 +149,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          role-duration-seconds: 7200
+          role-duration-seconds: 10800
           mask-aws-account-id: true
 
       # The AWS CLI and psql are not in the default act image.
@@ -168,6 +169,10 @@ jobs:
       - name: Create the RDS instance
         run: ./tests/rds_up.sh
 
+      # The address of a runner sometimes changes during a job: the new one is allowed too
+      - name: Keep the instance reachable from the runner
+        run: nohup ./tests/rds_watch_ip.sh > "${RUNNER_TEMP:-/tmp}/rds-watch-ip.log" 2>&1 &
+
       - name: Run the tests
         run: ./tests/rds_test.sh
 
@@ -178,4 +183,6 @@ jobs:
 
       - name: Delete the RDS instance
         if: always()
-        run: ./tests/rds_down.sh
+        run: |
+          cat "${RUNNER_TEMP:-/tmp}/rds-watch-ip.log" 2> /dev/null || true
+          ./tests/rds_down.sh
