@@ -141,3 +141,44 @@ jobs:
 
       - name: IAM authentication against the emulator of AWS
         run: ./tests/floci_iam.sh
+
+  # The test matrix of the README (scripts/test_matrix.py), from the logs of the jobs of
+  # this run: it is shown in the summary of the run, and on the main branch it is
+  # committed to the README when it changed. Nobody writes it by hand.
+  matrix:
+    needs: test
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Test matrix of this run
+        if: ${{ !env.ACT }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/test_matrix.py --run "${{ github.run_id }}" --rds --write README.md --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: The README does not show this matrix
+        if: ${{ !env.ACT && github.event_name == pull_request }}
+        run: |
+          if ! git diff --quiet README.md; then
+            echo "::warning title=Test matrix::The test matrix of this run differs from the one of the README: see the summary of the run. It is committed when the pull request is merged."
+          fi
+
+      - name: Commit the test matrix
+        if: ${{ !env.ACT && github.event_name == push && github.ref == refs/heads/main }}
+        run: |
+          if git diff --quiet README.md; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "docs: test matrix" README.md
+          # (a push of this token does not start the workflows again)
+          git push origin HEAD:main || echo "::warning title=Test matrix::The main branch has moved: the next run updates the matrix."
