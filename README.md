@@ -92,8 +92,6 @@ The same tests in the different environments:
 - [4] the end-to-end test needs privileges of the master user of a managed service (extensions, pgaudit), it is run without superuser on AWS RDS.
 <!-- test-matrix:end -->
 
-The AWS RDS column comes from runs of the `rds-test` workflow on temporary instances of every major version RDS offers (PostgreSQL 12 to 18), with Terraform and OpenTofu: the whole test suite, the end-to-end checks, a password from AWS Secrets Manager and the IAM authentication of the provider. They ran for the release 1.28.1, and again on PostgreSQL 17 after the update of the dependencies.
-
 How the provider logs in to the managed services is tested without any cloud account on every change:
 
 | Login | Test |
