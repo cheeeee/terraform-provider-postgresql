@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"syscall"
 	"time"
@@ -23,9 +24,15 @@ type proxyDriver struct{}
 // transaction and every query: when the network or the server closes it while it is being opened
 // (EOF, connection reset), nothing has been executed yet. It is reported as a bad connection, for
 // which database/sql opens another one (it makes three attempts) instead of failing the operation.
+//
+// It is written in the log every time: a connection which is lost has a cause, which is not to
+// be hidden. One which was found: a Mac which resets, by itself, 1 in 1024 of the connections
+// whose SYN it had to send again.
 func (d proxyDriver) Open(name string) (driver.Conn, error) {
 	conn, err := pq.DialOpen(d, name)
 	if err != nil && isLostConnectionError(err) {
+		// (the error is the one of the network: it has no part of the connection string)
+		log.Printf("[WARN] the connection to PostgreSQL was closed by the other side while it was being opened (%v): it is opened again, three attempts are made", err)
 		return nil, fmt.Errorf("%w: %w", driver.ErrBadConn, err)
 	}
 	return conn, err

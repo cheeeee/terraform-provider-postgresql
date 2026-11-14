@@ -34,7 +34,7 @@ func TestAccPostgresqlDatabase_DropWithAutovacuumWorker(t *testing.T) {
 	dbExecute(t, dbDSN, "INSERT INTO autovacuum_slow SELECT generate_series(1, 300000)")
 	dbExecute(t, dbDSN, "DELETE FROM autovacuum_slow")
 
-	db, err := sql.Open(testDriverName, dsn)
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestAccPostgresqlDatabase_DropWithSessionOutOfReach(t *testing.T) {
 		dropRole()
 	})
 
-	db, err := sql.Open(testDriverName, dsn)
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
