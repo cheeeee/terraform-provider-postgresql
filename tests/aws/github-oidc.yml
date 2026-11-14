@@ -1,0 +1,285 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  terraform-provider-postgresql: what GitHub Actions needs to run the rds-test workflow in this
+  account, and nothing more. A role which only the "rds-test" environment of one repository can
+  assume (OpenID Connect, no stored key), allowed to create and delete temporary RDS instances
+  named tfpg-test-* in a network of their own, in this region only.
+
+# Deploy it once, in the region of the tests, with the credentials of an administrator:
+#
+#   aws cloudformation deploy --region ca-central-1 --stack-name tfpg-test-github \
+#     --template-file tests/aws/github-oidc.yml --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides Repository=<owner>/<repository>
+#
+# then give the outputs to the "rds-test" environment of the repository (see rds-test.yml).
+# Deleting the stack removes everything. Nothing here costs money while no test runs.
+
+Parameters:
+  Repository:
+    Type: String
+    Description: The GitHub repository whose workflow may assume the role, as owner/name
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  Environment:
+    Type: String
+    Default: rds-test
+    Description: The environment of the repository the job has to run in
+  CreateOIDCProvider:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: An account can only have one provider for GitHub, set it to false when it already exists
+
+Conditions:
+  WithOIDCProvider: !Equals [!Ref CreateOIDCProvider, 'true']
+
+Resources:
+  # --- the identity of GitHub Actions
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: WithOIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  # --- a network of their own for the instances: two public subnets, no NAT gateway
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.87.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: tfpg-test
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: tfpg-test
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: tfpg-test
+
+  InternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.87.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: tfpg-test-a
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.87.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: tfpg-test-b
+
+  SubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref RouteTable
+
+  SubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref RouteTable
+
+  SubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: tfpg-test
+      DBSubnetGroupDescription: terraform-provider-postgresql tests
+      SubnetIds:
+        - !Ref SubnetA
+        - !Ref SubnetB
+
+  # --- the role of the workflow
+  WorkflowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tfpg-test-github
+      Description: !Sub 'Assumed by GitHub Actions in the environment ${Environment} of ${Repository}'
+      # The whole test suite needs more than two hours on one instance, and the instance is
+      # deleted at the end with the same credentials.
+      MaxSessionDuration: 14400
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${Repository}:environment:${Environment}'
+      Policies:
+        - PolicyName: rds-test
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The instance: its name, its size, its network and its tag are imposed
+              - Sid: CreateInstance
+                Effect: Allow
+                Action: rds:CreateDBInstance
+                Resource: !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:tfpg-test-*'
+                Condition:
+                  StringEquals:
+                    'rds:DatabaseEngine': postgres
+                    'rds:DatabaseClass': db.t4g.micro
+                    'aws:RequestTag/purpose': tfpg-test
+                  NumericLessThanEquals:
+                    'rds:StorageSize': '20'
+                  Bool:
+                    'rds:MultiAz': 'false'
+              - Sid: CreateInstanceWith
+                Effect: Allow
+                Action: rds:CreateDBInstance
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:pg:tfpg-test-*'
+                  - !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:subgrp:${SubnetGroup}'
+                  - !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:og:default*'
+              - Sid: Instance
+                Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DeleteDBInstance
+                  - rds:AddTagsToResource
+                Resource: !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:tfpg-test-*'
+              - Sid: ParameterGroup
+                Effect: Allow
+                Action:
+                  - rds:CreateDBParameterGroup
+                  - rds:ModifyDBParameterGroup
+                  - rds:DescribeDBParameterGroups
+                  - rds:DeleteDBParameterGroup
+                  - rds:AddTagsToResource
+                Resource: !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:pg:tfpg-test-*'
+              - Sid: Describe
+                Effect: Allow
+                Action:
+                  - rds:DescribeDBEngineVersions
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref AWS::Region
+
+              # The security group of an instance: in the network of the tests, with the tag
+              - Sid: CreateSecurityGroupIn
+                Effect: Allow
+                Action: ec2:CreateSecurityGroup
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${Vpc}'
+              - Sid: CreateSecurityGroup
+                Effect: Allow
+                Action: ec2:CreateSecurityGroup
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestTag/purpose': tfpg-test
+              - Sid: TagSecurityGroupWhenCreated
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*'
+                Condition:
+                  StringEquals:
+                    'ec2:CreateAction': CreateSecurityGroup
+                    'aws:RequestTag/purpose': tfpg-test
+              - Sid: SecurityGroup
+                Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:DeleteSecurityGroup
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/purpose': tfpg-test
+
+              # The end-to-end test: a password in Secrets Manager, roles of the database
+              # which log in with an IAM token, and the provider which assumes a role
+              - Sid: Secret
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:TagResource
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DeleteSecret
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:tfpg-test-*'
+              - Sid: ConnectAsTheRolesOfTheExample
+                Effect: Allow
+                Action: rds-db:connect
+                Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:*/e2e_iam_*'
+              - Sid: AssumeTheRoleOfTheProvider
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/tfpg-test-connect'
+
+  # --- the role the provider assumes in the IAM authentication test (aws_rds_iam_provider_role_arn).
+  # The workflow cannot create a role: it is given this one.
+  ConnectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tfpg-test-connect
+      Description: Assumed by the provider in the tests, to log in as the role tfpg_iam_admin of a test instance
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt WorkflowRole.Arn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: connect
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: rds-db:connect
+                Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:*/tfpg_iam_admin'
+
+Outputs:
+  WorkflowRoleArn:
+    Description: Variable AWS_ROLE_ARN of the environment
+    Value: !GetAtt WorkflowRole.Arn
+  ConnectRoleName:
+    Description: Variable RDS_IAM_ROLE of the environment
+    Value: !Ref ConnectRole
+  VpcName:
+    Description: Variable RDS_VPC_NAME of the environment
+    Value: tfpg-test
+  SubnetGroupName:
+    Description: Variable RDS_SUBNET_GROUP of the environment
+    Value: !Ref SubnetGroup
