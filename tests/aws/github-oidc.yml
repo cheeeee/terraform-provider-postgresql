@@ -27,6 +27,10 @@ Parameters:
     Type: String
     Default: rds-test
     Description: The environment of the repository the job has to run in
+  JanitorEnvironment:
+    Type: String
+    Default: rds-janitor
+    Description: The environment of the workflow which deletes what the tests left behind
   CreateOIDCProvider:
     Type: String
     Default: 'true'
@@ -133,9 +137,9 @@ Resources:
     Properties:
       RoleName: tfpg-test-github
       Description: !Sub 'Assumed by GitHub Actions in the environment ${Environment} of ${Repository}'
-      # The whole test suite needs more than two hours on one instance, and the instance is
-      # deleted at the end with the same credentials.
-      MaxSessionDuration: 14400
+      # A job of the workflow runs a part of the test suite on its own instance, for less
+      # than two hours, and deletes the instance at the end with the same credentials.
+      MaxSessionDuration: 7200
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -274,7 +278,65 @@ Resources:
                 Action: rds-db:connect
                 Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:*/tfpg_iam_admin'
 
+  # --- the role of the rds-janitor workflow, which deletes what a run of the tests left
+  # behind. It runs on a schedule, without any approval: it can only look and delete.
+  JanitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tfpg-test-janitor
+      Description: !Sub 'Assumed by GitHub Actions in the environment ${JanitorEnvironment} of ${Repository}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+                'token.actions.githubusercontent.com:sub': !Sub '${Repository}:environment:${JanitorEnvironment}'
+      Policies:
+        - PolicyName: rds-janitor
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Look
+                Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBParameterGroups
+                  - rds:ListTagsForResource
+                  - ec2:DescribeSecurityGroups
+                  - secretsmanager:ListSecrets
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref AWS::Region
+              - Sid: DeleteInstancesAndParameterGroups
+                Effect: Allow
+                Action:
+                  - rds:DeleteDBInstance
+                  - rds:DeleteDBParameterGroup
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:tfpg-test-*'
+                  - !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:pg:tfpg-test-*'
+              - Sid: DeleteSecurityGroups
+                Effect: Allow
+                Action: ec2:DeleteSecurityGroup
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/purpose': tfpg-test
+              - Sid: DeleteSecrets
+                Effect: Allow
+                Action: secretsmanager:DeleteSecret
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:tfpg-test-*'
+
 Outputs:
+  JanitorRoleArn:
+    Description: Variable AWS_ROLE_ARN of the environment of the janitor
+    Value: !GetAtt JanitorRole.Arn
   WorkflowRoleArn:
     Description: Variable AWS_ROLE_ARN of the environment
     Value: !GetAtt WorkflowRole.Arn

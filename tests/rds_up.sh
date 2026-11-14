@@ -30,16 +30,19 @@ if [ -z "$vpc" ] || [ "$vpc" = "None" ]; then
 fi
 ip=$(curl -fsS --max-time 10 https://checkip.amazonaws.com)
 
+# The date of creation, for rds_janitor.sh (an instance has one, not its groups)
+created=$(date +%s)
+
 echo "Creating security group $RDS_NAME (PostgreSQL allowed from $ip only)"
 sg=$(aws ec2 create-security-group --group-name "$RDS_NAME" --vpc-id "$vpc" \
     --description "terraform-provider-postgresql tests (temporary)" \
-    --tag-specifications "ResourceType=security-group,Tags=[{Key=purpose,Value=tfpg-test}]" \
+    --tag-specifications "ResourceType=security-group,Tags=[{Key=purpose,Value=tfpg-test},{Key=created,Value=$created}]" \
     --query GroupId --output text)
 aws ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port 5432 --cidr "${ip}/32" > /dev/null
 
 echo "Creating parameter group $RDS_NAME ($family)"
 aws rds create-db-parameter-group --db-parameter-group-name "$RDS_NAME" --db-parameter-group-family "$family" \
-    --description "terraform-provider-postgresql tests (temporary)" --tags Key=purpose,Value=tfpg-test > /dev/null
+    --description "terraform-provider-postgresql tests (temporary)" --tags Key=purpose,Value=tfpg-test "Key=created,Value=$created" > /dev/null
 aws rds modify-db-parameter-group --db-parameter-group-name "$RDS_NAME" --parameters \
     "ParameterName=shared_preload_libraries,ParameterValue='pgaudit,pg_stat_statements',ApplyMethod=pending-reboot" \
     "ParameterName=pgaudit.role,ParameterValue=rds_pgaudit,ApplyMethod=pending-reboot" \

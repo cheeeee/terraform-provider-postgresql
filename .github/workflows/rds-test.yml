@@ -1,15 +1,22 @@
-# Run the acceptance tests against a real (and temporary) AWS RDS instance.
+# Run the acceptance tests against real (and temporary) AWS RDS instances.
 #
-# It only runs on demand:
-#   gh workflow run rds-test.yml -f pgversion=17
+# It only runs on demand, for one or several versions of PostgreSQL:
+#   gh workflow run rds-test.yml -f pgversions=17
+#   gh workflow run rds-test.yml -f pgversions=all
+#   gh workflow run rds-test.yml -f pgversions=17 -f cli=terraform -f tests=Parameter
+#
+# Without "tests" the whole test suite is run. It needs more than two hours on one
+# instance, so it is split in four parts which run at the same time, each one on its own
+# instance (tests/rds_matrix.py): a version takes about 45 minutes and eight instances
+# for the two CLIs.
 #
 # On GitHub, the AWS credentials come from a role which only the "rds-test" environment
 # of this repository can assume (OpenID Connect, no stored key). The role, the network
 # of the instances and what the role is allowed to do are in tests/aws/github-oidc.yml:
 # deploy this stack once, then give its outputs to the variables of the environment
 # (AWS_ROLE_ARN, RDS_VPC_NAME, RDS_SUBNET_GROUP, RDS_IAM_ROLE). Protect the environment
-# with a required reviewer and restrict it to the main branch: every run then needs an
-# approval before it gets any credentials.
+# with a required reviewer: a run, from any branch, then gets no credentials before it
+# is approved (one approval for all the jobs of the run).
 #
 # The role has no right on IAM. The role which the provider assumes in the IAM
 # authentication test is the one of the stack (RDS_IAM_ROLE).
@@ -21,58 +28,47 @@
 # iam:CreateRole, PutRolePolicy, DeleteRolePolicy, DeleteRole, GetRole on the roles named
 # tfpg-test-*.
 #   - access keys in a file (AWS_ACCESS_KEY_ID=... / AWS_SECRET_ACCESS_KEY=...):
-#       act workflow_dispatch -W .github/workflows/rds-test.yml --input pgversion=17 --env-file aws.env
+#       act workflow_dispatch -W .github/workflows/rds-test.yml --input pgversions=17 --env-file aws.env
 #   - or the AWS configuration of the host, e.g. for the short-lived credentials
 #     of "aws login" / "aws sso login" which have to be refreshed during the run:
-#       act workflow_dispatch -W .github/workflows/rds-test.yml --input pgversion=17 \
+#       act workflow_dispatch -W .github/workflows/rds-test.yml --input pgversions=17 \
 #         --container-options "-v $HOME/.aws:/root/.aws"
 name: rds-test
 
 on:
   workflow_dispatch:
     inputs:
-      pgversion:
-        description: PostgreSQL major version
+      pgversions:
+        description: PostgreSQL major versions, separated by spaces (12 to 18), or "all"
         required: true
         default: '17'
-      tests:
-        description: Tests to run (go test -run pattern)
-        required: true
-        default: Parameter
       cli:
         description: CLI used by the tests
         required: true
-        default: terraform
+        default: both
         type: choice
         options:
+          - both
           - terraform
           - opentofu
+      tests:
+        description: Tests to run (go test -run pattern). Empty for the whole test suite, in four instances
+        required: false
+        default: ''
 
 permissions:
   id-token: write
   contents: read
 
-# The instances are named after the PostgreSQL version.
-concurrency: rds-test-${{ inputs.pgversion }}-${{ inputs.cli }}
+# One run at a time: the instances are named after the version, the CLI and the part.
+concurrency: rds-test
 
 jobs:
-  rds:
+  plan:
     runs-on: ubuntu-latest
-    environment: rds-test
-    timeout-minutes: 235
 
-    env:
-      AWS_REGION: ca-central-1
-      PGVERSION: ${{ inputs.pgversion }}
-      RDS_SUFFIX: ${{ inputs.cli }}
-      RDS_TESTS: ${{ inputs.tests }}
-      # The tests stop before the credentials of the role expire (4 hours): the instance
-      # is deleted with the same credentials.
-      RDS_TEST_TIMEOUT: 200m
-      # The network of the instances and the role assumed by the provider (empty with act)
-      RDS_VPC_NAME: ${{ vars.RDS_VPC_NAME }}
-      RDS_SUBNET_GROUP: ${{ vars.RDS_SUBNET_GROUP }}
-      RDS_IAM_EXISTING_ROLE: ${{ vars.RDS_IAM_ROLE }}
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
 
     steps:
       - name: Only the owner of the repository can run this workflow
@@ -82,26 +78,63 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: The jobs of the run
+        id: matrix
+        env:
+          PGVERSIONS: ${{ inputs.pgversions }}
+          CLI: ${{ inputs.cli }}
+          TESTS: ${{ inputs.tests }}
+        run: echo "matrix=$(python3 tests/rds_matrix.py "$PGVERSIONS" "$CLI" "$TESTS")" >> "$GITHUB_OUTPUT"
+
+  rds:
+    needs: plan
+    name: rds (${{ matrix.pgversion }}, ${{ matrix.cli }}, ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    environment: rds-test
+    timeout-minutes: 110
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    env:
+      AWS_REGION: ca-central-1
+      PGVERSION: ${{ matrix.pgversion }}
+      RDS_SUFFIX: ${{ matrix.cli }}-${{ matrix.shard }}
+      RDS_TESTS: ${{ matrix.run }}
+      RDS_SKIP: ${{ matrix.skip }}
+      # The tests stop before the credentials of the role expire (2 hours): the instance
+      # is deleted with the same credentials.
+      RDS_TEST_TIMEOUT: 80m
+      # The network of the instances and the role assumed by the provider (empty with act)
+      RDS_VPC_NAME: ${{ vars.RDS_VPC_NAME }}
+      RDS_SUBNET_GROUP: ${{ vars.RDS_SUBNET_GROUP }}
+      RDS_IAM_EXISTING_ROLE: ${{ vars.RDS_IAM_ROLE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version: '1.26'
 
       - name: Set up Terraform
-        if: inputs.cli != 'opentofu'
+        if: matrix.cli != 'opentofu'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: '1.15.4'
           terraform_wrapper: false
 
       - name: Set up OpenTofu
-        if: inputs.cli == 'opentofu'
+        if: matrix.cli == 'opentofu'
         uses: opentofu/setup-opentofu@v1
         with:
           tofu_wrapper: false
 
       - name: Use OpenTofu in the tests
-        if: inputs.cli == 'opentofu'
+        if: matrix.cli == 'opentofu'
         run: |
           {
             echo "TF_ACC_TERRAFORM_PATH=$(command -v tofu)"
@@ -115,7 +148,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          role-duration-seconds: 14400
+          role-duration-seconds: 7200
           mask-aws-account-id: true
 
       # The AWS CLI and psql are not in the default act image.
@@ -138,7 +171,9 @@ jobs:
       - name: Run the tests
         run: ./tests/rds_test.sh
 
+      # Once per version and CLI: it does not depend on the part of the test suite
       - name: Run the Terraform end-to-end test
+        if: matrix.e2e
         run: ./tests/rds_e2e.sh
 
       - name: Delete the RDS instance
