@@ -165,14 +165,14 @@ jobs:
         run: python3 scripts/test_matrix.py --run "${{ github.run_id }}" --rds --write README.md --summary "$GITHUB_STEP_SUMMARY"
 
       - name: The README does not show this matrix
-        if: ${{ !env.ACT && github.event_name == pull_request }}
+        if: ${{ !env.ACT && github.event_name == 'pull_request' }}
         run: |
           if ! git diff --quiet README.md; then
             echo "::warning title=Test matrix::The test matrix of this run differs from the one of the README: see the summary of the run. It is committed when the pull request is merged."
           fi
 
       - name: Commit the test matrix
-        if: ${{ !env.ACT && github.event_name == push && github.ref == refs/heads/main }}
+        if: ${{ !env.ACT && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           if git diff --quiet README.md; then
             exit 0
