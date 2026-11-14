@@ -138,8 +138,8 @@ Resources:
       RoleName: tfpg-test-github
       Description: !Sub 'Assumed by GitHub Actions in the environment ${Environment} of ${Repository}'
       # A job of the workflow runs a part of the test suite on its own instance, for less
-      # than two hours, and deletes the instance at the end with the same credentials.
-      MaxSessionDuration: 7200
+      # than three hours, and deletes the instance at the end with the same credentials.
+      MaxSessionDuration: 10800
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:

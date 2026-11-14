@@ -3,7 +3,7 @@
 # are older than a run can be. A job deletes its own instance at the end; this is for
 # the job which could not (a runner which is lost, credentials which expire...).
 #
-# It runs every three hours and it fails when it found something, after having deleted
+# It runs every three hours, deletes what is older than four hours, and it fails when it found something, after having deleted
 # it. Its role (tests/aws/github-oidc.yml) can only look and delete: the "rds-janitor"
 # environment needs no approval, restrict it to the main branch and give it the variable
 # AWS_ROLE_ARN, the output JanitorRoleArn of the stack.
