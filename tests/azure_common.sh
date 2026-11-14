@@ -21,7 +21,8 @@ export AZURE_USER=tfadmin
 
 AZURE_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID:-$(az account show --query id --output tsv)}
 AZURE_TENANT_ID=${AZURE_TENANT_ID:-$(az account show --query tenantId --output tsv)}
-AZURE_SERVER_URL="https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_RESOURCE_GROUP}/providers/Microsoft.DBforPostgreSQL/flexibleServers/${AZURE_NAME}"
+AZURE_SERVERS_URL="https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_RESOURCE_GROUP}/providers/Microsoft.DBforPostgreSQL/flexibleServers"
+AZURE_SERVER_URL="${AZURE_SERVERS_URL}/${AZURE_NAME}"
 
 # arm <method> <path under the server, or ""> [<file with the body>]
 arm() {
