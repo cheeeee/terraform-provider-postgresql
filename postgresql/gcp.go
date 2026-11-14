@@ -14,8 +14,13 @@ import (
 	"google.golang.org/api/impersonate"
 )
 
-// The scope of the credentials used with Cloud SQL, to read the instance and to log in to it
-const gcpSQLScope = "https://www.googleapis.com/auth/sqlservice.admin"
+const (
+	// The scope of the credentials which read the instance in the Cloud SQL Admin API
+	gcpSQLAdminScope = "https://www.googleapis.com/auth/sqlservice.admin"
+	// The scope of the token a service account logs in to the database with: it is sent to the
+	// instance, it only allows to log in
+	gcpSQLLoginScope = "https://www.googleapis.com/auth/sqlservice.login"
+)
 
 var (
 	// gcpDialers are the connectors to Cloud SQL: one for the credentials of the environment (""),
@@ -24,8 +29,9 @@ var (
 	gcpDialersLock sync.Mutex
 
 	// gcpTokenSource gives the credentials of Google Cloud: the ones of the environment, or the ones
-	// of the service account they impersonate. (A variable: the tests have no credentials.)
-	gcpTokenSource = func(ctx context.Context, impersonated string) (oauth2.TokenSource, error) {
+	// of the service account they impersonate, with a scope. (A variable: the tests have no
+	// credentials.)
+	gcpTokenSource = func(ctx context.Context, impersonated string, scope string) (oauth2.TokenSource, error) {
 		if impersonated == "" {
 			credentials, err := gcp.DefaultCredentials(ctx)
 			if err != nil {
@@ -35,7 +41,7 @@ var (
 		}
 		return impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
 			TargetPrincipal: impersonated,
-			Scopes:          []string{gcpSQLScope},
+			Scopes:          []string{scope},
 		})
 	}
 
@@ -54,21 +60,30 @@ func gcpDialer(ctx context.Context, impersonated string) (*cloudsqlconn.Dialer, 
 		return dialer, nil
 	}
 
-	tokens, err := gcpTokenSource(ctx, impersonated)
-	if err != nil {
+	credentialsError := func(err error) error {
 		if impersonated != "" {
-			return nil, fmt.Errorf("error creating token source with service account impersonation of %s: %w", impersonated, err)
+			return fmt.Errorf("error creating token source with service account impersonation of %s: %w", impersonated, err)
 		}
-		return nil, fmt.Errorf("error reading the credentials of Google Cloud: %w", err)
+		return fmt.Errorf("error reading the credentials of Google Cloud: %w", err)
+	}
+	api, err := gcpTokenSource(ctx, impersonated, gcpSQLAdminScope)
+	if err != nil {
+		return nil, credentialsError(err)
 	}
 	options := []cloudsqlconn.Option{
 		// A run of Terraform does not send the metrics of its connections to Cloud Monitoring
 		cloudsqlconn.WithBuiltInMetrics(false),
 	}
 	if impersonated != "" {
-		options = append(options, cloudsqlconn.WithIAMAuthNTokenSources(tokens, tokens), cloudsqlconn.WithIAMAuthN())
+		// The token which logs in to the database is not the one of the Admin API: it only
+		// has the scope which allows to log in
+		login, err := gcpTokenSource(ctx, impersonated, gcpSQLLoginScope)
+		if err != nil {
+			return nil, credentialsError(err)
+		}
+		options = append(options, cloudsqlconn.WithIAMAuthNTokenSources(api, login), cloudsqlconn.WithIAMAuthN())
 	} else {
-		options = append(options, cloudsqlconn.WithTokenSource(tokens))
+		options = append(options, cloudsqlconn.WithTokenSource(api))
 	}
 	options = append(options, gcpDialerOptions...)
 

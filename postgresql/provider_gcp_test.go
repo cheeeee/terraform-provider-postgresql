@@ -40,9 +40,10 @@ func TestGCPConnStrInstance(t *testing.T) {
 		gcpDialers = map[string]*cloudsqlconn.Dialer{}
 	}
 	resetDialers()
-	var impersonated []string
-	gcpTokenSource = func(_ context.Context, account string) (oauth2.TokenSource, error) {
-		impersonated = append(impersonated, account)
+	// account -> scopes of the credentials which were asked for it
+	askedScopes := map[string][]string{}
+	gcpTokenSource = func(_ context.Context, account string, scope string) (oauth2.TokenSource, error) {
+		askedScopes[account] = append(askedScopes[account], scope)
 		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "token-of-the-test"}), nil
 	}
 	gcpDialerOptions = []cloudsqlconn.Option{cloudsqlconn.WithAdminAPIEndpoint(api.URL)}
@@ -94,8 +95,14 @@ func TestGCPConnStrInstance(t *testing.T) {
 					t.Errorf("the Cloud SQL Admin API was asked for %s", path)
 				}
 			}
-			if impersonated[len(impersonated)-1] != test.impersonate {
-				t.Errorf("the credentials are the ones of %q, not of %q", impersonated[len(impersonated)-1], test.impersonate)
+			// The credentials of the Admin API, and for an impersonated service account a token of
+			// its own to log in to the database, which only has the scope of the login
+			expected := []string{gcpSQLAdminScope}
+			if test.impersonate != "" {
+				expected = append(expected, gcpSQLLoginScope)
+			}
+			if got := askedScopes[test.impersonate]; strings.Join(got, " ") != strings.Join(expected, " ") {
+				t.Errorf("the credentials of %q were asked with the scopes %v, expected %v", test.impersonate, got, expected)
 			}
 		})
 	}
