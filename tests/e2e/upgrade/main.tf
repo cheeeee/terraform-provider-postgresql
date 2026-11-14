@@ -164,12 +164,19 @@ resource "postgresql_grant" "schema" {
   privileges  = ["USAGE"]
 }
 
+# (the privileges of a table and of its columns are stored in the rows of the table: two
+# grants on the same table which run at the same time fail with "tuple concurrently
+# updated". The provider it is forked from only serializes the grants of one role; these
+# ones are for two roles: they are applied one after the other. The fork serializes the
+# grants of a database itself, since 1.28.0.)
 resource "postgresql_grant" "tables" {
   database    = local.data
   role        = postgresql_role.app.name
   schema      = "public"
   object_type = "table"
   privileges  = ["SELECT", "INSERT", "UPDATE"]
+
+  depends_on = [postgresql_grant.table, postgresql_grant.columns]
 }
 
 resource "postgresql_grant" "table" {
