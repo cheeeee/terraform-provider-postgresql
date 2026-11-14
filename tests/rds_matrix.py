@@ -16,14 +16,18 @@ import sys
 
 ALL_VERSIONS = ["12", "13", "14", "15", "16", "17", "18"]
 
-# Shard -> pattern of the names of its tests. About the same duration each (15 to 30 minutes).
+# Shard -> pattern of the names of its tests. About the same duration each: 20 to 50 minutes
+# from a runner of GitHub (three times less next to the region), which leaves a margin
+# before the tests are stopped (RDS_TEST_TIMEOUT in the workflow).
 SHARDS = {
     "a": r"^TestAccPostgresqlGrant",
     "b": r"^TestAccPostgresql(Role|Schema|SecurityLabel|Server|UserMapping|ReplicationSlot|PhysicalReplicationSlot)",
-    "c": r"^TestAccPostgresql(Subscription|Publication)",
+    "c": r"^TestAccPostgresqlSubscription",
+    "d": r"^TestAccPostgresqlPublication",
+    "e": r"^TestAccPostgresqlDefaultPrivileges",
 }
-# The shard of all the other tests
-REST = "d"
+# The shard of all the other tests (databases, functions, extensions, event triggers...)
+REST = "f"
 # The end-to-end checks do not depend on the tests: they run once, with the shortest shard
 E2E_SHARD = "b"
 
