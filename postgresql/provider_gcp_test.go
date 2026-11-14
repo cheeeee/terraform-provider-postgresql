@@ -2,88 +2,100 @@ package postgresql
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"errors"
-	"net/url"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"gocloud.dev/postgres/gcppostgres"
+	"cloud.google.com/go/cloudsqlconn"
+	"golang.org/x/oauth2"
 )
-
-// recordingCertSource is where the Cloud SQL proxy asks the certificates of an instance: it
-// keeps the name of the instance and refuses, nothing of Google Cloud is called.
-type recordingCertSource struct {
-	lock      sync.Mutex
-	instances []string
-}
-
-var errRecordingCertSource = errors.New("no certificate: the instance is only recorded")
-
-func (s *recordingCertSource) record(instance string) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	s.instances = append(s.instances, instance)
-}
-
-func (s *recordingCertSource) Local(instance string) (tls.Certificate, error) {
-	s.record(instance)
-	return tls.Certificate{}, errRecordingCertSource
-}
-
-func (s *recordingCertSource) Remote(instance string) (*x509.Certificate, string, string, string, error) {
-	s.record(instance)
-	return nil, "", "", "", errRecordingCertSource
-}
 
 // scheme = "gcppostgres": the connection string of the provider, with the host written as
 // project/region/instance or as project:region:instance (the connection name given by
-// google_sql_database_instance), is the instance and the database the Cloud SQL proxy connects to.
+// google_sql_database_instance), names the instance the Cloud SQL connector asks the Cloud SQL
+// Admin API for. The API is a local server which records what it is asked and refuses: nothing of
+// Google Cloud is called. (The connection itself is tested on Cloud SQL: tests/e2e/gcp.sh.)
 func TestGCPConnStrInstance(t *testing.T) {
-	for _, host := range []string{"my-project/europe-west1/my-instance", "my-project:europe-west1:my-instance"} {
-		t.Run(host, func(t *testing.T) {
+	var lock sync.Mutex
+	var asked []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		asked = append(asked, r.URL.Path)
+		lock.Unlock()
+		http.Error(w, `{"error": {"code": 404, "message": "the instance is only recorded"}}`, http.StatusNotFound)
+	}))
+	defer api.Close()
+
+	// No credentials of Google Cloud, and the Admin API of the test
+	tokenSource, dialerOptions := gcpTokenSource, gcpDialerOptions
+	resetDialers := func() {
+		gcpDialersLock.Lock()
+		defer gcpDialersLock.Unlock()
+		for _, dialer := range gcpDialers {
+			_ = dialer.Close()
+		}
+		gcpDialers = map[string]*cloudsqlconn.Dialer{}
+	}
+	resetDialers()
+	var impersonated []string
+	gcpTokenSource = func(_ context.Context, account string) (oauth2.TokenSource, error) {
+		impersonated = append(impersonated, account)
+		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "token-of-the-test"}), nil
+	}
+	gcpDialerOptions = []cloudsqlconn.Option{cloudsqlconn.WithAdminAPIEndpoint(api.URL)}
+	defer func() {
+		resetDialers()
+		gcpTokenSource, gcpDialerOptions = tokenSource, dialerOptions
+	}()
+
+	for _, test := range []struct {
+		host, impersonate string
+	}{
+		{"my-project/europe-west1/my-instance", ""},
+		{"my-project:europe-west1:my-instance", ""},
+		{"my-project:europe-west1:my-instance", "account@my-project.iam.gserviceaccount.com"},
+	} {
+		t.Run(test.host+" "+test.impersonate, func(t *testing.T) {
+			lock.Lock()
+			asked = nil
+			lock.Unlock()
 			config := &Config{
 				Scheme:          "gcppostgres",
-				Host:            host,
+				Host:            test.host,
 				Port:            5432,
 				Username:        "some user",
 				Password:        "p@ss/word",
 				SSLMode:         "require",
 				ApplicationName: "Terraform provider",
 			}
-			dsn, err := url.Parse(config.connStr("my_database"))
-			if err != nil {
-				t.Fatalf("the connection string cannot be parsed: %v", err)
-			}
-
-			certs := &recordingCertSource{}
-			opener := gcppostgres.URLOpener{CertSource: certs}
-			db, err := opener.OpenPostgresURL(context.Background(), dsn)
-			if err != nil {
-				t.Fatalf("the connection string %s is refused: %v", dsn.Redacted(), err)
-			}
-			defer func() { _ = db.Close() }()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
+			db, err := openGCPDBConnection(ctx, config.connStr("my_database"), test.impersonate)
+			if err != nil {
+				t.Fatalf("the connection string is refused: %v", err)
+			}
+			defer func() { _ = db.Close() }()
 			if err := db.PingContext(ctx); err == nil {
-				t.Fatal("a connection was opened without any certificate")
+				t.Fatal("a connection was opened without any instance")
 			}
 
-			certs.lock.Lock()
-			defer certs.lock.Unlock()
-			if len(certs.instances) == 0 {
-				t.Fatal("no certificate was asked: the proxy of Cloud SQL was not used")
+			lock.Lock()
+			defer lock.Unlock()
+			if len(asked) == 0 {
+				t.Fatal("the Cloud SQL Admin API was not asked for the instance")
 			}
-			for _, instance := range certs.instances {
-				// The proxy reads the project, the region and the name and ignores what follows (the port)
-				parts := strings.Split(instance, ":")
-				if len(parts) < 3 || parts[0] != "my-project" || parts[1] != "europe-west1" || parts[2] != "my-instance" {
-					t.Errorf("the instance asked to the proxy is %q", instance)
+			for _, path := range asked {
+				if !strings.Contains(path, "/projects/my-project/instances/my-instance/") &&
+					!strings.Contains(path, "/projects/my-project/instances/my-instance:") {
+					t.Errorf("the Cloud SQL Admin API was asked for %s", path)
 				}
+			}
+			if impersonated[len(impersonated)-1] != test.impersonate {
+				t.Errorf("the credentials are the ones of %q, not of %q", impersonated[len(impersonated)-1], test.impersonate)
 			}
 		})
 	}

@@ -21,6 +21,7 @@ on:
   push:
     branches:
       - ci/gcp-test
+      - feat/gcp-connector
   workflow_dispatch:
     inputs:
       pgversions:
