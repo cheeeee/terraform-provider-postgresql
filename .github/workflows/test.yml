@@ -1,10 +1,17 @@
 name: test
 
+permissions:
+  contents: read
+
 on:
   push:
     branches:
     - main
   pull_request:
+  # Once a week with the last version of Terraform: what a new version of a CLI or of
+  # PostgreSQL breaks is seen without waiting for a change of the code.
+  schedule:
+    - cron: '41 5 * * 1'
 
 jobs:
   test:
@@ -24,23 +31,25 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: '1.26'
 
       - name: Set up Terraform
         if: matrix.cli == 'terraform'
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
-          terraform_version: '1.15.4'
+          terraform_version: ${{ github.event_name == 'schedule' && 'latest' || '1.15.4' }}
           terraform_wrapper: false
 
       - name: Set up OpenTofu
         if: matrix.cli == 'opentofu'
-        uses: opentofu/setup-opentofu@v1
+        uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1
         with:
           tofu_wrapper: false
 
@@ -93,23 +102,25 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: '1.26'
 
       - name: Set up Terraform
         if: matrix.cli == 'terraform'
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
-          terraform_version: '1.15.4'
+          terraform_version: ${{ github.event_name == 'schedule' && 'latest' || '1.15.4' }}
           terraform_wrapper: false
 
       - name: Set up OpenTofu
         if: matrix.cli == 'opentofu'
-        uses: opentofu/setup-opentofu@v1
+        uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1
         with:
           tofu_wrapper: false
 
@@ -156,7 +167,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Test matrix of this run
         if: ${{ !env.ACT }}
@@ -173,6 +186,8 @@ jobs:
 
       - name: Commit the test matrix
         if: ${{ !env.ACT && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if git diff --quiet README.md; then
             exit 0
@@ -181,4 +196,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -q -m "docs: test matrix" README.md
           # (a push of this token does not start the workflows again)
-          git push origin HEAD:main || echo "::warning title=Test matrix::The main branch has moved: the next run updates the matrix."
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main || echo "::warning title=Test matrix::The main branch has moved: the next run updates the matrix."

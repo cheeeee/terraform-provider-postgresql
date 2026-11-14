@@ -1,6 +1,6 @@
 variable "role" {}
 variable "grant_roles" {
-  type = map
+  type = map(any)
   default = {
     user1 = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"],
     user2 = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"],
