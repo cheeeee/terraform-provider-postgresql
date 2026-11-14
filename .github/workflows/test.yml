@@ -96,6 +96,78 @@ jobs:
       - name: teste2e
         run: make teste2e
 
+  # Every release line of the two CLIs (tests/cli_versions.json), on one version of
+  # PostgreSQL: what works with a version of a CLI does not depend on the version of
+  # PostgreSQL. All of them with all the versions of PostgreSQL is the first step of a
+  # release (full-test.yml).
+  cli-versions:
+    runs-on: ubuntu-latest
+
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: The versions of the CLIs
+        id: matrix
+        run: echo "matrix=$(python3 scripts/cli_versions.py matrix 17)" >> "$GITHUB_OUTPUT"
+
+  cli:
+    needs: cli-versions
+    name: cli (${{ matrix.cli }} ${{ matrix.version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.cli-versions.outputs.matrix) }}
+
+    env:
+      PGVERSION: ${{ matrix.pgversion }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26'
+
+      - name: Set up Terraform
+        if: matrix.cli == 'terraform'
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: ${{ matrix.version }}
+          terraform_wrapper: false
+
+      - name: Set up OpenTofu
+        if: matrix.cli == 'opentofu'
+        uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1
+        with:
+          tofu_version: ${{ matrix.version }}
+          tofu_wrapper: false
+
+      - name: Use OpenTofu in the tests
+        if: matrix.cli == 'opentofu'
+        run: |
+          {
+            echo "TF_ACC_TERRAFORM_PATH=$(command -v tofu)"
+            echo "TF_ACC_PROVIDER_HOST=registry.opentofu.org"
+            echo "E2E_TERRAFORM=tofu"
+          } >> "$GITHUB_ENV"
+
+      - name: testacc
+        run: make testacc
+
+      - name: teste2e
+        run: make teste2e
+
   # The IAM authentication of the provider (aws_rds_iam_auth, with an assumed role and the
   # region of the token) against Floci, a local emulator of AWS: see tests/floci_iam.sh.
   # The same test runs against a real RDS instance in rds-test.yml.
