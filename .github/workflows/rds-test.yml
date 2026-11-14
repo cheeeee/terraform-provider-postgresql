@@ -6,9 +6,9 @@
 #   gh workflow run rds-test.yml -f pgversions=17 -f cli=terraform -f tests=Parameter
 #
 # Without "tests" the whole test suite is run. It needs more than two hours on one
-# instance, so it is split in four parts which run at the same time, each one on its own
-# instance (tests/rds_matrix.py): a version takes about 45 minutes and eight instances
-# for the two CLIs.
+# instance, so it is split in six parts which run at the same time, each one on its own
+# instance (tests/rds_matrix.py): a version takes about an hour and twelve instances for
+# the two CLIs.
 #
 # On GitHub, the AWS credentials come from a role which only the "rds-test" environment
 # of this repository can assume (OpenID Connect, no stored key). The role, the network
@@ -52,7 +52,7 @@ on:
           - terraform
           - opentofu
       tests:
-        description: Tests to run (go test -run pattern). Empty for the whole test suite, in four instances
+        description: Tests to run (go test -run pattern). Empty for the whole test suite, in six instances
         required: false
         default: ''
 
