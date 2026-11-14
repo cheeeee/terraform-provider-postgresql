@@ -433,11 +433,12 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 
 	connectRetryTimeout := time.Duration(c.config.ConnectionRetryTimeoutSeconds) * time.Second
 	retryError := retry.RetryContext(ctx, connectRetryTimeout, func() *retry.RetryError {
-		if c.config.Scheme == "postgres" {
+		switch c.config.Scheme {
+		case "postgres":
 			db, err = sql.Open(postgresDriverName, dsn)
-		} else if c.config.Scheme == "gcppostgres" {
+		case "gcppostgres":
 			db, err = openGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
-		} else {
+		default:
 			db, err = postgres.Open(ctx, dsn)
 		}
 		if err == nil {
