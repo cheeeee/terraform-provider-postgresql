@@ -1,0 +1,130 @@
+# Test the provider against real (and temporary) Google Cloud SQL instances: the
+# connection through the Cloud SQL proxy (scheme = "gcppostgres") and the IAM database
+# authentication of an impersonated service account, which nothing else tests.
+#
+# It only runs on demand, for one or several versions of PostgreSQL:
+#   gh workflow run gcp-test.yml -f pgversions=17
+#   gh workflow run gcp-test.yml -f pgversions="12 13 14 15 16 17 18"
+#
+# The credentials of Google Cloud come from a service account which only the "gcp-test"
+# environment of this repository can use (workload identity federation, no stored key).
+# The service account and what it is allowed to do are created by tests/gcp/setup.sh:
+# run it once, then give what it prints to the variables of the environment (GCP_PROJECT,
+# GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT, GCP_CONNECT_SERVICE_ACCOUNT).
+# Protect the environment with a required reviewer: a run, from any branch, then gets no
+# credentials before it is approved.
+name: gcp-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      pgversions:
+        description: PostgreSQL major versions, separated by spaces (12 to 18)
+        required: true
+        default: '17'
+      cli:
+        description: CLI used by the tests
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - terraform
+          - opentofu
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency: gcp-test
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+
+    steps:
+      - name: Only the owner of the repository can run this workflow
+        if: ${{ github.actor != github.repository_owner }}
+        run: exit 1
+
+      - name: The jobs of the run
+        id: matrix
+        env:
+          PGVERSIONS: ${{ inputs.pgversions }}
+          CLI: ${{ inputs.cli }}
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os, sys
+          versions = os.environ["PGVERSIONS"].replace(",", " ").split()
+          unknown = [v for v in versions if v not in ("12", "13", "14", "15", "16", "17", "18")]
+          if unknown or not versions:
+              sys.exit(f"unknown versions: {unknown}")
+          clis = ["terraform", "opentofu"] if os.environ["CLI"] == "both" else [os.environ["CLI"]]
+          print("matrix=" + json.dumps({"pgversion": versions, "cli": clis}))
+          PY
+
+  gcp:
+    needs: plan
+    name: gcp (${{ matrix.pgversion }}, ${{ matrix.cli }})
+    runs-on: ubuntu-latest
+    environment: gcp-test
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    env:
+      PGVERSION: ${{ matrix.pgversion }}
+      GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+      GCP_CONNECT_SERVICE_ACCOUNT: ${{ vars.GCP_CONNECT_SERVICE_ACCOUNT }}
+      # The name of an instance cannot be used again for a week: every run has its own
+      GCP_SUFFIX: ${{ matrix.cli }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+
+      - name: Set up Terraform
+        if: matrix.cli != 'opentofu'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.15.4'
+          terraform_wrapper: false
+
+      - name: Set up OpenTofu
+        if: matrix.cli == 'opentofu'
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_wrapper: false
+
+      - name: Use OpenTofu in the tests
+        if: matrix.cli == 'opentofu'
+        run: echo "E2E_TERRAFORM=tofu" >> "$GITHUB_ENV"
+
+      - name: Credentials of Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Create the Cloud SQL instance
+        run: ./tests/gcp_up.sh
+
+      - name: Run the end-to-end test
+        run: ./tests/gcp_e2e.sh
+
+      - name: Delete the Cloud SQL instance
+        if: always()
+        run: ./tests/gcp_down.sh
