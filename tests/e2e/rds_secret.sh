@@ -63,12 +63,23 @@ export TF_VAR_aws_region=$AWS_REGION TF_VAR_secret_id=$RDS_SECRET
 
 # query_as <role> <password> <query>, in the database of the module
 query_as() {
-    PGPASSWORD=$2 PGCONNECT_TIMEOUT=15 psql "host=$PGHOST port=5432 user=$1 dbname=e2e_iam sslmode=require" -v ON_ERROR_STOP=1 -qAt -c "$3"
+    PGPASSWORD=$2 PGCONNECT_TIMEOUT=30 psql "host=$PGHOST port=5432 user=$1 dbname=e2e_iam sslmode=require" -v ON_ERROR_STOP=1 -qAt -c "$3"
 }
 expect() {
-    local name=$1 expected=$2 actual
+    local name=$1 expected=$2 actual attempt
     shift 2
-    actual=$(query_as "$@")
+    # The login with an IAM token is sometimes slow on a small instance which has just run
+    # the tests: a connection which times out is tried again.
+    for attempt in 1 2 3; do
+        if actual=$(query_as "$@" 2> "$WORK/psql.txt"); then
+            break
+        fi
+        if [ "$attempt" = 3 ] || ! grep -q "timeout expired" "$WORK/psql.txt"; then
+            cat "$WORK/psql.txt"
+            echo "FAIL: $name"
+            exit 1
+        fi
+    done
     if [ "$actual" != "$expected" ]; then
         echo "FAIL: $name: expected '$expected', got '$actual'"
         exit 1

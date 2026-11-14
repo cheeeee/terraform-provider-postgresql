@@ -45,7 +45,6 @@ const (
 	featurePublishViaRoot
 	featurePubTruncate
 	featurePublication
-	featurePubWithoutTruncate
 	featureFunction
 	featureFunctionSQLBody
 	featureFunctionNoDependsOnExtension
@@ -137,9 +136,6 @@ var (
 
 		// attribute pubtruncate for publications is supported
 		featurePubTruncate: semver.MustParseRange(">=11.0.0"),
-
-		// attribute pubtruncate for publications is supported
-		featurePubWithoutTruncate: semver.MustParseRange("<11.0.0"),
 
 		// publication is Supported
 		featurePublication: semver.MustParseRange(">=10.0.0"),
