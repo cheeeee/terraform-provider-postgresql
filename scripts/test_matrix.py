@@ -69,10 +69,13 @@ MARKERS = ("<!-- test-matrix:start -->", "<!-- test-matrix:end -->")
 PASS, FAIL, NONE, NA = "✅", "❌", "—", "n/a"
 
 # The jobs of the rds-test workflow which make a version tested on AWS RDS: the whole
-# test suite (its four parts, see tests/rds_matrix.py) with the two CLIs, in the same run
+# test suite (all its parts, they are in tests/rds_matrix.py) with the two CLIs, in the same run
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests"))
+import rds_matrix  # noqa: E402
+
 RDS_WORKFLOW = "rds-test.yml"
 RDS_CLIS = ("terraform", "opentofu")
-RDS_SHARDS = ("a", "b", "c", "d")
+RDS_SHARDS = tuple(rds_matrix.SHARDS) + (rds_matrix.REST,)
 
 API = "https://api.github.com"
 
