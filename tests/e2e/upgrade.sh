@@ -141,7 +141,7 @@ for from in $UPGRADE_FROM; do
     tf init -input=false -no-color > "$WORK/init.txt" 2>&1 || { cat "$WORK/init.txt"; exit 1; }
     echo "## $(grep -E "Installed .*postgresql" "$WORK/init.txt" | sed 's/^- //')"
     applied=0
-    for attempt in 1 2 3; do
+    for _ in 1 2 3; do
         if tf apply -input=false -no-color -auto-approve > "$WORK/apply.txt" 2>&1; then
             applied=1
             break

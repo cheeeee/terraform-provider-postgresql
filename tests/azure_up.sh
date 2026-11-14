@@ -30,8 +30,8 @@ trap 'rm -rf "$work"' EXIT
 # wait_for <path> [<attempts>]: until the resource is there (the answer of a PUT is an
 # operation which goes on; when it fails, the resource never comes)
 wait_for() {
-    local path=$1 attempts=${2:-120} attempt state
-    for attempt in $(seq "$attempts"); do
+    local path=$1 attempts=${2:-120} state
+    for _ in $(seq "$attempts"); do
         state=$(arm get "$path" 2> /dev/null | python3 -c 'import json,sys; p=json.load(sys.stdin).get("properties",{}); print(p.get("state") or p.get("provisioningState") or "there")' 2> /dev/null || true)
         case "$state" in
         Ready | Succeeded | there)
@@ -47,8 +47,8 @@ wait_for() {
 # ensure <path> <file with the body>: create a resource of the server. The server sometimes
 # accepts the request and drops it (it is busy just after its creation): it is sent again.
 ensure() {
-    local path=$1 body=$2 try
-    for try in 1 2 3 4; do
+    local path=$1 body=$2
+    for _ in 1 2 3 4; do
         arm put "$path" "$body" > /dev/null || true
         if wait_for "$path" 18 2> /dev/null; then
             return 0

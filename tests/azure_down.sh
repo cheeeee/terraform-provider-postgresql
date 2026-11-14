@@ -12,8 +12,8 @@ source "$HERE/azure_common.sh"
 # exists: 0 when the server is in the list of the servers of the resource group, 1 when it
 # is not, 2 when the list could not be read
 exists() {
-    local names attempt
-    for attempt in 1 2 3; do
+    local names
+    for _ in 1 2 3; do
         if names=$(az rest --method get --url "${AZURE_SERVERS_URL}?api-version=${AZURE_API_VERSION}" \
             --query 'value[].name' --output tsv 2>&1); then
             if grep -qxF "$AZURE_NAME" <<< "$names"; then
@@ -32,7 +32,7 @@ status=$?
 if [ "$status" = 0 ]; then
     echo "Deleting server $AZURE_NAME"
     arm delete "" > /dev/null
-    for attempt in $(seq 90); do
+    for _ in $(seq 90); do
         exists
         status=$?
         [ "$status" = 0 ] || break

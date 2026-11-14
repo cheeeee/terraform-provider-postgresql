@@ -11,8 +11,8 @@ source "$HERE/gcp_common.sh"
 # exists: 0 when the instance exists, 1 when Google Cloud says it does not, 2 when it
 # could not be known
 exists() {
-    local output attempt
-    for attempt in 1 2 3; do
+    local output
+    for _ in 1 2 3; do
         if output=$(gcp sql instances describe "$GCP_NAME" --format 'value(state)' 2>&1); then
             return 0
         fi
@@ -30,7 +30,7 @@ status=$?
 if [ "$status" = 0 ]; then
     echo "Deleting instance $GCP_NAME"
     gcp sql instances delete "$GCP_NAME" --async > /dev/null
-    for attempt in $(seq 90); do
+    for _ in $(seq 90); do
         exists
         status=$?
         [ "$status" = 0 ] || break

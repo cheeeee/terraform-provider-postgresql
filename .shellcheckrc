@@ -1,0 +1,3 @@
+# The scripts source files whose name is built at run time (the state of an instance,
+# the settings of a suite of tests): shellcheck cannot follow them.
+disable=SC1090,SC1091
