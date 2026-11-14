@@ -341,20 +341,20 @@ func (c *Config) connParams() []string {
 }
 
 func (c *Config) connStr(database string) string {
-	host := c.Host
+	host := fmt.Sprintf("%s:%d", c.Host, c.Port)
 	// For GCP, support both project/region/instance and project:region:instance
-	// (The second one allows to use the output of google_sql_database_instance as host
+	// (The second one allows to use the output of google_sql_database_instance as host).
+	// It is the name of an instance, not an address: it has no port.
 	if c.Scheme == "gcppostgres" {
-		host = strings.ReplaceAll(host, ":", "/")
+		host = strings.ReplaceAll(c.Host, ":", "/")
 	}
 
 	connStr := fmt.Sprintf(
-		"%s://%s:%s@%s:%d/%s?%s",
+		"%s://%s:%s@%s/%s?%s",
 		c.Scheme,
 		url.PathEscape(c.Username),
 		url.PathEscape(c.Password),
 		host,
-		c.Port,
 		database,
 		strings.Join(c.connParams(), "&"),
 	)
