@@ -9,7 +9,11 @@ Description: >-
 #
 #   aws cloudformation deploy --region ca-central-1 --stack-name tfpg-test-github \
 #     --template-file tests/aws/github-oidc.yml --capabilities CAPABILITY_NAMED_IAM \
-#     --parameter-overrides Repository=<owner>/<repository>
+#     --parameter-overrides Repository="$(gh api repos/<owner>/<repository>/actions/oidc/customization/sub -q .sub_claim_prefix)"
+#
+# The parameter is how GitHub names the repository in its tokens, "repo:" included: either
+# repo:<owner>/<repository>, or, with the immutable subjects which GitHub gives to the new
+# repositories, repo:<owner>@<id of the owner>/<repository>@<id of the repository>.
 #
 # then give the outputs to the "rds-test" environment of the repository (see rds-test.yml).
 # Deleting the stack removes everything. Nothing here costs money while no test runs.
@@ -17,8 +21,8 @@ Description: >-
 Parameters:
   Repository:
     Type: String
-    Description: The GitHub repository whose workflow may assume the role, as owner/name
-    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+    Description: The GitHub repository whose workflow may assume the role, as the prefix of the subject of its tokens
+    AllowedPattern: '^repo:[A-Za-z0-9_.-]+(@[0-9]+)?/[A-Za-z0-9_.-]+(@[0-9]+)?$'
   Environment:
     Type: String
     Default: rds-test
@@ -142,7 +146,7 @@ Resources:
             Condition:
               StringEquals:
                 'token.actions.githubusercontent.com:aud': sts.amazonaws.com
-                'token.actions.githubusercontent.com:sub': !Sub 'repo:${Repository}:environment:${Environment}'
+                'token.actions.githubusercontent.com:sub': !Sub '${Repository}:environment:${Environment}'
       Policies:
         - PolicyName: rds-test
           PolicyDocument:
