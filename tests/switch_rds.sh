@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# (the second expansion is the one of zsh: the script is sourced from the two shells)
+# shellcheck disable=SC2046,SC2296
 HERE=$(dirname $(readlink -f ${BASH_SOURCE:-${(%):-%N}}))
 
 source "$HERE/switch_superuser.sh"

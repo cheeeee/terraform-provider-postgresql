@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2034  # the variables are for the scripts which source this file
 # Settings shared by the rds_*.sh scripts, which run the acceptance tests
 # against a temporary AWS RDS instance (see .github/workflows/rds-test.yml).
 

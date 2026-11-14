@@ -9,7 +9,8 @@ source ./tests/switch_superuser.sh
 
 # Use psql from the postgres container if it's not installed locally
 if ! command -v psql > /dev/null; then
-    export E2E_PSQL="docker compose -f $(pwd)/tests/docker-compose.yml exec -T postgres psql -U postgres"
+    E2E_PSQL="docker compose -f $(pwd)/tests/docker-compose.yml exec -T postgres psql -U postgres"
+    export E2E_PSQL
 fi
 
 status=0

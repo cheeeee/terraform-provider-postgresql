@@ -15,8 +15,8 @@ unknown=0
 # exists <command which describes a resource>: 0 when it exists, 1 when AWS says it does
 # not, 2 when it could not be known
 exists() {
-    local output attempt
-    for attempt in 1 2 3; do
+    local output
+    for _ in 1 2 3; do
         if output=$("$@" 2>&1); then
             return 0
         fi
@@ -33,8 +33,7 @@ exists() {
 # security_groups: the identifiers of the security groups of the instance; it fails when
 # they could not be listed
 security_groups() {
-    local attempt
-    for attempt in 1 2 3; do
+    for _ in 1 2 3; do
         if aws ec2 describe-security-groups --filters "Name=group-name,Values=$RDS_NAME" \
             --query 'SecurityGroups[].GroupId' --output text; then
             return 0

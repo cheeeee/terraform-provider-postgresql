@@ -1,0 +1,89 @@
+# Checks which need no database and no cloud: they run on every change, and once a week
+# for the vulnerabilities which are published between two changes.
+name: checks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: '23 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  # The workflows themselves: a mistake in one of them is only seen when it runs,
+  # and the ones which test on a cloud only run on demand.
+  workflows:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12 -color
+
+  # The scripts of the tests: they create and delete resources on the clouds.
+  scripts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: shellcheck
+        run: git ls-files '*.sh' | xargs shellcheck --severity=warning
+
+  # go.mod and go.sum say what the code uses, no more and no less.
+  modules:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+
+      - name: go mod tidy changes nothing
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  # The known vulnerabilities of the modules and of the standard library which the code reaches.
+  vulnerabilities:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # The unit tests with the race detector (the acceptance tests are skipped without a database):
+  # the provider keeps its connections in maps which several goroutines use.
+  race:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
