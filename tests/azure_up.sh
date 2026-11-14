@@ -44,6 +44,20 @@ wait_for() {
     return 1
 }
 
+# ensure <path> <file with the body>: create a resource of the server. The server sometimes
+# accepts the request and drops it (it is busy just after its creation): it is sent again.
+ensure() {
+    local path=$1 body=$2 try
+    for try in 1 2 3 4; do
+        arm put "$path" "$body" > /dev/null || true
+        if wait_for "$path" 18 2> /dev/null; then
+            return 0
+        fi
+    done
+    echo "$AZURE_NAME$path could not be created: see the activity log of the resource group" >&2
+    return 1
+}
+
 echo "Creating server $AZURE_NAME (PostgreSQL $PGVERSION)"
 cat > "$work/server.json" <<JSON
 {
@@ -68,13 +82,11 @@ wait_for ""
 
 echo "PostgreSQL allowed from $ip only"
 echo "{\"properties\": {\"startIpAddress\": \"$ip\", \"endIpAddress\": \"$ip\"}}" > "$work/firewall.json"
-arm put "/firewallRules/tests" "$work/firewall.json" > /dev/null
-wait_for "/firewallRules/tests" 30
+ensure "/firewallRules/tests" "$work/firewall.json"
 
 echo "Administrator of Microsoft Entra: $AZURE_PRINCIPAL_TYPE $AZURE_PRINCIPAL_ID"
 echo "{\"properties\": {\"principalType\": \"$AZURE_PRINCIPAL_TYPE\", \"principalName\": \"$AZURE_PRINCIPAL_NAME\", \"tenantId\": \"$AZURE_TENANT_ID\"}}" > "$work/admin.json"
-arm put "/administrators/$AZURE_PRINCIPAL_ID" "$work/admin.json" > /dev/null
-wait_for "/administrators/$AZURE_PRINCIPAL_ID" 30
+ensure "/administrators/$AZURE_PRINCIPAL_ID" "$work/admin.json"
 
 host=$(arm get "" | python3 -c 'import json,sys; print(json.load(sys.stdin)["properties"]["fullyQualifiedDomainName"])')
 (
