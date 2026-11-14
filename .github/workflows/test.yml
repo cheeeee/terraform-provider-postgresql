@@ -8,10 +8,16 @@ on:
     branches:
     - main
   pull_request:
-  # Once a week with the last version of Terraform: what a new version of a CLI or of
-  # PostgreSQL breaks is seen without waiting for a change of the code.
+  # Once a week with the last version of Terraform and of OpenTofu: what a new version of
+  # a CLI or of PostgreSQL breaks is seen without waiting for a change of the code.
   schedule:
     - cron: '41 5 * * 1'
+
+env:
+  # The versions of the two CLIs: the tests are run the same way with both. The weekly
+  # run takes the last version of each.
+  TERRAFORM_VERSION: ${{ github.event_name == 'schedule' && 'latest' || '1.15.4' }}
+  OPENTOFU_VERSION: ${{ github.event_name == 'schedule' && 'latest' || '1.13.9' }}
 
 jobs:
   test:
@@ -44,13 +50,14 @@ jobs:
         if: matrix.cli == 'terraform'
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
-          terraform_version: ${{ github.event_name == 'schedule' && 'latest' || '1.15.4' }}
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
 
       - name: Set up OpenTofu
         if: matrix.cli == 'opentofu'
         uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1
         with:
+          tofu_version: ${{ env.OPENTOFU_VERSION }}
           tofu_wrapper: false
 
       # The acceptance tests and the end-to-end test use Terraform by default.
@@ -115,13 +122,14 @@ jobs:
         if: matrix.cli == 'terraform'
         uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
-          terraform_version: ${{ github.event_name == 'schedule' && 'latest' || '1.15.4' }}
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
 
       - name: Set up OpenTofu
         if: matrix.cli == 'opentofu'
         uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1
         with:
+          tofu_version: ${{ env.OPENTOFU_VERSION }}
           tofu_wrapper: false
 
       - name: Use OpenTofu in the tests
