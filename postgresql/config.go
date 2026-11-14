@@ -16,12 +16,8 @@ import (
 	"github.com/blang/semver"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/lib/pq"
-	"gocloud.dev/gcp"
-	"gocloud.dev/gcp/cloudsql"
 	"gocloud.dev/postgres"
 	_ "gocloud.dev/postgres/awspostgres"
-	"gocloud.dev/postgres/gcppostgres"
-	"google.golang.org/api/impersonate"
 )
 
 type featureName uint
@@ -437,11 +433,12 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 
 	connectRetryTimeout := time.Duration(c.config.ConnectionRetryTimeoutSeconds) * time.Second
 	retryError := retry.RetryContext(ctx, connectRetryTimeout, func() *retry.RetryError {
-		if c.config.Scheme == "postgres" {
+		switch c.config.Scheme {
+		case "postgres":
 			db, err = sql.Open(postgresDriverName, dsn)
-		} else if c.config.Scheme == "gcppostgres" && c.config.GCPIAMImpersonateServiceAccount != "" {
-			db, err = openImpersonatedGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
-		} else {
+		case "gcppostgres":
+			db, err = openGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
+		default:
 			db, err = postgres.Open(ctx, dsn)
 		}
 		if err == nil {
@@ -526,25 +523,4 @@ func parseServerVersion(pgVersion string) (*semver.Version, error) {
 	}
 
 	return &version, nil
-}
-
-func openImpersonatedGCPDBConnection(ctx context.Context, dsn string, targetServiceAccountEmail string) (*sql.DB, error) {
-	ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
-		TargetPrincipal: targetServiceAccountEmail,
-		Scopes:          []string{"https://www.googleapis.com/auth/sqlservice.admin"},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error creating token source with service account impersonation of %s: %w", targetServiceAccountEmail, err)
-	}
-	client, err := gcp.NewHTTPClient(gcp.DefaultTransport(), ts)
-	if err != nil {
-		return nil, fmt.Errorf("error creating HTTP client with service account impersonation of %s: %w", targetServiceAccountEmail, err)
-	}
-	certSource := cloudsql.NewCertSourceWithIAM(client, ts)
-	opener := gcppostgres.URLOpener{CertSource: certSource}
-	dbURL, err := url.Parse(dsn)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing connection string: %w", err)
-	}
-	return opener.OpenPostgresURL(ctx, dbURL)
 }

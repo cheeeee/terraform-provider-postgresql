@@ -23,6 +23,9 @@ export PGSSLMODE=require
 export RDS_SECRET
 "$HERE/e2e/rds_secret.sh"
 
+# The connection with scheme = "awspostgres" (the certificate authorities of RDS)
+"$HERE/e2e/rds_scheme.sh"
+
 # The provider itself logging in with IAM authentication and an assumed role.
 # It creates an IAM role (and an IAM user when the credentials are the ones of the
 # root user): set RDS_IAM_TEST=0 to skip it when the credentials cannot do that.
