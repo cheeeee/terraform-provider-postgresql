@@ -466,7 +466,17 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 	}
 
 	sql := fmt.Sprintf("DROP DATABASE %s %s", pq.QuoteIdentifier(dbName), dropWithForce)
-	if _, err := db.Exec(sql); err != nil {
+	_, err = db.Exec(sql)
+	var pqErr *pq.Error
+	if err != nil && dropWithForce != "" && errors.As(err, &pqErr) && pqErr.Code == "42501" {
+		// FORCE terminates the other sessions of the database itself, and it is refused as a whole
+		// when one of them is out of reach of the connected user (see terminateBConnections).
+		// Without FORCE PostgreSQL stops the autovacuum workers itself, and it fails with its own
+		// message when another session is still there: "is being accessed by other users".
+		sql = fmt.Sprintf("DROP DATABASE %s", pq.QuoteIdentifier(dbName))
+		_, err = db.Exec(sql)
+	}
+	if err != nil {
 		return fmt.Errorf("error dropping database: %w", err)
 	}
 
@@ -927,8 +937,6 @@ func doSetDBIsTemplate(db *DBConnection, dbName string, isTemplate bool) error {
 }
 
 func terminateBConnections(db *DBConnection, dbName string) error {
-	var terminateSql string
-
 	if db.featureSupported(featureDBAllowConnections) {
 		alterSql := fmt.Sprintf("ALTER DATABASE %s ALLOW_CONNECTIONS false", pq.QuoteIdentifier(dbName))
 
@@ -940,9 +948,36 @@ func terminateBConnections(db *DBConnection, dbName string) error {
 	if db.featureSupported(featurePid) {
 		pid = "pid"
 	}
-	terminateSql = fmt.Sprintf("SELECT pg_terminate_backend(%s) FROM pg_stat_activity WHERE datname = $1 AND %s <> pg_backend_pid()", pid, pid)
-	if _, err := db.Exec(terminateSql, dbName); err != nil {
-		return fmt.Errorf("error terminating database connections: %w", err)
+	// The sessions are terminated one by one. PostgreSQL refuses the ones which are out of reach of
+	// the connected user: an autovacuum worker (it has no role) for a role which is not a superuser,
+	// or the session of a role whose privileges the connected user does not have. In one statement
+	// a single refusal made the deletion of the database fail ("must be a superuser to terminate
+	// superuser process"). A session which is refused is left: DROP DATABASE stops the autovacuum
+	// workers itself, and it says so when another session is still there.
+	rows, err := db.Query(fmt.Sprintf("SELECT %[1]s FROM pg_stat_activity WHERE datname = $1 AND %[1]s <> pg_backend_pid()", pid), dbName)
+	if err != nil {
+		return fmt.Errorf("error listing database connections: %w", err)
+	}
+	var pids []int64
+	for rows.Next() {
+		var backend int64
+		if err := rows.Scan(&backend); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("error listing database connections: %w", err)
+		}
+		pids = append(pids, backend)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("error listing database connections: %w", err)
+	}
+	for _, backend := range pids {
+		if _, err := db.Exec("SELECT pg_terminate_backend($1)", backend); err != nil {
+			var pqErr *pq.Error
+			if errors.As(err, &pqErr) && pqErr.Code == "42501" {
+				continue
+			}
+			return fmt.Errorf("error terminating database connections: %w", err)
+		}
 	}
 
 	return nil
