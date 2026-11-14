@@ -14,13 +14,26 @@ on:
   push:
     tags:
       - 'v*'
-# The release is created with the token of the workflow, which is read-only by default.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  # Every version of Terraform and of OpenTofu with every version of PostgreSQL: nothing is
+  # released when one of them fails. The failed jobs can be run again from the page of the
+  # run, the release is built once all of them passed.
+  full-test:
+    # (the call of a workflow of the repository is read from the commit which runs, with
+    # "./" as well as with "$/", which actionlint 1.7.12 refuses)
+    uses: ./.github/workflows/full-test.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+
   goreleaser:
+    needs: full-test
     runs-on: ubuntu-latest
+    # The release is created with the token of the workflow, which is read-only by default.
+    permissions:
+      contents: write
     steps:
       -
         name: Checkout

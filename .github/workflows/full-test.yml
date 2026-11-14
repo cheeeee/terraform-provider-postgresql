@@ -1,0 +1,99 @@
+name: full-test
+
+# Every release line of Terraform and of OpenTofu (tests/cli_versions.json) with the versions
+# of PostgreSQL which are asked for: the acceptance tests and the end-to-end checks.
+#
+# - On a pull request (test.yml): every version of the CLIs, on one version of PostgreSQL.
+# - Before a release (release.yml) and on demand: every version of the CLIs with every
+#   version of PostgreSQL. A release is only built when all of it passed. It is hundreds of
+#   jobs, of more than half an hour each: hours, with the 20 jobs GitHub runs at a time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pgversions:
+        description: Versions of PostgreSQL, separated by spaces
+        # 19rc1 has to be replaced by 19 as soon as PostgreSQL 19 is released
+        default: 19rc1 18 17 16 15 14 13 12
+  workflow_call:
+    inputs:
+      pgversions:
+        description: Versions of PostgreSQL, separated by spaces
+        type: string
+        default: 19rc1 18 17 16 15 14 13 12
+
+permissions:
+  contents: read
+
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: The versions of the CLIs and of PostgreSQL
+        id: matrix
+        env:
+          PGVERSIONS: ${{ inputs.pgversions }}
+        run: |
+          # shellcheck disable=SC2086  # one argument per version
+          echo "matrix=$(python3 scripts/cli_versions.py matrix $PGVERSIONS)" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: versions
+    name: ${{ matrix.cli }} ${{ matrix.version }}, PostgreSQL ${{ matrix.pgversion }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.versions.outputs.matrix) }}
+
+    env:
+      PGVERSION: ${{ matrix.pgversion }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26'
+
+      - name: Set up Terraform
+        if: matrix.cli == 'terraform'
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: ${{ matrix.version }}
+          terraform_wrapper: false
+
+      - name: Set up OpenTofu
+        if: matrix.cli == 'opentofu'
+        uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1
+        with:
+          tofu_version: ${{ matrix.version }}
+          tofu_wrapper: false
+
+      - name: Use OpenTofu in the tests
+        if: matrix.cli == 'opentofu'
+        run: |
+          {
+            echo "TF_ACC_TERRAFORM_PATH=$(command -v tofu)"
+            echo "TF_ACC_PROVIDER_HOST=registry.opentofu.org"
+            echo "E2E_TERRAFORM=tofu"
+          } >> "$GITHUB_ENV"
+
+      - name: testacc
+        run: make testacc
+
+      - name: teste2e
+        run: make teste2e
