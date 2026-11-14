@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"net/url"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -79,9 +78,9 @@ func TestGCPConnStrInstance(t *testing.T) {
 				t.Fatal("no certificate was asked: the proxy of Cloud SQL was not used")
 			}
 			for _, instance := range certs.instances {
-				// The proxy reads the project, the region and the name and ignores what follows (the port)
-				parts := strings.Split(instance, ":")
-				if len(parts) < 3 || parts[0] != "my-project" || parts[1] != "europe-west1" || parts[2] != "my-instance" {
+				// The name of the instance and nothing else: the proxy ignores what follows the name,
+				// but the Cloud SQL connector which replaces it reads a port as a part of the name
+				if instance != "my-project:europe-west1:my-instance" {
 					t.Errorf("the instance asked to the proxy is %q", instance)
 				}
 			}
