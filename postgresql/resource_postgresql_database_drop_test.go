@@ -40,6 +40,17 @@ func TestAccPostgresqlDatabase_DropWithAutovacuumWorker(t *testing.T) {
 	}
 	defer closeDB(t, db)
 
+	// The test only makes sense with autovacuum: it is said when it is off, not hidden by a
+	// worker which never comes.
+	var autovacuum string
+	var naptime int
+	if err := db.QueryRow("SELECT current_setting('autovacuum'), (SELECT setting::int FROM pg_settings WHERE name = 'autovacuum_naptime')").Scan(&autovacuum, &naptime); err != nil {
+		t.Fatal(err)
+	}
+	if autovacuum != "on" {
+		t.Skipf("autovacuum is %s on this server", autovacuum)
+	}
+
 	// The worker comes within autovacuum_naptime (a minute by default). It is the process of the
 	// database which has no role: a role which is not a superuser does not see its type.
 	workers := func() int {
@@ -49,10 +60,12 @@ func TestAccPostgresqlDatabase_DropWithAutovacuumWorker(t *testing.T) {
 		}
 		return count
 	}
-	deadline := time.Now().Add(4 * time.Minute)
+	// (the launcher visits a database every autovacuum_naptime: three visits and a margin)
+	wait := time.Duration(3*naptime+60) * time.Second
+	deadline := time.Now().Add(wait)
 	for workers() == 0 {
 		if time.Now().After(deadline) {
-			t.Skip("no autovacuum worker came to the database: is autovacuum off?")
+			t.Fatalf("no autovacuum worker came to the database in %s (autovacuum_naptime = %ds): the case is not tested", wait, naptime)
 		}
 		time.Sleep(2 * time.Second)
 	}
