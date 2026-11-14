@@ -466,7 +466,16 @@ func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) 
 	}
 
 	sql := fmt.Sprintf("DROP DATABASE %s %s", pq.QuoteIdentifier(dbName), dropWithForce)
-	if _, err := db.Exec(sql); err != nil {
+	_, err = db.Exec(sql)
+	var pqErr *pq.Error
+	if err != nil && dropWithForce != "" && errors.As(err, &pqErr) && pqErr.Code == "42501" {
+		// FORCE terminates the other sessions of the database itself, and it is refused as a whole
+		// when one of them is out of reach of the connected user: an autovacuum worker, for a role
+		// which is not a superuser. Without FORCE PostgreSQL stops the autovacuum workers itself.
+		sql = fmt.Sprintf("DROP DATABASE %s", pq.QuoteIdentifier(dbName))
+		_, err = db.Exec(sql)
+	}
+	if err != nil {
 		return fmt.Errorf("error dropping database: %w", err)
 	}
 
@@ -940,7 +949,22 @@ func terminateBConnections(db *DBConnection, dbName string) error {
 	if db.featureSupported(featurePid) {
 		pid = "pid"
 	}
-	terminateSql = fmt.Sprintf("SELECT pg_terminate_backend(%s) FROM pg_stat_activity WHERE datname = $1 AND %s <> pg_backend_pid()", pid, pid)
+	// Only the sessions which the connected user is allowed to terminate: all of them for a
+	// superuser; otherwise the ones of the roles it is a member of (its own ones) and, with
+	// pg_signal_backend, the ones of the roles which are not superusers. pg_terminate_backend
+	// refuses the other ones, and the whole statement with them: a process which has no role (an
+	// autovacuum worker) made the deletion of a database fail for a role which is not a superuser.
+	terminateSql = fmt.Sprintf(`SELECT pg_terminate_backend(a.%[1]s)
+FROM pg_stat_activity a
+JOIN pg_roles r ON r.oid = a.usesysid
+WHERE a.datname = $1 AND a.%[1]s <> pg_backend_pid()
+AND (
+    (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+    OR pg_has_role(current_user, a.usesysid, 'MEMBER')
+    OR (NOT r.rolsuper AND EXISTS (
+        SELECT 1 FROM pg_roles s WHERE s.rolname = 'pg_signal_backend' AND pg_has_role(current_user, s.oid, 'MEMBER')
+    ))
+)`, pid)
 	if _, err := db.Exec(terminateSql, dbName); err != nil {
 		return fmt.Errorf("error terminating database connections: %w", err)
 	}
