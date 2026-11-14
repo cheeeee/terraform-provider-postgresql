@@ -1,0 +1,46 @@
+# Delete what a run of the rds-test workflow left behind on AWS (tests/rds_janitor.sh):
+# the instances, parameter groups, security groups and secrets named tfpg-test-* which
+# are older than a run can be. A job deletes its own instance at the end; this is for
+# the job which could not (a runner which is lost, credentials which expire...).
+#
+# It runs every three hours and it fails when it found something, after having deleted
+# it. Its role (tests/aws/github-oidc.yml) can only look and delete: the "rds-janitor"
+# environment needs no approval, restrict it to the main branch and give it the variable
+# AWS_ROLE_ARN, the output JanitorRoleArn of the stack.
+#
+# GitHub stops the scheduled workflows of a repository without any activity for 60 days.
+name: rds-janitor
+
+on:
+  schedule:
+    - cron: '17 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency: rds-janitor
+
+jobs:
+  janitor:
+    runs-on: ubuntu-latest
+    environment: rds-janitor
+    timeout-minutes: 30
+
+    env:
+      AWS_REGION: ca-central-1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Delete what the tests left behind
+        run: ./tests/rds_janitor.sh
