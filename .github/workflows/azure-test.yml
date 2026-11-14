@@ -1,0 +1,136 @@
+# Test the provider against real (and temporary) Azure Database for PostgreSQL flexible
+# servers: the login with a token of Microsoft Entra (azure_identity_auth), which the
+# server checks. Nothing else tests it against a server of Azure.
+#
+# It only runs on demand, for one or several versions of PostgreSQL:
+#   gh workflow run azure-test.yml -f pgversions=17
+#   gh workflow run azure-test.yml -f pgversions="13 14 15 16 17 18"
+#
+# The credentials of Azure are the ones of a managed identity which only the "azure-test"
+# environment of this repository can use (a federated credential, no secret). The
+# identity and what it is allowed to do are created by tests/azure/setup.sh: run it once,
+# then give what it prints to the variables of the environment (AZURE_CLIENT_ID,
+# AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, AZURE_LOCATION,
+# AZURE_PRINCIPAL_ID). Protect the environment with a required reviewer: a run, from any
+# branch, then gets no credentials before it is approved.
+name: azure-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      pgversions:
+        description: PostgreSQL major versions, separated by spaces
+        required: true
+        default: '17'
+      cli:
+        description: CLI used by the tests
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - terraform
+          - opentofu
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency: azure-test
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+
+    steps:
+      - name: Only the owner of the repository can run this workflow
+        if: ${{ github.actor != github.repository_owner }}
+        run: exit 1
+
+      - name: The jobs of the run
+        id: matrix
+        env:
+          PGVERSIONS: ${{ inputs.pgversions }}
+          CLI: ${{ inputs.cli }}
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os, sys
+          versions = os.environ["PGVERSIONS"].replace(",", " ").split()
+          unknown = [v for v in versions if not v.isdigit()]
+          if unknown or not versions:
+              sys.exit(f"unknown versions: {unknown}")
+          clis = ["terraform", "opentofu"] if os.environ["CLI"] == "both" else [os.environ["CLI"]]
+          print("matrix=" + json.dumps({"pgversion": versions, "cli": clis}))
+          PY
+
+  azure:
+    needs: plan
+    name: azure (${{ matrix.pgversion }}, ${{ matrix.cli }})
+    runs-on: ubuntu-latest
+    environment: azure-test
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    env:
+      PGVERSION: ${{ matrix.pgversion }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+      # The identity of the workflow is the Entra administrator of the server: the provider
+      # logs in with its token
+      AZURE_PRINCIPAL_ID: ${{ vars.AZURE_PRINCIPAL_ID }}
+      AZURE_PRINCIPAL_NAME: tfpg-test-github
+      AZURE_PRINCIPAL_TYPE: ServicePrincipal
+      # The name of a server is a DNS name of Azure: every run has its own
+      AZURE_SUFFIX: ${{ matrix.cli }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+
+      - name: Set up Terraform
+        if: matrix.cli != 'opentofu'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.15.4'
+          terraform_wrapper: false
+
+      - name: Set up OpenTofu
+        if: matrix.cli == 'opentofu'
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_wrapper: false
+
+      - name: Use OpenTofu in the tests
+        if: matrix.cli == 'opentofu'
+        run: echo "E2E_TERRAFORM=tofu" >> "$GITHUB_ENV"
+
+      - name: Credentials of Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create the server
+        run: ./tests/azure_up.sh
+
+      - name: Run the end-to-end test
+        run: ./tests/azure_e2e.sh
+
+      - name: Delete the server
+        if: always()
+        run: ./tests/azure_down.sh
