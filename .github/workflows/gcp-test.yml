@@ -16,12 +16,6 @@
 name: gcp-test
 
 on:
-  # TEMPORARY, until this workflow is on the main branch (GitHub only starts a workflow
-  # on demand when it is there): the pushes to the branch of the pull request
-  push:
-    branches:
-      - ci/gcp-test
-      - feat/gcp-connector
   workflow_dispatch:
     inputs:
       pgversions:
@@ -59,8 +53,8 @@ jobs:
       - name: The jobs of the run
         id: matrix
         env:
-          PGVERSIONS: ${{ inputs.pgversions || '17' }}
-          CLI: ${{ inputs.cli || 'both' }}
+          PGVERSIONS: ${{ inputs.pgversions }}
+          CLI: ${{ inputs.cli }}
         run: |
           python3 - >> "$GITHUB_OUTPUT" <<'PY'
           import json, os, sys
