@@ -33,7 +33,6 @@ on:
           - opentofu
 
 permissions:
-  id-token: write
   contents: read
 
 concurrency: gcp-test
@@ -71,6 +70,10 @@ jobs:
     name: gcp (${{ matrix.pgversion }}, ${{ matrix.cli }})
     runs-on: ubuntu-latest
     environment: gcp-test
+    # The token of GitHub which the cloud exchanges for credentials: this job only
+    permissions:
+      id-token: write
+      contents: read
     timeout-minutes: 60
 
     strategy:
@@ -86,23 +89,25 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: '1.26'
 
       - name: Set up Terraform
         if: matrix.cli != 'opentofu'
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: '1.15.4'
           terraform_wrapper: false
 
       - name: Set up OpenTofu
         if: matrix.cli == 'opentofu'
-        uses: opentofu/setup-opentofu@v1
+        uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1
         with:
           tofu_wrapper: false
 
@@ -111,13 +116,13 @@ jobs:
         run: echo "E2E_TERRAFORM=tofu" >> "$GITHUB_ENV"
 
       - name: Credentials of Google Cloud
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
 
       - name: Create the Cloud SQL instance
         run: ./tests/gcp_up.sh
