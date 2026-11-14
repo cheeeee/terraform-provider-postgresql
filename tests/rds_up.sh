@@ -14,9 +14,18 @@ if [ -z "$version" ] || [ "$version" = "None" ]; then
     exit 1
 fi
 
-vpc=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+# The network of the instance: the VPC named RDS_VPC_NAME with its DB subnet group
+# RDS_SUBNET_GROUP (tests/aws/github-oidc.yml), or the default VPC of the region.
+subnet_group=()
+if [ -n "${RDS_VPC_NAME:-}" ]; then
+    : "${RDS_SUBNET_GROUP:?RDS_SUBNET_GROUP must be set with RDS_VPC_NAME}"
+    vpc=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=$RDS_VPC_NAME" --query 'Vpcs[0].VpcId' --output text)
+    subnet_group=(--db-subnet-group-name "$RDS_SUBNET_GROUP")
+else
+    vpc=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+fi
 if [ -z "$vpc" ] || [ "$vpc" = "None" ]; then
-    echo "There is no default VPC in $AWS_REGION" >&2
+    echo "The VPC ${RDS_VPC_NAME:-(default)} is not found in $AWS_REGION" >&2
     exit 1
 fi
 ip=$(curl -fsS --max-time 10 https://checkip.amazonaws.com)
@@ -43,7 +52,7 @@ aws rds create-db-instance --db-instance-identifier "$RDS_NAME" \
     --engine postgres --engine-version "$version" --db-instance-class "${RDS_INSTANCE_CLASS:-db.t4g.micro}" \
     --allocated-storage 20 --storage-type gp3 \
     --master-username "$RDS_USER" --master-user-password "$password" \
-    --vpc-security-group-ids "$sg" --db-parameter-group-name "$RDS_NAME" \
+    --vpc-security-group-ids "$sg" --db-parameter-group-name "$RDS_NAME" ${subnet_group[@]+"${subnet_group[@]}"} \
     --publicly-accessible --no-multi-az --backup-retention-period 0 --no-deletion-protection \
     --enable-iam-database-authentication --no-auto-minor-version-upgrade \
     --tags Key=purpose,Value=tfpg-test > /dev/null

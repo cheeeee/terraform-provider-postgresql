@@ -3,17 +3,23 @@
 # It only runs on demand:
 #   gh workflow run rds-test.yml -f pgversion=17
 #
-# On GitHub, the AWS credentials come from the role defined in the AWS_ROLE_ARN
-# variable of the "rds-test" environment (OpenID Connect, no stored key). Protect
-# this environment with a required reviewer to control who can create instances.
+# On GitHub, the AWS credentials come from a role which only the "rds-test" environment
+# of this repository can assume (OpenID Connect, no stored key). The role, the network
+# of the instances and what the role is allowed to do are in tests/aws/github-oidc.yml:
+# deploy this stack once, then give its outputs to the variables of the environment
+# (AWS_ROLE_ARN, RDS_VPC_NAME, RDS_SUBNET_GROUP, RDS_IAM_ROLE). Protect the environment
+# with a required reviewer and restrict it to the main branch: every run then needs an
+# approval before it gets any credentials.
 #
-# The end-to-end test also creates a temporary IAM role, to test the IAM authentication
-# of the provider with an assumed role: the credentials need iam:CreateRole, PutRolePolicy,
-# DeleteRolePolicy, DeleteRole, GetRole and sts:AssumeRole on the roles named tfpg-test-*.
-# (With the credentials of the root user of an account, which cannot assume a role, a
-# temporary IAM user is created as well.)
+# The role has no right on IAM. The role which the provider assumes in the IAM
+# authentication test is the one of the stack (RDS_IAM_ROLE).
 #
-# It can also be run locally with act, with the AWS credentials of the host:
+# It can also be run locally with act, with the AWS credentials of the host. The instance
+# is then created in the default VPC, and the end-to-end test creates a temporary IAM role
+# (and, with the credentials of the root user of an account, which cannot assume a role,
+# a temporary IAM user): the credentials need the rights of tests/aws/github-oidc.yml and
+# iam:CreateRole, PutRolePolicy, DeleteRolePolicy, DeleteRole, GetRole on the roles named
+# tfpg-test-*.
 #   - access keys in a file (AWS_ACCESS_KEY_ID=... / AWS_SECRET_ACCESS_KEY=...):
 #       act workflow_dispatch -W .github/workflows/rds-test.yml --input pgversion=17 --env-file aws.env
 #   - or the AWS configuration of the host, e.g. for the short-lived credentials
@@ -53,14 +59,20 @@ jobs:
   rds:
     runs-on: ubuntu-latest
     environment: rds-test
-    timeout-minutes: 300
+    timeout-minutes: 235
 
     env:
       AWS_REGION: ca-central-1
       PGVERSION: ${{ inputs.pgversion }}
       RDS_SUFFIX: ${{ inputs.cli }}
       RDS_TESTS: ${{ inputs.tests }}
-      RDS_TEST_TIMEOUT: 240m
+      # The tests stop before the credentials of the role expire (4 hours): the instance
+      # is deleted with the same credentials.
+      RDS_TEST_TIMEOUT: 200m
+      # The network of the instances and the role assumed by the provider (empty with act)
+      RDS_VPC_NAME: ${{ vars.RDS_VPC_NAME }}
+      RDS_SUBNET_GROUP: ${{ vars.RDS_SUBNET_GROUP }}
+      RDS_IAM_EXISTING_ROLE: ${{ vars.RDS_IAM_ROLE }}
 
     steps:
       - name: Only the owner of the repository can run this workflow
@@ -103,6 +115,8 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 14400
+          mask-aws-account-id: true
 
       # The AWS CLI and psql are not in the default act image.
       - name: Install the AWS CLI and psql (act)
