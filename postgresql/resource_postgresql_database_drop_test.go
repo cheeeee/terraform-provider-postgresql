@@ -93,11 +93,13 @@ func TestAccPostgresqlDatabase_DropWithAutovacuumWorker(t *testing.T) {
 	}
 }
 
-// A database is dropped while the session of another role is in it. A superuser terminates it.
-// A role which is not a superuser is not allowed to (it does not have the privileges of the other
-// role, even when it is a member of it without INHERIT, like the role which created it since
-// PostgreSQL 16): the session is left, and the error is the one of DROP DATABASE, which says
-// what holds the database, not the refusal of pg_terminate_backend.
+// A database is dropped while the session of another role is in it. A role which is allowed to
+// terminate this session drops the database: a superuser, a role with the privileges of
+// pg_signal_backend (the master user of AWS RDS) or with the privileges of the other role.
+// Another role is not allowed to, even when it is a member of the other role without INHERIT
+// (like the role which created it, since PostgreSQL 16): the session is left, and the error is
+// the one of DROP DATABASE, which says what holds the database, not the refusal of
+// pg_terminate_backend.
 func TestAccPostgresqlDatabase_DropWithSessionOutOfReach(t *testing.T) {
 	skipIfNotAcc(t)
 	testAccPreCheck(t)
@@ -126,8 +128,12 @@ func TestAccPostgresqlDatabase_DropWithSessionOutOfReach(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeDB(t, db)
-	var superuser bool
-	if err := db.QueryRow("SELECT rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&superuser); err != nil {
+	// Is the connected user allowed to terminate the session of the other role?
+	var allowed bool
+	if err := db.QueryRow(`SELECT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+		OR pg_has_role(current_user, $1, 'USAGE')
+		OR EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_signal_backend' AND pg_has_role(current_user, oid, 'USAGE'))`,
+		other).Scan(&allowed); err != nil {
 		t.Fatal(err)
 	}
 
@@ -143,9 +149,9 @@ func TestAccPostgresqlDatabase_DropWithSessionOutOfReach(t *testing.T) {
 	}
 	err = resourcePostgreSQLDatabaseDelete(conn, d)
 
-	if superuser {
+	if allowed {
 		if err != nil {
-			t.Fatalf("a superuser does not drop the database: %v", err)
+			t.Fatalf("the database is not dropped by a role which is allowed to terminate the session: %v", err)
 		}
 		return
 	}
