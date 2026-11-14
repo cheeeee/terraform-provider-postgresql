@@ -2,6 +2,7 @@ package postgresql
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,5 +77,69 @@ func TestAccPostgresqlDatabase_DropWithAutovacuumWorker(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("the database %s still exists", dbName)
+	}
+}
+
+// A database is dropped while the session of another role is in it. A superuser terminates it.
+// A role which is not a superuser is not allowed to (it does not have the privileges of the other
+// role, even when it is a member of it without INHERIT, like the role which created it since
+// PostgreSQL 16): the session is left, and the error is the one of DROP DATABASE, which says
+// what holds the database, not the refusal of pg_terminate_backend.
+func TestAccPostgresqlDatabase_DropWithSessionOutOfReach(t *testing.T) {
+	skipIfNotAcc(t)
+	testAccPreCheck(t)
+
+	const dbName, other = "tf_tests_db_other_session", "tf_tests_other_session"
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	dbExecute(t, dsn, "DROP DATABASE IF EXISTS "+dbName)
+	dbExecute(t, dsn, "DROP ROLE IF EXISTS "+other)
+	dropRole := createTestRole(t, other)
+	dbExecute(t, dsn, "CREATE DATABASE "+dbName)
+
+	// The session of the other role, in the database
+	session := connectAsTestRole(t, other, dbName)
+	if err := session.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = session.Close()
+		dbExecute(t, dsn, "DROP DATABASE IF EXISTS "+dbName)
+		dropRole()
+	})
+
+	db, err := sql.Open(testDriverName, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeDB(t, db)
+	var superuser bool
+	if err := db.QueryRow("SELECT rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&superuser); err != nil {
+		t.Fatal(err)
+	}
+
+	client := testAccProvider.Meta().(*Client)
+	conn, err := client.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := resourcePostgreSQLDatabase().TestResourceData()
+	d.SetId(dbName)
+	if err := d.Set(dbNameAttr, dbName); err != nil {
+		t.Fatal(err)
+	}
+	err = resourcePostgreSQLDatabaseDelete(conn, d)
+
+	if superuser {
+		if err != nil {
+			t.Fatalf("a superuser does not drop the database: %v", err)
+		}
+		return
+	}
+	if err == nil {
+		t.Fatal("the database is dropped while the session of a role out of reach is in it")
+	}
+	if !strings.Contains(err.Error(), "is being accessed by other users") {
+		t.Fatalf("the error does not say what holds the database: %v", err)
 	}
 }
