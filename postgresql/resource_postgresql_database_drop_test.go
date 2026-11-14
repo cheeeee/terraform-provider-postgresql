@@ -63,9 +63,20 @@ func TestAccPostgresqlDatabase_DropWithAutovacuumWorker(t *testing.T) {
 	// (the launcher visits a database every autovacuum_naptime: three visits and a margin)
 	wait := time.Duration(3*naptime+60) * time.Second
 	deadline := time.Now().Add(wait)
+	// The launcher only sends a worker when the statistics say that the table has dead rows,
+	// and the statistics can be lost: on a Cloud SQL instance which has just been created,
+	// those of the database were reset a minute after the server started, and no worker ever
+	// came. A dead row is made again at every visit which brought no worker.
+	visit := time.Duration(naptime) * time.Second
+	nextRow := time.Now().Add(visit)
 	for workers() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatalf("no autovacuum worker came to the database in %s (autovacuum_naptime = %ds): the case is not tested", wait, naptime)
+		}
+		if time.Now().After(nextRow) {
+			dbExecute(t, dbDSN, "INSERT INTO autovacuum_slow VALUES (0)")
+			dbExecute(t, dbDSN, "DELETE FROM autovacuum_slow")
+			nextRow = time.Now().Add(visit)
 		}
 		time.Sleep(2 * time.Second)
 	}
