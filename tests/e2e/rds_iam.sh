@@ -15,6 +15,10 @@
 #                 ones of the root user of the account, which cannot assume a role
 # Everything it creates is deleted at the end (and by rds_down.sh).
 #
+# With RDS_IAM_EXISTING_ROLE, the name of a role which already exists, nothing is created
+# in IAM: the role has to be assumable by the current credentials and allowed to connect
+# as tfpg_iam_admin (it is how the workflow runs on GitHub, without any right on IAM).
+#
 # It also runs against an emulator of AWS (tests/floci_iam.sh), which checks the token like
 # RDS does but answers with another message: IAM_REFUSED is the message of a refused token.
 # PGPORT is the port of the instance, E2E_PSQL another command to run psql (see e2e_local.sh).
@@ -48,6 +52,9 @@ sql() {
 }
 
 delete_iam() {
+    if [ -n "${RDS_IAM_EXISTING_ROLE:-}" ]; then
+        return
+    fi
     if aws iam get-user --user-name "$RDS_IAM_USER" > /dev/null 2>&1; then
         for key in $(aws iam list-access-keys --user-name "$RDS_IAM_USER" --query 'AccessKeyMetadata[].AccessKeyId' --output text); do
             aws iam delete-access-key --user-name "$RDS_IAM_USER" --access-key-id "$key"
@@ -84,15 +91,21 @@ sql "GRANT rds_iam TO $DB_USER"
 # --- the IAM role which is allowed to connect as this role
 account=$(aws sts get-caller-identity --query Account --output text)
 caller=$(aws sts get-caller-identity --query Arn --output text)
-dbi=$(aws rds describe-db-instances --db-instance-identifier "$RDS_NAME" --query 'DBInstances[0].DbiResourceId' --output text)
-delete_iam
-role_arn=$(aws iam create-role --role-name "$RDS_IAM_ROLE" \
-    --description "terraform-provider-postgresql tests (temporary)" --tags Key=purpose,Value=tfpg-test \
-    --assume-role-policy-document "{\"Version\": \"2012-10-17\", \"Statement\": [{\"Effect\": \"Allow\", \"Principal\": {\"AWS\": \"arn:aws:iam::${account}:root\"}, \"Action\": \"sts:AssumeRole\"}]}" \
-    --query Role.Arn --output text)
-aws iam put-role-policy --role-name "$RDS_IAM_ROLE" --policy-name connect \
-    --policy-document "{\"Version\": \"2012-10-17\", \"Statement\": [{\"Effect\": \"Allow\", \"Action\": \"rds-db:connect\", \"Resource\": \"arn:aws:rds-db:${REGION}:${account}:dbuser:${dbi}/${DB_USER}\"}]}"
-echo "IAM role $RDS_IAM_ROLE created"
+if [ -n "${RDS_IAM_EXISTING_ROLE:-}" ]; then
+    # The credentials cannot create a role: they are given one (tests/aws/github-oidc.yml)
+    role_arn="arn:aws:iam::${account}:role/${RDS_IAM_EXISTING_ROLE}"
+    echo "IAM role $RDS_IAM_EXISTING_ROLE is used"
+else
+    dbi=$(aws rds describe-db-instances --db-instance-identifier "$RDS_NAME" --query 'DBInstances[0].DbiResourceId' --output text)
+    delete_iam
+    role_arn=$(aws iam create-role --role-name "$RDS_IAM_ROLE" \
+        --description "terraform-provider-postgresql tests (temporary)" --tags Key=purpose,Value=tfpg-test \
+        --assume-role-policy-document "{\"Version\": \"2012-10-17\", \"Statement\": [{\"Effect\": \"Allow\", \"Principal\": {\"AWS\": \"arn:aws:iam::${account}:root\"}, \"Action\": \"sts:AssumeRole\"}]}" \
+        --query Role.Arn --output text)
+    aws iam put-role-policy --role-name "$RDS_IAM_ROLE" --policy-name connect \
+        --policy-document "{\"Version\": \"2012-10-17\", \"Statement\": [{\"Effect\": \"Allow\", \"Action\": \"rds-db:connect\", \"Resource\": \"arn:aws:rds-db:${REGION}:${account}:dbuser:${dbi}/${DB_USER}\"}]}"
+    echo "IAM role $RDS_IAM_ROLE created"
+fi
 
 # --- the credentials which assume the role
 mkdir "$WORK/aws"

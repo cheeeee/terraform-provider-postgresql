@@ -16,12 +16,8 @@ import (
 	"github.com/blang/semver"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/lib/pq"
-	"gocloud.dev/gcp"
-	"gocloud.dev/gcp/cloudsql"
 	"gocloud.dev/postgres"
 	_ "gocloud.dev/postgres/awspostgres"
-	"gocloud.dev/postgres/gcppostgres"
-	"google.golang.org/api/impersonate"
 )
 
 type featureName uint
@@ -45,7 +41,6 @@ const (
 	featurePublishViaRoot
 	featurePubTruncate
 	featurePublication
-	featurePubWithoutTruncate
 	featureFunction
 	featureFunctionSQLBody
 	featureFunctionNoDependsOnExtension
@@ -137,9 +132,6 @@ var (
 
 		// attribute pubtruncate for publications is supported
 		featurePubTruncate: semver.MustParseRange(">=11.0.0"),
-
-		// attribute pubtruncate for publications is supported
-		featurePubWithoutTruncate: semver.MustParseRange("<11.0.0"),
 
 		// publication is Supported
 		featurePublication: semver.MustParseRange(">=10.0.0"),
@@ -345,20 +337,20 @@ func (c *Config) connParams() []string {
 }
 
 func (c *Config) connStr(database string) string {
-	host := c.Host
+	host := fmt.Sprintf("%s:%d", c.Host, c.Port)
 	// For GCP, support both project/region/instance and project:region:instance
-	// (The second one allows to use the output of google_sql_database_instance as host
+	// (The second one allows to use the output of google_sql_database_instance as host).
+	// It is the name of an instance, not an address: it has no port.
 	if c.Scheme == "gcppostgres" {
-		host = strings.ReplaceAll(host, ":", "/")
+		host = strings.ReplaceAll(c.Host, ":", "/")
 	}
 
 	connStr := fmt.Sprintf(
-		"%s://%s:%s@%s:%d/%s?%s",
+		"%s://%s:%s@%s/%s?%s",
 		c.Scheme,
 		url.PathEscape(c.Username),
 		url.PathEscape(c.Password),
 		host,
-		c.Port,
 		database,
 		strings.Join(c.connParams(), "&"),
 	)
@@ -441,11 +433,12 @@ func (c *Client) connectWithRetry(ctx context.Context, postgresDriverName, dsn s
 
 	connectRetryTimeout := time.Duration(c.config.ConnectionRetryTimeoutSeconds) * time.Second
 	retryError := retry.RetryContext(ctx, connectRetryTimeout, func() *retry.RetryError {
-		if c.config.Scheme == "postgres" {
+		switch c.config.Scheme {
+		case "postgres":
 			db, err = sql.Open(postgresDriverName, dsn)
-		} else if c.config.Scheme == "gcppostgres" && c.config.GCPIAMImpersonateServiceAccount != "" {
-			db, err = openImpersonatedGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
-		} else {
+		case "gcppostgres":
+			db, err = openGCPDBConnection(ctx, dsn, c.config.GCPIAMImpersonateServiceAccount)
+		default:
 			db, err = postgres.Open(ctx, dsn)
 		}
 		if err == nil {
@@ -530,25 +523,4 @@ func parseServerVersion(pgVersion string) (*semver.Version, error) {
 	}
 
 	return &version, nil
-}
-
-func openImpersonatedGCPDBConnection(ctx context.Context, dsn string, targetServiceAccountEmail string) (*sql.DB, error) {
-	ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
-		TargetPrincipal: targetServiceAccountEmail,
-		Scopes:          []string{"https://www.googleapis.com/auth/sqlservice.admin"},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error creating token source with service account impersonation of %s: %w", targetServiceAccountEmail, err)
-	}
-	client, err := gcp.NewHTTPClient(gcp.DefaultTransport(), ts)
-	if err != nil {
-		return nil, fmt.Errorf("error creating HTTP client with service account impersonation of %s: %w", targetServiceAccountEmail, err)
-	}
-	certSource := cloudsql.NewCertSourceWithIAM(client, ts)
-	opener := gcppostgres.URLOpener{CertSource: certSource}
-	dbURL, err := url.Parse(dsn)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing connection string: %w", err)
-	}
-	return opener.OpenPostgresURL(ctx, dbURL)
 }

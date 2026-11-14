@@ -1,0 +1,158 @@
+package postgresql
+
+import (
+	"database/sql"
+	"strings"
+	"testing"
+	"time"
+)
+
+// A database is dropped while an autovacuum worker is in it. The worker has no role: a role
+// which is not a superuser is not allowed to terminate it, neither with pg_terminate_backend
+// nor with DROP DATABASE ... WITH (FORCE). The deletion of the database used to fail there
+// ("must be a superuser to terminate superuser process"); PostgreSQL stops the worker itself
+// when the database is dropped without FORCE.
+func TestAccPostgresqlDatabase_DropWithAutovacuumWorker(t *testing.T) {
+	skipIfNotAcc(t)
+	testAccPreCheck(t)
+
+	const dbName = "tf_tests_db_autovacuum"
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	dbExecute(t, dsn, "DROP DATABASE IF EXISTS "+dbName)
+	dbExecute(t, dsn, "CREATE DATABASE "+dbName)
+	t.Cleanup(func() {
+		dbExecute(t, dsn, "DROP DATABASE IF EXISTS "+dbName)
+	})
+
+	// A table which autovacuum processes as soon as it can, and very slowly: its worker stays
+	// in the database for minutes
+	dbDSN := config.connStr(dbName)
+	dbExecute(t, dbDSN, `CREATE TABLE autovacuum_slow (id int) WITH (
+		autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0,
+		autovacuum_vacuum_cost_delay = 100, autovacuum_vacuum_cost_limit = 1)`)
+	dbExecute(t, dbDSN, "INSERT INTO autovacuum_slow SELECT generate_series(1, 300000)")
+	dbExecute(t, dbDSN, "DELETE FROM autovacuum_slow")
+
+	db, err := sql.Open(testDriverName, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeDB(t, db)
+
+	// The test only makes sense with autovacuum: it is said when it is off, not hidden by a
+	// worker which never comes.
+	var autovacuum string
+	var naptime int
+	if err := db.QueryRow("SELECT current_setting('autovacuum'), (SELECT setting::int FROM pg_settings WHERE name = 'autovacuum_naptime')").Scan(&autovacuum, &naptime); err != nil {
+		t.Fatal(err)
+	}
+	if autovacuum != "on" {
+		t.Skipf("autovacuum is %s on this server", autovacuum)
+	}
+
+	// The worker comes within autovacuum_naptime (a minute by default). It is the process of the
+	// database which has no role: a role which is not a superuser does not see its type.
+	workers := func() int {
+		var count int
+		if err := db.QueryRow("SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND usesysid IS NULL", dbName).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	// (the launcher visits a database every autovacuum_naptime: three visits and a margin)
+	wait := time.Duration(3*naptime+60) * time.Second
+	deadline := time.Now().Add(wait)
+	for workers() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no autovacuum worker came to the database in %s (autovacuum_naptime = %ds): the case is not tested", wait, naptime)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	client := testAccProvider.Meta().(*Client)
+	conn, err := client.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := resourcePostgreSQLDatabase().TestResourceData()
+	d.SetId(dbName)
+	if err := d.Set(dbNameAttr, dbName); err != nil {
+		t.Fatal(err)
+	}
+	if err := resourcePostgreSQLDatabaseDelete(conn, d); err != nil {
+		t.Fatalf("the database is not dropped while an autovacuum worker is in it: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow("SELECT count(*) FROM pg_database WHERE datname = $1", dbName).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("the database %s still exists", dbName)
+	}
+}
+
+// A database is dropped while the session of another role is in it. A superuser terminates it.
+// A role which is not a superuser is not allowed to (it does not have the privileges of the other
+// role, even when it is a member of it without INHERIT, like the role which created it since
+// PostgreSQL 16): the session is left, and the error is the one of DROP DATABASE, which says
+// what holds the database, not the refusal of pg_terminate_backend.
+func TestAccPostgresqlDatabase_DropWithSessionOutOfReach(t *testing.T) {
+	skipIfNotAcc(t)
+	testAccPreCheck(t)
+
+	const dbName, other = "tf_tests_db_other_session", "tf_tests_other_session"
+	config := getTestConfig(t)
+	dsn := config.connStr("postgres")
+	dbExecute(t, dsn, "DROP DATABASE IF EXISTS "+dbName)
+	dbExecute(t, dsn, "DROP ROLE IF EXISTS "+other)
+	dropRole := createTestRole(t, other)
+	dbExecute(t, dsn, "CREATE DATABASE "+dbName)
+
+	// The session of the other role, in the database
+	session := connectAsTestRole(t, other, dbName)
+	if err := session.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = session.Close()
+		dbExecute(t, dsn, "DROP DATABASE IF EXISTS "+dbName)
+		dropRole()
+	})
+
+	db, err := sql.Open(testDriverName, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeDB(t, db)
+	var superuser bool
+	if err := db.QueryRow("SELECT rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&superuser); err != nil {
+		t.Fatal(err)
+	}
+
+	client := testAccProvider.Meta().(*Client)
+	conn, err := client.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := resourcePostgreSQLDatabase().TestResourceData()
+	d.SetId(dbName)
+	if err := d.Set(dbNameAttr, dbName); err != nil {
+		t.Fatal(err)
+	}
+	err = resourcePostgreSQLDatabaseDelete(conn, d)
+
+	if superuser {
+		if err != nil {
+			t.Fatalf("a superuser does not drop the database: %v", err)
+		}
+		return
+	}
+	if err == nil {
+		t.Fatal("the database is dropped while the session of a role out of reach is in it")
+	}
+	if !strings.Contains(err.Error(), "is being accessed by other users") {
+		t.Fatalf("the error does not say what holds the database: %v", err)
+	}
+}

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run the acceptance tests against the instance created by rds_up.sh.
 # By default only the tests of the role / database parameters are run,
-# set RDS_TESTS to a go test -run pattern to run other ones.
+# set RDS_TESTS to a go test -run pattern to run other ones, and RDS_SKIP to
+# a go test -skip pattern to leave some of them out (see rds_matrix.py).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -27,4 +28,8 @@ export TEST_PUBLISHER_HOST=127.0.0.1
 
 cd "$HERE/.."
 # RDS_TEST_TIMEOUT: the whole suite needs several hours on a remote instance
-go test ./postgresql -count=1 -v -timeout "${RDS_TEST_TIMEOUT:-60m}" -run "${RDS_TESTS:-Parameter}"
+skip=()
+if [ -n "${RDS_SKIP:-}" ]; then
+    skip=(-skip "$RDS_SKIP")
+fi
+go test ./postgresql -count=1 -v -timeout "${RDS_TEST_TIMEOUT:-60m}" -run "${RDS_TESTS:-Parameter}" ${skip[@]+"${skip[@]}"}

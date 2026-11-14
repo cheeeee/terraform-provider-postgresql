@@ -140,7 +140,18 @@ for from in $UPGRADE_FROM; do
     use_provider "$source" "$constraint"
     tf init -input=false -no-color > "$WORK/init.txt" 2>&1 || { cat "$WORK/init.txt"; exit 1; }
     echo "## $(grep -E "Installed .*postgresql" "$WORK/init.txt" | sed 's/^- //')"
-    if ! tf apply -input=false -no-color -auto-approve > "$WORK/apply.txt" 2>&1; then
+    applied=0
+    for _ in 1 2 3; do
+        if tf apply -input=false -no-color -auto-approve > "$WORK/apply.txt" 2>&1; then
+            applied=1
+            break
+        fi
+        # The released providers sometimes fail when they grant privileges at the same time
+        # ("tuple concurrently updated", serialized since): the apply is run again.
+        grep -q "tuple concurrently updated" "$WORK/apply.txt" || break
+        echo "(the released provider failed with \"tuple concurrently updated\": the apply is run again)"
+    done
+    if [ "$applied" = 0 ]; then
         # A released provider which does not know the version of the server (a release
         # candidate: "19rc1") cannot connect at all: there is nothing to upgrade from.
         if grep -q "error parsing version" "$WORK/apply.txt" && [ "$(count_managed)" = 0 ]; then
