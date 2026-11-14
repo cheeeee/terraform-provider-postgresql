@@ -21,10 +21,19 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: actionlint
         run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12 -color
+
+      # What a workflow is allowed to do and what it runs: actions pinned to a commit, a
+      # read-only token where nothing is written, no token left behind by the checkout...
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pipx run zizmor==1.32.0 --no-progress .github/workflows
 
   # The scripts of the tests: they create and delete resources on the clouds.
   scripts:
@@ -32,7 +41,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: shellcheck
         run: git ls-files '*.sh' | xargs shellcheck --severity=warning
@@ -43,10 +54,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: '1.26'
 
@@ -61,10 +74,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: '1.26'
 
@@ -78,12 +93,62 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: '1.26'
 
       - name: go test -race
         run: go test -race -count=1 ./...
+
+  # The files which are not Go: the Terraform configurations of the examples and of the
+  # end-to-end tests, and the CloudFormation stack of the tests on AWS.
+  formats:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: '1.15.4'
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -diff -recursive examples tests/e2e
+
+      - name: cfn-lint
+        run: pipx run cfn-lint==1.60.1 tests/aws/github-oidc.yml
+
+  # The release is only built when a tag is pushed: a configuration of GoReleaser which
+  # does not work anymore is seen here, not on the day of a release. Nothing is signed
+  # or published.
+  release-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: GoReleaser, without signing or publishing
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
+        with:
+          version: latest
+          args: release --snapshot --clean --skip=sign

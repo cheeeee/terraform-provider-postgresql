@@ -1,16 +1,17 @@
 name: Remove waiting-response label
 
-on: [issue_comment]
+# The comment itself is never read or run: the workflow only removes a label.
+on: [issue_comment] # zizmor: ignore[dangerous-triggers]
 
 jobs:
   remove_label:
-    if: github.actor != 'cyrilgdn'
+    if: github.actor != github.repository_owner
     runs-on: ubuntu-latest
     permissions:
       issues: write
       pull-requests: write
     steps:
-      - uses: actions/github-script@v9
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
             github.rest.issues.removeLabel({
