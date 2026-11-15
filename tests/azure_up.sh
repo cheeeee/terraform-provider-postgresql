@@ -69,12 +69,16 @@ configure() {
 }
 
 # What the acceptance tests need: the extensions they create, pgaudit, and the logical
-# replication (publications, subscriptions, replication slots). The last two parameters
+# replication (publications, subscriptions, replication slots). The last three parameters
 # are read when the server starts.
+# (max_worker_processes: a small server has 8 background workers and its own extensions use
+# most of them. The worker which copies the table of a subscription then never starts: the
+# subscription stays in its first state, without any error.)
 echo "Parameters of the server"
 configure azure.extensions "CITEXT,CUBE,EARTHDISTANCE,PG_TRGM,PGAUDIT,PGCRYPTO,POSTGRES_FDW"
 configure shared_preload_libraries "pg_cron,pg_stat_statements,pgaudit"
 configure wal_level logical
+configure max_worker_processes 16
 echo "Restarting the server"
 arm_wait post "/restart"
 pending=$(arm get "/configurations/wal_level" | python3 -c 'import json,sys; p=json.load(sys.stdin)["properties"]; print(p.get("value"), p.get("isConfigPendingRestart"))')

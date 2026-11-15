@@ -757,7 +757,14 @@ func TestAccPostgresqlSubscription_EnabledSynchronousCommit(t *testing.T) {
 	var oid string
 
 	resource.Test(t, resource.TestCase{
-		PreCheck:     s.preCheck(),
+		PreCheck: func() {
+			s.preCheck()()
+			// Before PostgreSQL 15 the commit mode of a subscription is kept for the superusers
+			// (the master user of AWS RDS reads it, the one of Google Cloud SQL does not): the
+			// provider then cannot import it, nor see that it was changed.
+			testCheckCanExecute(t, "read the commit mode of a subscription",
+				"SELECT subsynccommit FROM pg_catalog.pg_subscription LIMIT 1")
+		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
 		Steps: []resource.TestStep{
