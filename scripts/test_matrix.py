@@ -132,13 +132,20 @@ def api(path, raw=False):
 
 
 def run_jobs(repo, run):
-    """The jobs of the last attempt of a run."""
-    jobs, page = [], 1
+    """The jobs of the last attempt of a run.
+
+    They are taken from the list of the jobs of every attempt. The API has a list of the last
+    attempt only, but it is slow for a run of which a job was run again (0.17 s for each job
+    of the page, against 0.05 s) and the API gives up after 10 s: a page of 100 jobs of the 85
+    of such a run was always answered by an error 502."""
+    last, page = {}, 1
     while True:
-        found = api(f"/repos/{repo}/actions/runs/{run}/jobs?per_page=100&page={page}")["jobs"]
-        jobs += found
-        if len(found) < 100:
-            return jobs
+        found = api(f"/repos/{repo}/actions/runs/{run}/jobs?filter=all&per_page=50&page={page}")["jobs"]
+        for job in found:
+            if job["name"] not in last or job["run_attempt"] > last[job["name"]]["run_attempt"]:
+                last[job["name"]] = job
+        if len(found) < 50:
+            return list(last.values())
         page += 1
 
 
