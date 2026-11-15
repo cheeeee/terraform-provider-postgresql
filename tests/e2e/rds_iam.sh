@@ -165,6 +165,40 @@ for attempt in $(seq 30); do
     sleep 5
 done
 
+# token_login: log in as the role of the database with a token of the assumed role, with psql
+token_login() {
+    # shellcheck disable=SC2016  # the variables are the ones of the inner shell
+    in_aws env bash -c '
+        set -euo pipefail
+        credentials=$(aws sts assume-role --region "$1" --role-arn "$2" --role-session-name tfpg-test \
+            --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" --output text)
+        read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< "$credentials"
+        export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+        token=$(aws rds generate-db-auth-token --region "$1" --hostname "$3" --port "$4" --username "$5")
+        PGPASSWORD=$token psql "host=$3 port=$4 user=$5 dbname=postgres sslmode=require" -qAt -c "SELECT 1"
+    ' _ "$REGION" "$role_arn" "$PGHOST" "$PGPORT" "$DB_USER"
+}
+
+# A role which was just created in IAM is not known at once by the database, which refuses
+# its tokens for some seconds: the test waits for the first token which is accepted, then
+# every step runs once. Nothing is waited for with a role which already exists, nor with an
+# emulator, which knows a role as soon as it is created.
+if [ -z "${RDS_IAM_EXISTING_ROLE:-}" ] && [ -z "${AWS_ENDPOINT_URL:-}" ]; then
+    echo "Waiting until the database accepts a token of the role"
+    for attempt in $(seq 30); do
+        if token_login > "$WORK/login.txt" 2>&1; then
+            break
+        fi
+        if [ "$attempt" = 30 ] || ! grep -q "$IAM_REFUSED" "$WORK/login.txt"; then
+            cat "$WORK/login.txt"
+            echo "FAIL: the database does not accept a token of the role $RDS_IAM_ROLE"
+            exit 1
+        fi
+        sleep 5
+    done
+    echo "The database accepted a token of the role after $attempt logins"
+fi
+
 # --- Terraform
 echo "## Building the provider"
 (cd "$HERE/../.." && go build -o "$WORK/bin/terraform-provider-postgresql" .)
@@ -217,20 +251,13 @@ tf() {
 # expect_login <name> <env|profile> <variables>: the provider logs in, creates a role, has an empty
 # plan and deletes the role
 expect_login() {
-    local name=$1 mode=$2 attempt
+    local name=$1 mode=$2
     shift 2
-    # the policy of a new IAM role takes some time to be known by the database
-    for attempt in $(seq 12); do
-        if tf "$mode" apply -input=false -no-color -auto-approve "$@" > "$WORK/apply.txt" 2>&1; then
-            break
-        fi
-        if [ "$attempt" = 12 ] || ! grep -q "$IAM_REFUSED" "$WORK/apply.txt"; then
-            cat "$WORK/apply.txt"
-            echo "FAIL: $name"
-            exit 1
-        fi
-        sleep 10
-    done
+    if ! tf "$mode" apply -input=false -no-color -auto-approve "$@" > "$WORK/apply.txt" 2>&1; then
+        cat "$WORK/apply.txt"
+        echo "FAIL: $name"
+        exit 1
+    fi
     if [ "$(sql "SELECT count(*) FROM pg_roles WHERE rolname = 'tfpg_iam_probe'")" != 1 ]; then
         echo "FAIL: $name: the role was not created"
         exit 1
