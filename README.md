@@ -103,7 +103,7 @@ How the provider logs in to the managed services is tested without any cloud acc
 Requirements
 ------------
 
--	[Terraform](https://www.terraform.io/downloads.html) 0.12 or later, or [OpenTofu](https://opentofu.org/docs/intro/install/)
+-	[Terraform](https://www.terraform.io/downloads.html) 0.12 or later, or [OpenTofu](https://opentofu.org/docs/intro/install/) 1.6 or later. The last version of every release line of the two (`tests/cli_versions.json`) runs the acceptance tests on each pull request, and with every version of PostgreSQL before a release. Two things need a newer CLI: the write-only arguments (`password_wo`) need Terraform 1.11 or OpenTofu 1.11, and the end-to-end tests of this repository need Terraform 0.14.
 -	[Go](https://golang.org/doc/install) 1.16 (to build the provider plugin)
 
 Building The Provider
