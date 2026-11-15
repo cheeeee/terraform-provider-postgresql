@@ -27,37 +27,6 @@ password="Aa1$(openssl rand -hex 16)"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-# wait_for <path> [<attempts>]: until the resource is there (the answer of a PUT is an
-# operation which goes on; when it fails, the resource never comes)
-wait_for() {
-    local path=$1 attempts=${2:-120} state
-    for _ in $(seq "$attempts"); do
-        state=$(arm get "$path" 2> /dev/null | python3 -c 'import json,sys; p=json.load(sys.stdin).get("properties",{}); print(p.get("state") or p.get("provisioningState") or "there")' 2> /dev/null || true)
-        case "$state" in
-        Ready | Succeeded | there)
-            return 0
-            ;;
-        esac
-        sleep 10
-    done
-    echo "$AZURE_NAME$path is not available (state: ${state:-unknown}): see the activity log of the resource group" >&2
-    return 1
-}
-
-# ensure <path> <file with the body>: create a resource of the server. The server sometimes
-# accepts the request and drops it (it is busy just after its creation): it is sent again.
-ensure() {
-    local path=$1 body=$2
-    for _ in 1 2 3 4; do
-        arm put "$path" "$body" > /dev/null || true
-        if wait_for "$path" 18 2> /dev/null; then
-            return 0
-        fi
-    done
-    echo "$AZURE_NAME$path could not be created: see the activity log of the resource group" >&2
-    return 1
-}
-
 echo "Creating server $AZURE_NAME (PostgreSQL $PGVERSION)"
 cat > "$work/server.json" <<JSON
 {
@@ -76,19 +45,50 @@ cat > "$work/server.json" <<JSON
   }
 }
 JSON
-arm put "" "$work/server.json" > /dev/null
 echo "Waiting for the server to be available"
-wait_for ""
+arm_wait put "" "$work/server.json"
 
 echo "PostgreSQL allowed from $ip only"
 echo "{\"properties\": {\"startIpAddress\": \"$ip\", \"endIpAddress\": \"$ip\"}}" > "$work/firewall.json"
-ensure "/firewallRules/tests" "$work/firewall.json"
+arm_wait put "/firewallRules/tests" "$work/firewall.json"
 
 echo "Administrator of Microsoft Entra: $AZURE_PRINCIPAL_TYPE $AZURE_PRINCIPAL_ID"
 echo "{\"properties\": {\"principalType\": \"$AZURE_PRINCIPAL_TYPE\", \"principalName\": \"$AZURE_PRINCIPAL_NAME\", \"tenantId\": \"$AZURE_TENANT_ID\"}}" > "$work/admin.json"
-ensure "/administrators/$AZURE_PRINCIPAL_ID" "$work/admin.json"
+arm_wait put "/administrators/$AZURE_PRINCIPAL_ID" "$work/admin.json"
+
+# configure <name> <value>: set a parameter of the server
+configure() {
+    local name=$1 value=$2 current
+    echo "{\"properties\": {\"value\": \"$value\", \"source\": \"user-override\"}}" > "$work/configuration.json"
+    arm_wait put "/configurations/$name" "$work/configuration.json"
+    current=$(arm get "/configurations/$name" | python3 -c 'import json,sys; print(json.load(sys.stdin)["properties"].get("value", ""))')
+    if [ "$current" != "$value" ]; then
+        echo "The parameter $name of $AZURE_NAME is not $value after it was set (it is: $current)" >&2
+        return 1
+    fi
+}
+
+# What the acceptance tests need: the extensions they create, pgaudit, and the logical
+# replication (publications, subscriptions, replication slots). The last two parameters
+# are read when the server starts.
+echo "Parameters of the server"
+configure azure.extensions "CUBE,EARTHDISTANCE,PG_TRGM,PGAUDIT,PGCRYPTO,POSTGRES_FDW"
+configure shared_preload_libraries "pg_cron,pg_stat_statements,pgaudit"
+configure wal_level logical
+echo "Restarting the server"
+arm_wait post "/restart"
+pending=$(arm get "/configurations/wal_level" | python3 -c 'import json,sys; p=json.load(sys.stdin)["properties"]; print(p.get("value"), p.get("isConfigPendingRestart"))')
+if [ "$pending" != "logical False" ]; then
+    echo "The server $AZURE_NAME did not restart with its parameters (wal_level: $pending)" >&2
+    exit 1
+fi
 
 host=$(arm get "" | python3 -c 'import json,sys; print(json.load(sys.stdin)["properties"]["fullyQualifiedDomainName"])')
+
+# The replication slots and the subscriptions of the tests (the server subscribes to itself)
+# need an administrator which is allowed to replicate
+PGPASSWORD=$password PGCONNECT_TIMEOUT=30 psql "host=$host port=5432 user=$AZURE_USER dbname=postgres sslmode=require" \
+    -v ON_ERROR_STOP=1 -qAt -c "ALTER ROLE $AZURE_USER REPLICATION"
 (
     umask 077
     cat > "$AZURE_STATE" <<STATE
@@ -97,4 +97,4 @@ PGPASSWORD=$password
 AZURE_PRINCIPAL_NAME=$AZURE_PRINCIPAL_NAME
 STATE
 )
-echo "Server $AZURE_NAME is available"
+echo "Server $AZURE_NAME is available: PostgreSQL $(PGPASSWORD=$password PGCONNECT_TIMEOUT=30 psql "host=$host port=5432 user=$AZURE_USER dbname=postgres sslmode=require" -qAt -c 'SHOW server_version')"

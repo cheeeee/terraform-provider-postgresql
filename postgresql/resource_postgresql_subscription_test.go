@@ -1687,15 +1687,20 @@ func (s *subTest) ownerRole() (string, func()) {
 	roleName := "tf_sub_owner_" + strconv.Itoa(int(time.Now().UnixNano()))
 	return roleName, func() {
 		testAccPreCheck(t)
-		testCheckCanExecute(t, "create a role which can own a subscription",
+		// (Google Cloud SQL only lets a member of cloudsqlsuperuser own a subscription: the
+		// subscription of the probe connects to nothing, its address is one of the documentation)
+		testCheckCanExecute(t, "create a role which can own a subscription and give it one",
 			"CREATE ROLE tf_probe_owner",
 			`DO $$ BEGIN
 				IF current_setting('server_version_num')::int >= 160000 THEN
 					EXECUTE 'GRANT pg_create_subscription TO tf_probe_owner';
+					EXECUTE format('GRANT CREATE ON DATABASE %I TO tf_probe_owner', current_database());
 				ELSE
 					EXECUTE 'ALTER ROLE tf_probe_owner SUPERUSER';
 				END IF;
 			END $$`,
+			"CREATE SUBSCRIPTION tf_probe_owned CONNECTION 'host=192.0.2.1 dbname=postgres user=tf_probe password=tf_probe' PUBLICATION tf_probe_publication WITH (connect = false)",
+			"ALTER SUBSCRIPTION tf_probe_owned OWNER TO tf_probe_owner",
 		)
 		s.preCheck()()
 		config := getTestConfig(t)
