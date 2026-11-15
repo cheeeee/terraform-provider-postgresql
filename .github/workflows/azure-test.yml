@@ -1,10 +1,19 @@
 # Test the provider against real (and temporary) Azure Database for PostgreSQL flexible
-# servers: the login with a token of Microsoft Entra (azure_identity_auth), which the
-# server checks. Nothing else tests it against a server of Azure.
+# servers:
+# - the whole acceptance test suite, as the administrator of the server, which is not a
+#   superuser: in six parts which run at the same time, each one on its own server
+#   (tests/rds_matrix.py, as on AWS RDS);
+# - the login with a token of Microsoft Entra (azure_identity_auth), which the server
+#   checks. Nothing else tests it against a server of Azure.
 #
 # It only runs on demand, for one or several versions of PostgreSQL:
 #   gh workflow run azure-test.yml -f pgversions=17
-#   gh workflow run azure-test.yml -f pgversions="13 14 15 16 17 18"
+#   gh workflow run azure-test.yml -f pgversions="12 13 14 15 16 17 18"
+#   gh workflow run azure-test.yml -f pgversions=17 -f tests='^TestAccPostgresqlPublication'
+#
+# What Azure does not allow, and the tests then skip with the message of the server: a
+# publication of all the tables owned by another role, ALTER EXTENSION ... SET SCHEMA, an
+# extension which is not in the list of the server (azure.extensions, see azure_up.sh).
 #
 # The credentials of Azure are the ones of a managed identity which only the "azure-test"
 # environment of this repository can use (a federated credential, no secret). The

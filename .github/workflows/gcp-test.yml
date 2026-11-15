@@ -1,10 +1,19 @@
-# Test the provider against real (and temporary) Google Cloud SQL instances: the
-# connection through the Cloud SQL proxy (scheme = "gcppostgres") and the IAM database
-# authentication of an impersonated service account, which nothing else tests.
+# Test the provider against real (and temporary) Google Cloud SQL instances:
+# - the whole acceptance test suite, as the postgres user of the instance, which is not a
+#   superuser: in six parts which run at the same time, each one on its own instance
+#   (tests/rds_matrix.py, as on AWS RDS);
+# - the connection through the Cloud SQL connector (scheme = "gcppostgres") and the IAM
+#   database authentication of an impersonated service account, which nothing else tests.
 #
 # It only runs on demand, for one or several versions of PostgreSQL:
 #   gh workflow run gcp-test.yml -f pgversions=17
 #   gh workflow run gcp-test.yml -f pgversions="12 13 14 15 16 17 18"
+#   gh workflow run gcp-test.yml -f pgversions=17 -f tests='^TestAccPostgresqlPublication'
+#
+# What Cloud SQL does not allow, and the tests then skip with the message of the server:
+# a subscription or a publication of all the tables owned by a role which is not a member
+# of cloudsqlsuperuser, a schema added to a publication, a subscription to the loopback
+# address (the instance subscribes to its public address).
 #
 # The credentials of Google Cloud come from a service account which only the "gcp-test"
 # environment of this repository can use (workload identity federation, no stored key).

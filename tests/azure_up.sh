@@ -72,7 +72,7 @@ configure() {
 # replication (publications, subscriptions, replication slots). The last two parameters
 # are read when the server starts.
 echo "Parameters of the server"
-configure azure.extensions "CUBE,EARTHDISTANCE,PG_TRGM,PGAUDIT,PGCRYPTO,POSTGRES_FDW"
+configure azure.extensions "CITEXT,CUBE,EARTHDISTANCE,PG_TRGM,PGAUDIT,PGCRYPTO,POSTGRES_FDW"
 configure shared_preload_libraries "pg_cron,pg_stat_statements,pgaudit"
 configure wal_level logical
 echo "Restarting the server"
