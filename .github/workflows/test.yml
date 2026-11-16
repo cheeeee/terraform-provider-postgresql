@@ -194,7 +194,7 @@ jobs:
         if: ${{ !env.ACT }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/test_matrix.py --run "${{ github.run_id }}" --rds --write README.md --summary "$GITHUB_STEP_SUMMARY"
+        run: python3 scripts/test_matrix.py --run "${{ github.run_id }}" --clouds --write README.md --summary "$GITHUB_STEP_SUMMARY"
 
       - name: The README does not show this matrix
         if: ${{ !env.ACT && github.event_name == 'pull_request' }}
