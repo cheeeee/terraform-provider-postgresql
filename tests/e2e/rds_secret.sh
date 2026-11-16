@@ -63,23 +63,16 @@ export TF_VAR_aws_region=$AWS_REGION TF_VAR_secret_id=$RDS_SECRET
 
 # query_as <role> <password> <query>, in the database of the module
 query_as() {
-    PGPASSWORD=$2 PGCONNECT_TIMEOUT=30 psql "host=$PGHOST port=5432 user=$1 dbname=e2e_iam sslmode=require" -v ON_ERROR_STOP=1 -qAt -c "$3"
+    PGPASSWORD=$2 PGCONNECT_TIMEOUT=${CONNECT_TIMEOUT:-30} psql "host=$PGHOST port=5432 user=$1 dbname=e2e_iam sslmode=require" -v ON_ERROR_STOP=1 -qAt -c "$3"
 }
 expect() {
-    local name=$1 expected=$2 actual attempt
+    local name=$1 expected=$2 actual
     shift 2
-    # The login with an IAM token is sometimes slow on a small instance which has just run
-    # the tests: a connection which times out is tried again.
-    for attempt in 1 2 3; do
-        if actual=$(query_as "$@" 2> "$WORK/psql.txt"); then
-            break
-        fi
-        if [ "$attempt" = 3 ] || ! grep -q "timeout expired" "$WORK/psql.txt"; then
-            cat "$WORK/psql.txt"
-            echo "FAIL: $name"
-            exit 1
-        fi
-    done
+    if ! actual=$(query_as "$@" 2> "$WORK/psql.txt"); then
+        cat "$WORK/psql.txt"
+        echo "FAIL: $name"
+        exit 1
+    fi
     if [ "$actual" != "$expected" ]; then
         echo "FAIL: $name: expected '$expected', got '$actual'"
         exit 1
@@ -122,6 +115,14 @@ expect "it logs in with the password of the secret and is not audited" 'none' e2
 
 echo
 echo "## The roles with IAM authentication"
+# The first login with an IAM token on an instance is slow: the server takes seconds to check
+# its first token (6 s on a new instance, 8 to 17 s in the jobs on GitHub, where the instance
+# has just run the tests), and less than a second for the ones which follow, whatever the
+# role. It is a step of its own, with the time it needs; every check then runs once.
+token=$(aws rds generate-db-auth-token --hostname "$PGHOST" --port 5432 --username e2e_iam_rw --region "$AWS_REGION")
+began=$SECONDS
+CONNECT_TIMEOUT=180 expect "the first login with an IAM token on this instance" '1' e2e_iam_rw "$token" "SELECT 1"
+echo "(it took $((SECONDS - began)) s)"
 token=$(aws rds generate-db-auth-token --hostname "$PGHOST" --port 5432 --username e2e_iam_rw --region "$AWS_REGION")
 expect "the read-write role logs in with an IAM token and is audited" 'ddl, write' e2e_iam_rw "$token" "SHOW pgaudit.log"
 token=$(aws rds generate-db-auth-token --hostname "$PGHOST" --port 5432 --username e2e_iam_migrator --region "$AWS_REGION")
