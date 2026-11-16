@@ -15,7 +15,9 @@ and passed:
     --clouds         add what was tested on the managed services (AWS RDS, Google Cloud SQL,
                      Azure Database for PostgreSQL): for each one and each version of PostgreSQL,
                      the last run of its workflow on GitHub where the whole test suite passed
-                     with the two CLIs, on the commit of the run of --run or before it
+                     with the two CLIs, on the commit of the run of --run or before it. A
+                     run on the last commit of a pull request counts for the commit its squash
+                     made on the main branch, when the two have the very same files
     --summary FILE   also write the matrix, and whether the README shows it, to this file
                      (the summary of the job)
     --logs DIR       read the logs of the jobs of the test workflow from DIR/*.log instead of
@@ -268,8 +270,9 @@ def table(header, rows, align=":---:"):
 
 def cloud_evidence(repo, head, cloud):
     """For each version of PostgreSQL, the last run of the workflow of the cloud where every job of
-    the version passed, on the commit `head` or on one before it: {version: (run, [(suites, info)])}."""
-    ancestors = {}
+    the version passed, on the commit `head` or on one before it:
+    {version: (run, commit of the main branch the run counts for, [(suites, info)])}."""
+    ancestors, counted = {}, {}
 
     def is_ancestor(sha):
         if sha not in ancestors:
@@ -278,6 +281,24 @@ def cloud_evidence(repo, head, cloud):
             except urllib.error.HTTPError:
                 ancestors[sha] = False
         return ancestors[sha]
+
+    def tree(sha):
+        return api(f"/repos/{repo}/git/commits/{sha}")["tree"]["sha"]
+
+    def counted_for(sha):
+        """The commit a run on `sha` counts for: `sha` itself when it is `head` or before it. A
+        pull request which is squashed leaves its commits out of the main branch: a run on its
+        last commit counts for the commit of the squash, when this one is `head` or before it
+        and has the very same files (the same tree). None when the run counts for nothing."""
+        if sha not in counted:
+            counted[sha] = sha if is_ancestor(sha) else None
+            for pull in [] if counted[sha] else api(f"/repos/{repo}/commits/{sha}/pulls"):
+                squash = pull.get("merge_commit_sha")
+                if (pull.get("merged_at") and pull["head"]["sha"] == sha and squash and is_ancestor(squash)
+                        and tree(squash) == tree(sha)):
+                    counted[sha] = squash
+                    break
+        return counted[sha]
 
     evidence = {}
     runs = api(f"/repos/{repo}/actions/workflows/{cloud['workflow']}/runs?status=completed&per_page=40")["workflow_runs"]
@@ -292,9 +313,10 @@ def cloud_evidence(repo, head, cloud):
                 continue
             if not all((cli, shard) in jobs for cli in RDS_CLIS for shard in RDS_SHARDS):
                 continue
-            if not is_ancestor(run["head_sha"]):
+            commit = counted_for(run["head_sha"])
+            if not commit:
                 continue
-            evidence[version] = (run, [parse_log(job_log(repo, job)) for job in jobs.values()])
+            evidence[version] = (run, commit, [parse_log(job_log(repo, job)) for job in jobs.values()])
     return evidence
 
 
@@ -391,7 +413,7 @@ def main():
     by_version = table(["PostgreSQL"] + versions, rows)
 
     # --- areas x environments
-    # cloud key -> {version: (run, results)}, for the clouds which have a run to show
+    # cloud key -> {version: (run, commit, results)}, for the clouds which have a run to show
     evidence = {}
     if args.clouds and head:
         for cloud in CLOUDS:
@@ -430,13 +452,13 @@ def main():
             if pattern is None:
                 # the end-to-end checks run in one job of the version for each CLI
                 value = merge_versions({
-                    v: FAIL if FAIL in [e2e_mark(info) for _, info in found[v][1]]
-                    else (PASS if PASS in [e2e_mark(info) for _, info in found[v][1]] else NONE)
+                    v: FAIL if FAIL in [e2e_mark(info) for _, info in found[v][2]]
+                    else (PASS if PASS in [e2e_mark(info) for _, info in found[v][2]] else NONE)
                     for v in cloud_versions
                 })
             else:
                 value = merge_versions({
-                    v: mark([r for suites, _ in found[v][1] for tests in suites.values() for r in area_results(tests, pattern)])
+                    v: mark([r for suites, _ in found[v][2] for tests in suites.values() for r in area_results(tests, pattern)])
                     for v in cloud_versions
                 })
             row.append(cell(area, cloud["key"], value))
@@ -456,17 +478,20 @@ def main():
             continue
         cloud_rows = []
         for v in sorted(found, key=version_key):
-            run, results = found[v]
+            run, commit, results = found[v]
             engines = sorted({info["cloud_engine"] for _, info in results if "cloud_engine" in info}, key=version_key)
             cloud_rows.append([
-                ", ".join(engines) or v, run["created_at"][:10], f"`{run['head_sha'][:7]}`",
+                ", ".join(engines) or v, run["created_at"][:10], f"`{commit[:7]}`",
                 f"[{run['run_number']}]({run['html_url']})",
             ])
         by_cloud += (
             f"\n\n{cloud['name']}: for each version of PostgreSQL, the last run of the {workflow} where "
             f"{cloud['what']} passed on temporary instances, with Terraform and OpenTofu. A version which has no "
-            "such run on the commit of this matrix, or before it, is not listed.\n\n"
-            + table([f"{cloud['name']} PostgreSQL", "Date", "Commit", "Run"], cloud_rows)
+            "such run on the commit of this matrix, or before it, is not listed. A run on the last commit of a "
+            "pull request is listed with the commit its squash made on the main branch, which has the same files."
+            "\n\n"
+            + table([cloud["name"] if cloud["name"].endswith("PostgreSQL") else f"{cloud['name']} PostgreSQL",
+                     "Date", "Commit", "Run"], cloud_rows)
         )
 
     text = f"""{MARKERS[0]}
