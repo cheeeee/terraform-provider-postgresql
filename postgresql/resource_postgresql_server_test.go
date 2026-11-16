@@ -550,12 +550,33 @@ resource "postgresql_role" "owner_b" {
   name = "srv_owner_b"
 }
 
+# The owner of a server needs the right to use its foreign-data wrapper
+resource "postgresql_grant" "owner_a" {
+  database    = "postgres"
+  role        = postgresql_role.owner_a.name
+  object_type = "foreign_data_wrapper"
+  objects     = ["postgres_fdw"]
+  privileges  = ["USAGE"]
+
+  depends_on = [postgresql_extension.ext_postgres_fdw]
+}
+
+resource "postgresql_grant" "owner_b" {
+  database    = "postgres"
+  role        = postgresql_role.owner_b.name
+  object_type = "foreign_data_wrapper"
+  objects     = ["postgres_fdw"]
+  privileges  = ["USAGE"]
+
+  depends_on = [postgresql_extension.ext_postgres_fdw]
+}
+
 resource "postgresql_server" "myserver" {
   server_name  = %q
   fdw_name     = "postgres_fdw"
   server_owner = postgresql_role.%s.name
 
-  depends_on = [postgresql_extension.ext_postgres_fdw]
+  depends_on = [postgresql_grant.owner_a, postgresql_grant.owner_b]
 }
 `, serverName, owner)
 	}

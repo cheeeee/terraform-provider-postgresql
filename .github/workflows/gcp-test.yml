@@ -1,10 +1,19 @@
-# Test the provider against real (and temporary) Google Cloud SQL instances: the
-# connection through the Cloud SQL proxy (scheme = "gcppostgres") and the IAM database
-# authentication of an impersonated service account, which nothing else tests.
+# Test the provider against real (and temporary) Google Cloud SQL instances:
+# - the whole acceptance test suite, as the postgres user of the instance, which is not a
+#   superuser: in six parts which run at the same time, each one on its own instance
+#   (tests/rds_matrix.py, as on AWS RDS);
+# - the connection through the Cloud SQL connector (scheme = "gcppostgres") and the IAM
+#   database authentication of an impersonated service account, which nothing else tests.
 #
 # It only runs on demand, for one or several versions of PostgreSQL:
 #   gh workflow run gcp-test.yml -f pgversions=17
 #   gh workflow run gcp-test.yml -f pgversions="12 13 14 15 16 17 18"
+#   gh workflow run gcp-test.yml -f pgversions=17 -f tests='^TestAccPostgresqlPublication'
+#
+# What Cloud SQL does not allow, and the tests then skip with the message of the server:
+# a subscription or a publication of all the tables owned by a role which is not a member
+# of cloudsqlsuperuser, a schema added to a publication, a subscription to the loopback
+# address (the instance subscribes to its public address).
 #
 # The credentials of Google Cloud come from a service account which only the "gcp-test"
 # environment of this repository can use (workload identity federation, no stored key).
@@ -31,6 +40,10 @@ on:
           - both
           - terraform
           - opentofu
+      tests:
+        description: Tests to run (go test -run pattern). Empty for the whole test suite, in six instances
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -54,32 +67,30 @@ jobs:
         if: ${{ github.actor != github.repository_owner }}
         run: exit 1
 
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      # The same parts of the test suite as on AWS RDS (tests/rds_matrix.py)
       - name: The jobs of the run
         id: matrix
         env:
           PGVERSIONS: ${{ inputs.pgversions }}
           CLI: ${{ inputs.cli }}
-        run: |
-          python3 - >> "$GITHUB_OUTPUT" <<'PY'
-          import json, os, sys
-          versions = os.environ["PGVERSIONS"].replace(",", " ").split()
-          unknown = [v for v in versions if v not in ("12", "13", "14", "15", "16", "17", "18")]
-          if unknown or not versions:
-              sys.exit(f"unknown versions: {unknown}")
-          clis = ["terraform", "opentofu"] if os.environ["CLI"] == "both" else [os.environ["CLI"]]
-          print("matrix=" + json.dumps({"pgversion": versions, "cli": clis}))
-          PY
+          TESTS: ${{ inputs.tests }}
+        run: echo "matrix=$(python3 tests/rds_matrix.py "$PGVERSIONS" "$CLI" "$TESTS")" >> "$GITHUB_OUTPUT"
 
   gcp:
     needs: plan
-    name: gcp (${{ matrix.pgversion }}, ${{ matrix.cli }})
+    name: gcp (${{ matrix.pgversion }}, ${{ matrix.cli }}, ${{ matrix.shard }})
     runs-on: ubuntu-latest
     environment: gcp-test
     # The token of GitHub which the cloud exchanges for credentials: this job only
     permissions:
       id-token: write
       contents: read
-    timeout-minutes: 60
+    timeout-minutes: 170
 
     strategy:
       fail-fast: false
@@ -90,7 +101,11 @@ jobs:
       GCP_PROJECT: ${{ vars.GCP_PROJECT }}
       GCP_CONNECT_SERVICE_ACCOUNT: ${{ vars.GCP_CONNECT_SERVICE_ACCOUNT }}
       # The name of an instance cannot be used again for a week: every run has its own
-      GCP_SUFFIX: ${{ matrix.cli }}-${{ github.run_id }}-${{ github.run_attempt }}
+      GCP_SUFFIX: ${{ matrix.cli }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+      GCP_TESTS: ${{ matrix.run }}
+      GCP_SKIP: ${{ matrix.skip }}
+      # A part of the suite needs 20 to 50 minutes from most runners
+      GCP_TEST_TIMEOUT: 150m
 
     steps:
       - name: Checkout
@@ -119,7 +134,12 @@ jobs:
 
       - name: Use OpenTofu in the tests
         if: matrix.cli == 'opentofu'
-        run: echo "E2E_TERRAFORM=tofu" >> "$GITHUB_ENV"
+        run: |
+          {
+            echo "TF_ACC_TERRAFORM_PATH=$(command -v tofu)"
+            echo "TF_ACC_PROVIDER_HOST=registry.opentofu.org"
+            echo "E2E_TERRAFORM=tofu"
+          } >> "$GITHUB_ENV"
 
       - name: Credentials of Google Cloud
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
@@ -133,9 +153,20 @@ jobs:
       - name: Create the Cloud SQL instance
         run: ./tests/gcp_up.sh
 
+      # The address of a runner sometimes changes during a job: the new one is allowed too
+      - name: Keep the instance reachable from the runner
+        run: nohup ./tests/gcp_watch_ip.sh > "${RUNNER_TEMP:-/tmp}/gcp-watch-ip.log" 2>&1 &
+
+      - name: Run the tests
+        run: ./tests/gcp_test.sh
+
+      # Once per version and CLI: it does not depend on the part of the test suite
       - name: Run the end-to-end test
+        if: matrix.e2e
         run: ./tests/gcp_e2e.sh
 
       - name: Delete the Cloud SQL instance
         if: always()
-        run: ./tests/gcp_down.sh
+        run: |
+          cat "${RUNNER_TEMP:-/tmp}/gcp-watch-ip.log" 2> /dev/null || true
+          ./tests/gcp_down.sh
