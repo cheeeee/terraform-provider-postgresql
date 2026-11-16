@@ -454,11 +454,21 @@ resource "postgresql_role" "test_owner" {
 	login = true
 }
 
+# The owner of a publication needs the right to create in its database
+resource "postgresql_grant" "test_owner" {
+	database    = "%[1]s"
+	role        = postgresql_role.test_owner.name
+	object_type = "database"
+	privileges  = ["CREATE"]
+}
+
 resource "postgresql_publication" "test" {
 	name     = "publication"
-	database = "%s"
+	database = "%[1]s"
 	owner = "${postgresql_role.test_owner.name}"
 	all_tables = true
+
+	depends_on = [postgresql_grant.test_owner]
 }
 `, dbName)
 
@@ -468,6 +478,14 @@ resource "postgresql_publication" "test" {
 			testCheckCompatibleVersion(t, featurePublication)
 			testCheckCompatibleVersion(t, featurePubTruncate)
 			testCheckCanCreatePublication(t, true)
+			// (Google Cloud SQL keeps a publication of all the tables for a member of cloudsqlsuperuser)
+			testCheckCanExecute(t, "give a publication of all the tables to a role which is not a superuser",
+				"CREATE ROLE tf_probe_owner",
+				`DO $$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO tf_probe_owner', current_database()); END $$`,
+				"GRANT tf_probe_owner TO CURRENT_USER",
+				"CREATE PUBLICATION tf_probe_owned FOR ALL TABLES",
+				"ALTER PUBLICATION tf_probe_owned OWNER TO tf_probe_owner",
+			)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlPublicationDestroy,
@@ -1445,7 +1463,7 @@ func TestAccPostgresqlPublication_Schemas(t *testing.T) {
 	testPubTestCase(t,
 		func() {
 			testCheckCompatibleVersion(t, featurePubSchema)
-			testCheckCanExecute(t, "create a publication for the tables of a schema", "CREATE PUBLICATION tf_probe_schema FOR TABLES IN SCHEMA public")
+			testCheckCanPublishSchemas(t)
 		},
 		testPubInPlace([]resource.TestStep{
 			{
@@ -2181,7 +2199,7 @@ func TestAccPostgresqlPublication_SchemaReplacedByColumnList(t *testing.T) {
 	testPubTestCase(t,
 		func() {
 			testCheckCompatibleVersion(t, featurePubSchema)
-			testCheckCanExecute(t, "create a publication for the tables of a schema", "CREATE PUBLICATION tf_probe_schema FOR TABLES IN SCHEMA public")
+			testCheckCanPublishSchemas(t)
 		},
 		testPubInPlace([]resource.TestStep{
 			{

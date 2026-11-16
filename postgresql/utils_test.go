@@ -109,6 +109,18 @@ func testCheckCanCreatePublication(t *testing.T, allTables bool) {
 	testCheckCanExecute(t, what, statement)
 }
 
+// testCheckCanPublishSchemas skips the test if the connected user cannot create a publication
+// for the tables of a schema, or cannot add a schema to it (Google Cloud SQL allows the first
+// and keeps the second for a superuser).
+func testCheckCanPublishSchemas(t *testing.T) {
+	testCheckCanExecute(
+		t, "create a publication for the tables of a schema and add a schema to it",
+		"CREATE PUBLICATION tf_probe_schema FOR TABLES IN SCHEMA public",
+		"CREATE SCHEMA tf_probe_schema",
+		"ALTER PUBLICATION tf_probe_schema ADD TABLES IN SCHEMA tf_probe_schema",
+	)
+}
+
 // testCheckCanCreateSubscription skips the test if the connected user cannot create
 // a subscription which connects to the server with conninfo.
 func testCheckCanCreateSubscription(t *testing.T, conninfo string) {

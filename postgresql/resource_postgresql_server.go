@@ -224,8 +224,17 @@ func resourcePostgreSQLServerDelete(db *DBConnection, d *schema.ResourceData) er
 		dropMode = "CASCADE"
 	}
 
-	sql := fmt.Sprintf("DROP SERVER %s %s ", pq.QuoteIdentifier(serverName), dropMode)
-	if _, err := txn.Exec(sql); err != nil {
+	owners, err := serverOwners(txn, serverName)
+	if err != nil {
+		return err
+	}
+	// Only its owner can drop a server: the connected user gets the role of the owner
+	// for the time of the statement, as for the other objects which have an owner.
+	if err := withRolesGranted(txn, owners, func() error {
+		sql := fmt.Sprintf("DROP SERVER %s %s ", pq.QuoteIdentifier(serverName), dropMode)
+		_, err := txn.Exec(sql)
+		return err
+	}); err != nil {
 		return err
 	}
 
@@ -252,15 +261,25 @@ func resourcePostgreSQLServerUpdate(db *DBConnection, d *schema.ResourceData) er
 	}
 	defer deferredRollback(txn)
 
-	if err := setServerNameIfChanged(txn, d); err != nil {
+	// Only its owner can alter a server, and its new owner has to be a role the connected
+	// user can become: the connected user gets both roles for the time of the statements.
+	serverOldName, _ := d.GetChange(serverNameAttr)
+	owners, err := serverOwners(txn, serverOldName.(string))
+	if err != nil {
 		return err
 	}
-
-	if err := setServerOwnerIfChanged(txn, d); err != nil {
-		return err
+	if newOwner := d.Get(serverOwnerAttr).(string); newOwner != "" && !sliceContainsStr(owners, newOwner) {
+		owners = append(owners, newOwner)
 	}
-
-	if err := setServerVersionOptionsIfChanged(txn, d); err != nil {
+	if err := withRolesGranted(txn, owners, func() error {
+		if err := setServerNameIfChanged(txn, d); err != nil {
+			return err
+		}
+		if err := setServerOwnerIfChanged(txn, d); err != nil {
+			return err
+		}
+		return setServerVersionOptionsIfChanged(txn, d)
+	}); err != nil {
 		return err
 	}
 
@@ -339,6 +358,22 @@ func setServerNameIfChanged(txn *sql.Tx, d *schema.ResourceData) error {
 	}
 
 	return nil
+}
+
+// serverOwners returns the owner of a server, as the list of the roles the connected user
+// needs to alter or to drop it (nothing when the server does not exist).
+func serverOwners(txn *sql.Tx, serverName string) ([]string, error) {
+	var owner string
+	err := txn.QueryRow(
+		"SELECT pg_catalog.pg_get_userbyid(srvowner) FROM pg_catalog.pg_foreign_server WHERE srvname = $1", serverName,
+	).Scan(&owner)
+	switch {
+	case err == sql.ErrNoRows:
+		return nil, nil
+	case err != nil:
+		return nil, fmt.Errorf("error reading the owner of the foreign server: %w", err)
+	}
+	return []string{owner}, nil
 }
 
 func setServerOwnerIfChanged(txn *sql.Tx, d *schema.ResourceData) error {

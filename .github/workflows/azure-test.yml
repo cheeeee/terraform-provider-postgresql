@@ -1,10 +1,19 @@
 # Test the provider against real (and temporary) Azure Database for PostgreSQL flexible
-# servers: the login with a token of Microsoft Entra (azure_identity_auth), which the
-# server checks. Nothing else tests it against a server of Azure.
+# servers:
+# - the whole acceptance test suite, as the administrator of the server, which is not a
+#   superuser: in six parts which run at the same time, each one on its own server
+#   (tests/rds_matrix.py, as on AWS RDS);
+# - the login with a token of Microsoft Entra (azure_identity_auth), which the server
+#   checks. Nothing else tests it against a server of Azure.
 #
 # It only runs on demand, for one or several versions of PostgreSQL:
 #   gh workflow run azure-test.yml -f pgversions=17
-#   gh workflow run azure-test.yml -f pgversions="13 14 15 16 17 18"
+#   gh workflow run azure-test.yml -f pgversions="12 13 14 15 16 17 18"
+#   gh workflow run azure-test.yml -f pgversions=17 -f tests='^TestAccPostgresqlPublication'
+#
+# What Azure does not allow, and the tests then skip with the message of the server: a
+# publication of all the tables owned by another role, ALTER EXTENSION ... SET SCHEMA, an
+# extension which is not in the list of the server (azure.extensions, see azure_up.sh).
 #
 # The credentials of Azure are the ones of a managed identity which only the "azure-test"
 # environment of this repository can use (a federated credential, no secret). The
@@ -31,6 +40,10 @@ on:
           - both
           - terraform
           - opentofu
+      tests:
+        description: Tests to run (go test -run pattern). Empty for the whole test suite, in six servers
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -54,32 +67,30 @@ jobs:
         if: ${{ github.actor != github.repository_owner }}
         run: exit 1
 
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      # The same parts of the test suite as on AWS RDS (tests/rds_matrix.py)
       - name: The jobs of the run
         id: matrix
         env:
           PGVERSIONS: ${{ inputs.pgversions }}
           CLI: ${{ inputs.cli }}
-        run: |
-          python3 - >> "$GITHUB_OUTPUT" <<'PY'
-          import json, os, sys
-          versions = os.environ["PGVERSIONS"].replace(",", " ").split()
-          unknown = [v for v in versions if not v.isdigit()]
-          if unknown or not versions:
-              sys.exit(f"unknown versions: {unknown}")
-          clis = ["terraform", "opentofu"] if os.environ["CLI"] == "both" else [os.environ["CLI"]]
-          print("matrix=" + json.dumps({"pgversion": versions, "cli": clis}))
-          PY
+          TESTS: ${{ inputs.tests }}
+        run: echo "matrix=$(python3 tests/rds_matrix.py "$PGVERSIONS" "$CLI" "$TESTS")" >> "$GITHUB_OUTPUT"
 
   azure:
     needs: plan
-    name: azure (${{ matrix.pgversion }}, ${{ matrix.cli }})
+    name: azure (${{ matrix.pgversion }}, ${{ matrix.cli }}, ${{ matrix.shard }})
     runs-on: ubuntu-latest
     environment: azure-test
     # The token of GitHub which the cloud exchanges for credentials: this job only
     permissions:
       id-token: write
       contents: read
-    timeout-minutes: 60
+    timeout-minutes: 170
 
     strategy:
       fail-fast: false
@@ -98,7 +109,11 @@ jobs:
       AZURE_PRINCIPAL_NAME: tfpg-test-github
       AZURE_PRINCIPAL_TYPE: ServicePrincipal
       # The name of a server is a DNS name of Azure: every run has its own
-      AZURE_SUFFIX: ${{ matrix.cli }}-${{ github.run_id }}-${{ github.run_attempt }}
+      AZURE_SUFFIX: ${{ matrix.cli }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+      AZURE_TESTS: ${{ matrix.run }}
+      AZURE_SKIP: ${{ matrix.skip }}
+      # A part of the suite needs 20 to 50 minutes from most runners
+      AZURE_TEST_TIMEOUT: 150m
 
     steps:
       - name: Checkout
@@ -127,7 +142,12 @@ jobs:
 
       - name: Use OpenTofu in the tests
         if: matrix.cli == 'opentofu'
-        run: echo "E2E_TERRAFORM=tofu" >> "$GITHUB_ENV"
+        run: |
+          {
+            echo "TF_ACC_TERRAFORM_PATH=$(command -v tofu)"
+            echo "TF_ACC_PROVIDER_HOST=registry.opentofu.org"
+            echo "E2E_TERRAFORM=tofu"
+          } >> "$GITHUB_ENV"
 
       - name: Credentials of Azure
         uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
@@ -139,9 +159,30 @@ jobs:
       - name: Create the server
         run: ./tests/azure_up.sh
 
+      # The address of a runner sometimes changes during a job: the new one is allowed too
+      - name: Keep the server reachable from the runner
+        run: nohup ./tests/azure_watch_ip.sh > "${RUNNER_TEMP:-/tmp}/azure-watch-ip.log" 2>&1 &
+
+      - name: Run the tests
+        run: ./tests/azure_test.sh
+
+      # Once per version and CLI: it does not depend on the part of the test suite
       - name: Run the end-to-end test
+        if: matrix.e2e
         run: ./tests/azure_e2e.sh
+
+      # The token of Azure lasts an hour and the job can last longer: the server is deleted
+      # with a new one
+      - name: Credentials of Azure, again
+        if: always()
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Delete the server
         if: always()
-        run: ./tests/azure_down.sh
+        run: |
+          cat "${RUNNER_TEMP:-/tmp}/azure-watch-ip.log" 2> /dev/null || true
+          ./tests/azure_down.sh

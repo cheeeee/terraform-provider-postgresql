@@ -408,6 +408,12 @@ func TestAccPostgresqlExtension_SchemaRename(t *testing.T) {
 			testAccPreCheck(t)
 			testCheckCompatibleVersion(t, featureExtension)
 			testCheckCanCreateExtension(t, "pg_trgm")
+			// (Azure Database for PostgreSQL does not support ALTER EXTENSION ... SET SCHEMA)
+			testCheckCanExecute(t, "move an extension to another schema",
+				"CREATE EXTENSION IF NOT EXISTS pg_trgm",
+				"CREATE SCHEMA tf_probe_extension",
+				"ALTER EXTENSION pg_trgm SET SCHEMA tf_probe_extension",
+			)
 		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlExtensionDestroy,

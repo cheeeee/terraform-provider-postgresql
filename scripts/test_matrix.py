@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the test matrix of the README from the logs of the CI on GitHub.
 
-    scripts/test_matrix.py --run <id of a run of the "test" workflow> [--rds] [--write README.md]
+    scripts/test_matrix.py --run <id of a run of the "test" workflow> [--clouds] [--write README.md]
 
 It is run by the "matrix" job of the test workflow, on the logs of the jobs of its own
 run: nobody writes the matrix by hand. A cell is only checked if the tests really ran
@@ -12,9 +12,10 @@ and passed:
     n/a  no test ran because the area cannot work in this environment (see NOT_APPLICABLE)
     —    no test ran for another reason: the area was not tested
 
-    --rds            add what was tested on AWS RDS: for each version of PostgreSQL, the last
-                     run of the "rds-test" workflow on GitHub where the whole test suite
-                     passed with the two CLIs, on the commit of the run of --run or before it
+    --clouds         add what was tested on the managed services (AWS RDS, Google Cloud SQL,
+                     Azure Database for PostgreSQL): for each one and each version of PostgreSQL,
+                     the last run of its workflow on GitHub where the whole test suite passed
+                     with the two CLIs, on the commit of the run of --run or before it
     --summary FILE   also write the matrix, and whether the README shows it, to this file
                      (the summary of the job)
     --logs DIR       read the logs of the jobs of the test workflow from DIR/*.log instead of
@@ -62,18 +63,37 @@ NOT_APPLICABLE = {
     ("Event triggers", "rds"): "creating an event trigger needs a superuser",
     ("Foreign servers and user mappings", "rds"): "creating the extension of a foreign data wrapper needs a superuser",
     ("Security labels", "aws"): "AWS RDS has no security label provider",
+    ("Security labels", "gcp"): "Google Cloud SQL has no security label provider",
+    ("Security labels", "azure"): "Azure Database for PostgreSQL has no security label provider",
     (E2E, "rds"): "the end-to-end test needs privileges of the master user of a managed service (extensions, pgaudit), "
                   "it is run without superuser on AWS RDS",
 }
 MARKERS = ("<!-- test-matrix:start -->", "<!-- test-matrix:end -->")
 PASS, FAIL, NONE, NA = "✅", "❌", "—", "n/a"
 
-# The jobs of the rds-test workflow which make a version tested on AWS RDS: the whole
+# The jobs of the workflow of a managed service which make a version tested on it: the whole
 # test suite (all its parts, they are in tests/rds_matrix.py) with the two CLIs, in the same run
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests"))
 import rds_matrix  # noqa: E402
 
-RDS_WORKFLOW = "rds-test.yml"
+# The managed services: the workflow which tests each one on temporary instances, the name
+# of its jobs ("<job> (<version>, <cli>, <part>)") and what a run checks besides the tests
+CLOUDS = [
+    {
+        "key": "aws", "name": "AWS RDS", "workflow": "rds-test.yml", "job": "rds",
+        "what": "the whole test suite, the end-to-end checks, a password from AWS Secrets Manager and the IAM "
+                "authentication of the provider",
+    },
+    {
+        "key": "gcp", "name": "Google Cloud SQL", "workflow": "gcp-test.yml", "job": "gcp",
+        "what": "the whole test suite and the connection of the provider through the Cloud SQL connector, with a "
+                "password and with the IAM authentication of an impersonated service account",
+    },
+    {
+        "key": "azure", "name": "Azure Database for PostgreSQL", "workflow": "azure-test.yml", "job": "azure",
+        "what": "the whole test suite and the login of the provider with a token of Microsoft Entra",
+    },
+]
 RDS_CLIS = ("terraform", "opentofu")
 RDS_SHARDS = tuple(rds_matrix.SHARDS) + (rds_matrix.REST,)
 
@@ -112,13 +132,20 @@ def api(path, raw=False):
 
 
 def run_jobs(repo, run):
-    """The jobs of the last attempt of a run."""
-    jobs, page = [], 1
+    """The jobs of the last attempt of a run.
+
+    They are taken from the list of the jobs of every attempt. The API has a list of the last
+    attempt only, but it is slow for a run of which a job was run again (0.17 s for each job
+    of the page, against 0.05 s) and the API gives up after 10 s: a page of 100 jobs of the 85
+    of such a run was always answered by an error 502."""
+    last, page = {}, 1
     while True:
-        found = api(f"/repos/{repo}/actions/runs/{run}/jobs?per_page=100&page={page}")["jobs"]
-        jobs += found
-        if len(found) < 100:
-            return jobs
+        found = api(f"/repos/{repo}/actions/runs/{run}/jobs?filter=all&per_page=50&page={page}")["jobs"]
+        for job in found:
+            if job["name"] not in last or job["run_attempt"] > last[job["name"]]["run_attempt"]:
+                last[job["name"]] = job
+        if len(found) < 50:
+            return list(last.values())
         page += 1
 
 
@@ -170,10 +197,12 @@ def parse_log(text):
             info["upgrade_passed"] = True
         if "SKIPPED" in line and "Module examples" in line:
             info["e2e_partial"] = True
-        m = re.search(r"Creating instance \S+ \(PostgreSQL ((\d+)[0-9.]*)", line)
+        # (AWS RDS says the version when the instance is asked for, the others when it is there)
+        m = (re.search(r"Creating instance \S+ \(PostgreSQL ((\d+)\.[0-9.]+)", line)
+             or re.search(r"(?:Instance|Server) \S+ is available: PostgreSQL ((\d+)\.[0-9.]+)", line))
         if m:
-            info["rds_version"] = m.group(2)
-            info["rds_engine"] = m.group(1).rstrip(".")
+            info["cloud_version"] = m.group(2)
+            info["cloud_engine"] = m.group(1).rstrip(".")
     return suites, info
 
 
@@ -234,8 +263,8 @@ def table(header, rows, align=":---:"):
     return "\n".join(out)
 
 
-def rds_evidence(repo, head):
-    """For each version of PostgreSQL, the last run of the rds-test workflow where every job of
+def cloud_evidence(repo, head, cloud):
+    """For each version of PostgreSQL, the last run of the workflow of the cloud where every job of
     the version passed, on the commit `head` or on one before it: {version: (run, [(suites, info)])}."""
     ancestors = {}
 
@@ -248,11 +277,11 @@ def rds_evidence(repo, head):
         return ancestors[sha]
 
     evidence = {}
-    runs = api(f"/repos/{repo}/actions/workflows/{RDS_WORKFLOW}/runs?status=completed&per_page=40")["workflow_runs"]
+    runs = api(f"/repos/{repo}/actions/workflows/{cloud['workflow']}/runs?status=completed&per_page=40")["workflow_runs"]
     for run in sorted(runs, key=lambda r: r["created_at"], reverse=True):
         passed = collections.defaultdict(dict)
         for job in run_jobs(repo, run["id"]):
-            m = re.match(r"rds \((\d+), (\w+), (\w+)\)$", job["name"])
+            m = re.match(cloud["job"] + r" \((\d+), (\w+), (\w+)\)$", job["name"])
             if m and job["conclusion"] == "success":
                 passed[m.group(1)][(m.group(2), m.group(3))] = job
         for version, jobs in passed.items():
@@ -270,7 +299,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run", help='id of a run of the "test" workflow')
     parser.add_argument("--logs", help="directory of the logs of the jobs (*.log), named after the jobs")
-    parser.add_argument("--rds", action="store_true", help='add the runs of the "rds-test" workflow on GitHub')
+    parser.add_argument("--clouds", action="store_true",
+                        help="add the runs of the workflows of the managed services on GitHub")
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", "cheeeee/terraform-provider-postgresql"))
     parser.add_argument("--write", help="file to update between the test-matrix markers")
     parser.add_argument("--summary", help="file to append the matrix to, with the state of the file of --write")
@@ -358,11 +388,15 @@ def main():
     by_version = table(["PostgreSQL"] + versions, rows)
 
     # --- areas x environments
-    rds = rds_evidence(args.repo, head) if args.rds and head else {}
-    rds_versions = sorted(rds, key=version_key)
-    header = ["Environment", "Superuser", "Not superuser"]
-    if rds:
-        header.append("AWS RDS")
+    # cloud key -> {version: (run, results)}, for the clouds which have a run to show
+    evidence = {}
+    if args.clouds and head:
+        for cloud in CLOUDS:
+            found = cloud_evidence(args.repo, head, cloud)
+            if found:
+                evidence[cloud["key"]] = found
+    shown = [cloud for cloud in CLOUDS if cloud["key"] in evidence]
+    header = ["Environment", "Superuser", "Not superuser"] + [cloud["name"] for cloud in shown]
     notes = []
 
     def cell(area, environment, value):
@@ -387,47 +421,50 @@ def main():
                     for v in versions
                 })
             row.append(cell(area, suite, value))
-        if rds:
+        for cloud in shown:
+            found = evidence[cloud["key"]]
+            cloud_versions = sorted(found, key=version_key)
             if pattern is None:
                 # the end-to-end checks run in one job of the version for each CLI
                 value = merge_versions({
-                    v: FAIL if FAIL in [e2e_mark(info) for _, info in rds[v][1]]
-                    else (PASS if PASS in [e2e_mark(info) for _, info in rds[v][1]] else NONE)
-                    for v in rds_versions
+                    v: FAIL if FAIL in [e2e_mark(info) for _, info in found[v][1]]
+                    else (PASS if PASS in [e2e_mark(info) for _, info in found[v][1]] else NONE)
+                    for v in cloud_versions
                 })
             else:
                 value = merge_versions({
-                    v: mark([r for suites, _ in rds[v][1] for tests in suites.values() for r in area_results(tests, pattern)])
-                    for v in rds_versions
+                    v: mark([r for suites, _ in found[v][1] for tests in suites.values() for r in area_results(tests, pattern)])
+                    for v in cloud_versions
                 })
-            row.append(cell(area, "aws", value))
+            row.append(cell(area, cloud["key"], value))
         rows.append(row)
     by_environment = table(header, rows)
     footnotes = "".join(f"\n- [{i}] {reason}." for i, reason in enumerate(notes, 1))
 
-    if rds:
-        rds_rows = []
-        for v in rds_versions:
-            run, results = rds[v]
-            engines = sorted({info["rds_engine"] for _, info in results if "rds_engine" in info}, key=version_key)
-            rds_rows.append([
+    by_cloud = ""
+    for cloud in CLOUDS if args.clouds else []:
+        workflow = f"[{cloud['workflow'][:-4]} workflow](.github/workflows/{cloud['workflow']})"
+        found = evidence.get(cloud["key"])
+        if not found:
+            by_cloud += (
+                f"\n\n{cloud['name']}: no run of the {workflow} passed with the whole test suite on the commit of "
+                "this matrix, or before it."
+            )
+            continue
+        cloud_rows = []
+        for v in sorted(found, key=version_key):
+            run, results = found[v]
+            engines = sorted({info["cloud_engine"] for _, info in results if "cloud_engine" in info}, key=version_key)
+            cloud_rows.append([
                 ", ".join(engines) or v, run["created_at"][:10], f"`{run['head_sha'][:7]}`",
                 f"[{run['run_number']}]({run['html_url']})",
             ])
-        by_rds = (
-            "\n\nAWS RDS: for each version of PostgreSQL, the last run of the [rds-test workflow]"
-            "(.github/workflows/rds-test.yml) where the whole test suite, the end-to-end checks, a password from AWS "
-            "Secrets Manager and the IAM authentication of the provider passed on temporary instances, with "
-            "Terraform and OpenTofu. A version which has no such run on the commit of this matrix, or before it, is "
-            "not listed.\n\n" + table(["AWS RDS PostgreSQL", "Date", "Commit", "Run"], rds_rows)
+        by_cloud += (
+            f"\n\n{cloud['name']}: for each version of PostgreSQL, the last run of the {workflow} where "
+            f"{cloud['what']} passed on temporary instances, with Terraform and OpenTofu. A version which has no "
+            "such run on the commit of this matrix, or before it, is not listed.\n\n"
+            + table([f"{cloud['name']} PostgreSQL", "Date", "Commit", "Run"], cloud_rows)
         )
-    elif args.rds:
-        by_rds = (
-            "\n\nAWS RDS: no run of the [rds-test workflow](.github/workflows/rds-test.yml) passed with the whole "
-            "test suite on the commit of this matrix, or before it."
-        )
-    else:
-        by_rds = ""
 
     text = f"""{MARKERS[0]}
 {source}. Every cell covers {" and ".join(cli_names) or "the CLI of the CI"}.
@@ -442,7 +479,7 @@ The same tests in the different environments:
 - {FAIL}: at least one test failed.
 - {NA}: the area cannot work in this environment, the reason is given below.
 - {NONE}: no test ran, the area has not been tested there.
-- "Not superuser" is a local PostgreSQL used with a role which is not a superuser, like the master user of a managed service.{footnotes}{by_rds}
+- "Not superuser" is a local PostgreSQL used with a role which is not a superuser, like the master user of a managed service.{footnotes}{by_cloud}
 {MARKERS[1]}"""
 
     changed = None
