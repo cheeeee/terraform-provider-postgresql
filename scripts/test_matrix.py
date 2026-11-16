@@ -98,6 +98,7 @@ RDS_CLIS = ("terraform", "opentofu")
 RDS_SHARDS = tuple(rds_matrix.SHARDS) + (rds_matrix.REST,)
 
 API = "https://api.github.com"
+JOBS_PER_PAGE = 20
 
 
 def sh(*cmd):
@@ -134,17 +135,19 @@ def api(path, raw=False):
 def run_jobs(repo, run):
     """The jobs of the last attempt of a run.
 
-    They are taken from the list of the jobs of every attempt. The API has a list of the last
-    attempt only, but it is slow for a run of which a job was run again (0.17 s for each job
-    of the page, against 0.05 s) and the API gives up after 10 s: a page of 100 jobs of the 85
-    of such a run was always answered by an error 502."""
+    The API of GitHub is slow to list the jobs of a run of which a job was run again: 0.17 s for
+    each job of a page, where another run takes 0.05 s, and it gives up after 10 s. A page of 100
+    jobs of such a run (85 jobs, one of them run again) was always answered by an error 502, and a
+    page of 50 took up to 9 s. The pages are of 20 jobs, 3.4 s at most, and the jobs of every
+    attempt are listed (the list of the last attempt only is not faster), the last attempt of
+    each job being kept."""
     last, page = {}, 1
     while True:
-        found = api(f"/repos/{repo}/actions/runs/{run}/jobs?filter=all&per_page=50&page={page}")["jobs"]
+        found = api(f"/repos/{repo}/actions/runs/{run}/jobs?filter=all&per_page={JOBS_PER_PAGE}&page={page}")["jobs"]
         for job in found:
             if job["name"] not in last or job["run_attempt"] > last[job["name"]]["run_attempt"]:
                 last[job["name"]] = job
-        if len(found) < 50:
+        if len(found) < JOBS_PER_PAGE:
             return list(last.values())
         page += 1
 
