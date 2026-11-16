@@ -3,8 +3,9 @@
 # rds_up.sh failed halfway, and it fails if something could not be deleted.
 #
 # A resource is only taken for absent when AWS says it does not exist: a call which
-# fails for another reason (a refused call, a crash of the CLI) is tried again, and it
-# makes the script fail if it keeps failing. What is left is deleted by rds_janitor.sh.
+# fails for another reason (a refused call, a crash of the CLI) makes the script fail,
+# after the rest was deleted. What is left is deleted by rds_janitor.sh.
+# (The AWS CLI already sends again, by itself, a call which was throttled or cut.)
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -16,15 +17,12 @@ unknown=0
 # not, 2 when it could not be known
 exists() {
     local output
-    for _ in 1 2 3; do
-        if output=$("$@" 2>&1); then
-            return 0
-        fi
-        if echo "$output" | grep -qE "NotFound|NoSuchEntity|ResourceNotFoundException"; then
-            return 1
-        fi
-        sleep 5
-    done
+    if output=$("$@" 2>&1); then
+        return 0
+    fi
+    if echo "$output" | grep -qE "NotFound|NoSuchEntity|ResourceNotFoundException"; then
+        return 1
+    fi
     echo "Could not check ($*): $output" >&2
     unknown=1
     return 2
@@ -33,13 +31,10 @@ exists() {
 # security_groups: the identifiers of the security groups of the instance; it fails when
 # they could not be listed
 security_groups() {
-    for _ in 1 2 3; do
-        if aws ec2 describe-security-groups --filters "Name=group-name,Values=$RDS_NAME" \
-            --query 'SecurityGroups[].GroupId' --output text; then
-            return 0
-        fi
-        sleep 5
-    done
+    if aws ec2 describe-security-groups --filters "Name=group-name,Values=$RDS_NAME" \
+        --query 'SecurityGroups[].GroupId' --output text; then
+        return 0
+    fi
     echo "Could not list the security groups named $RDS_NAME" >&2
     return 1
 }
