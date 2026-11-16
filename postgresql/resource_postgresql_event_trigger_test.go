@@ -660,7 +660,8 @@ func TestAccPostgresqlEventTrigger_FilterMultiple(t *testing.T) {
 			{
 				Config: fmt.Sprintf(testAccPostgreSQLEventTriggerGenericConfig, "postgres", "public", "test_event", "ddl_command_end", "postgres", "enable",
 					testAccEventTriggerFilter("CREATE TABLE")+"\n"+testAccEventTriggerFilter("ALTER TABLE"), ""),
-				ExpectError: regexp.MustCompile(`Too many filter blocks`),
+				// ("Too many list items" before Terraform 0.15)
+				ExpectError: regexp.MustCompile(`Too many (filter blocks|list items)`),
 			},
 		},
 	})

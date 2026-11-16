@@ -96,6 +96,17 @@ jobs:
       - name: teste2e
         run: make teste2e
 
+  # Every release line of the two CLIs (tests/cli_versions.json), on one version of
+  # PostgreSQL: what works with a version of a CLI does not depend on the version of
+  # PostgreSQL. All of them with all the versions of PostgreSQL is the first step of a
+  # release, and can be asked for (full-test.yml).
+  cli:
+    # (the call of a workflow of the repository is read from the commit which runs, with
+    # "./" as well as with "$/", which actionlint 1.7.12 refuses)
+    uses: ./.github/workflows/full-test.yml # zizmor: ignore[self-repository]
+    with:
+      pgversions: '17'
+
   # The IAM authentication of the provider (aws_rds_iam_auth, with an assumed role and the
   # region of the token) against Floci, a local emulator of AWS: see tests/floci_iam.sh.
   # The same test runs against a real RDS instance in rds-test.yml.

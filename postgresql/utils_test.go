@@ -4,11 +4,15 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/blang/semver"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/lib/pq"
 )
@@ -18,6 +22,58 @@ const (
 	roleNamePrefix   = "tf_tests_role"
 	testRolePassword = "testpwd"
 )
+
+// The CLI which runs the acceptance tests: Terraform or OpenTofu, and its version.
+var testCLI struct {
+	once    sync.Once
+	name    string
+	version semver.Version
+	known   bool
+}
+
+var testCLIVersionRegexp = regexp.MustCompile(`(?m)^(Terraform|OpenTofu) v(\d+\.\d+\.\d+)`)
+
+// testCLIVersion returns the name and the version of the CLI of the tests (TF_ACC_TERRAFORM_PATH,
+// or the terraform of the PATH). known is false when it cannot be told.
+func testCLIVersion() (name string, version semver.Version, known bool) {
+	testCLI.once.Do(func() {
+		path := os.Getenv("TF_ACC_TERRAFORM_PATH")
+		if path == "" {
+			path = "terraform"
+		}
+		out, err := exec.Command(path, "version").Output()
+		if err != nil {
+			return
+		}
+		match := testCLIVersionRegexp.FindSubmatch(out)
+		if match == nil {
+			return
+		}
+		version, err := semver.Parse(string(match[2]))
+		if err != nil {
+			return
+		}
+		testCLI.name, testCLI.version, testCLI.known = string(match[1]), version, true
+	})
+	return testCLI.name, testCLI.version, testCLI.known
+}
+
+// testCLIHasWriteOnly tells whether the CLI of the tests knows the write-only arguments:
+// Terraform and OpenTofu have them since their 1.11. A CLI whose version cannot be read is
+// taken for a recent one: the test then fails instead of being silently skipped.
+func testCLIHasWriteOnly() bool {
+	_, version, known := testCLIVersion()
+	return !known || version.GTE(semver.MustParse("1.11.0"))
+}
+
+// testSkipWithoutWriteOnly skips a test of the write-only arguments (password_wo) with a CLI
+// which does not have them.
+func testSkipWithoutWriteOnly(t *testing.T) {
+	if !testCLIHasWriteOnly() {
+		name, version, _ := testCLIVersion()
+		t.Skipf("the write-only arguments need Terraform 1.11 or OpenTofu 1.11: the tests run with %s %s", name, version)
+	}
+}
 
 func closeDB(t *testing.T, db *sql.DB) {
 	if err := db.Close(); err != nil {

@@ -4,6 +4,21 @@ set -e
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# The end-to-end tests give the provider which was just built to the CLI with dev_overrides
+# and run it with -chdir: Terraform has both since 0.14. They are skipped, and it is said,
+# with an older Terraform: the acceptance tests are what is run with it.
+cli_version=$("${E2E_TERRAFORM:-terraform}" version | head -1)
+case "$cli_version" in
+    "Terraform v0.12."* | "Terraform v0.13."*)
+        reason="the end-to-end tests are skipped with $cli_version: they need dev_overrides and -chdir, which Terraform has since 0.14"
+        echo "SKIP: $reason"
+        if [ -n "${GITHUB_ACTIONS:-}" ]; then
+            echo "::notice title=End-to-end tests::$reason"
+        fi
+        exit 0
+        ;;
+esac
+
 ./tests/testacc_setup.sh
 source ./tests/switch_superuser.sh
 

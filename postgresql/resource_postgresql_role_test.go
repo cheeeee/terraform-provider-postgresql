@@ -487,6 +487,7 @@ resource "postgresql_role" "role_with_search_path" {
 `
 
 func TestAccPostgresqlRole_WriteOnlyPassword_Basic(t *testing.T) {
+	testSkipWithoutWriteOnly(t)
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() {
 			testAccPreCheck(t)
@@ -629,7 +630,9 @@ resource "postgresql_role" "hash_pwd_role" {
 				),
 			},
 			{
-				// The write-only password is hashed too
+				// The write-only password is hashed too (with a CLI which has write-only
+				// arguments: the other steps do not depend on it)
+				SkipFunc: func() (bool, error) { return !testCLIHasWriteOnly(), nil },
 				Config: providerConfig + `
 resource "postgresql_role" "hash_pwd_role" {
   name                = "hash_pwd_role"
@@ -679,6 +682,7 @@ resource "postgresql_role" "hash_pwd_role" {
 }
 
 func TestAccPostgresqlRole_WriteOnlyPassword_Switch(t *testing.T) {
+	testSkipWithoutWriteOnly(t)
 	configPassword := `
 resource "postgresql_role" "switch_role" {
   name     = "switch_role"
@@ -746,6 +750,7 @@ resource "postgresql_role" "switch_role" {
 }
 
 func TestAccPostgresqlRole_WriteOnlyPassword_WithVersioning(t *testing.T) {
+	testSkipWithoutWriteOnly(t)
 	const roleName = "switch_role"
 
 	configWOv1 := `
