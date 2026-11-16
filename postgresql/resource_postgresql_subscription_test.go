@@ -2,6 +2,7 @@ package postgresql
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -553,6 +554,13 @@ func (s *subTest) catalog(subName, expr, expected string) resource.TestCheckFunc
 	return func(_ *terraform.State) error {
 		got, err := s.query(s.dbSub, fmt.Sprintf(`SELECT (%s)::text FROM pg_catalog.pg_subscription
 			WHERE subname = $1 AND subdbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())`, expr), subName)
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && pqErr.Code == "42501" {
+			// Some columns of pg_subscription are kept for the superusers (subsynccommit before
+			// PostgreSQL 15): the provider does not read them either, the value cannot be checked.
+			s.t.Logf("%s of subscription %s cannot be read by the connected user, it is not checked: %v", expr, subName, err)
+			return nil
+		}
 		if err != nil {
 			return fmt.Errorf("could not read %s of subscription %s: %w", expr, subName, err)
 		}
@@ -581,10 +589,15 @@ func (s *subTest) slots(expected string) resource.TestCheckFunc {
 	}
 }
 
+// The oid of a subscription, from the view of the statistics: before PostgreSQL 13 a user who
+// is not a superuser cannot read the oid column of pg_subscription itself (the master user of
+// AWS RDS can, the one of Google Cloud SQL cannot).
+const subscriptionOIDQuery = "SELECT DISTINCT subid::text FROM pg_catalog.pg_stat_subscription WHERE subname = $1"
+
 // subscriptionOID keeps the oid of the subscription to prove that it is not replaced.
 func (s *subTest) rememberOID(name string, oid *string) resource.TestCheckFunc {
 	return func(_ *terraform.State) error {
-		got, err := s.query(s.dbSub, "SELECT oid::text FROM pg_catalog.pg_subscription WHERE subname = $1", name)
+		got, err := s.query(s.dbSub, subscriptionOIDQuery, name)
 		if err != nil {
 			return err
 		}
@@ -595,7 +608,7 @@ func (s *subTest) rememberOID(name string, oid *string) resource.TestCheckFunc {
 
 func (s *subTest) sameOID(name string, oid *string) resource.TestCheckFunc {
 	return func(_ *terraform.State) error {
-		got, err := s.query(s.dbSub, "SELECT oid::text FROM pg_catalog.pg_subscription WHERE subname = $1", name)
+		got, err := s.query(s.dbSub, subscriptionOIDQuery, name)
 		if err != nil {
 			return err
 		}
@@ -608,7 +621,7 @@ func (s *subTest) sameOID(name string, oid *string) resource.TestCheckFunc {
 
 func (s *subTest) differentOID(name string, oid *string) resource.TestCheckFunc {
 	return func(_ *terraform.State) error {
-		got, err := s.query(s.dbSub, "SELECT oid::text FROM pg_catalog.pg_subscription WHERE subname = $1", name)
+		got, err := s.query(s.dbSub, subscriptionOIDQuery, name)
 		if err != nil {
 			return err
 		}
@@ -744,7 +757,14 @@ func TestAccPostgresqlSubscription_EnabledSynchronousCommit(t *testing.T) {
 	var oid string
 
 	resource.Test(t, resource.TestCase{
-		PreCheck:     s.preCheck(),
+		PreCheck: func() {
+			s.preCheck()()
+			// Before PostgreSQL 15 the commit mode of a subscription is kept for the superusers
+			// (the master user of AWS RDS reads it, the one of Google Cloud SQL does not): the
+			// provider then cannot import it, nor see that it was changed.
+			testCheckCanExecute(t, "read the commit mode of a subscription",
+				"SELECT subsynccommit FROM pg_catalog.pg_subscription LIMIT 1")
+		},
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckPostgresqlSubscriptionDestroy,
 		Steps: []resource.TestStep{
@@ -1687,15 +1707,20 @@ func (s *subTest) ownerRole() (string, func()) {
 	roleName := "tf_sub_owner_" + strconv.Itoa(int(time.Now().UnixNano()))
 	return roleName, func() {
 		testAccPreCheck(t)
-		testCheckCanExecute(t, "create a role which can own a subscription",
+		// (Google Cloud SQL only lets a member of cloudsqlsuperuser own a subscription: the
+		// subscription of the probe connects to nothing, its address is one of the documentation)
+		testCheckCanExecute(t, "create a role which can own a subscription and give it one",
 			"CREATE ROLE tf_probe_owner",
 			`DO $$ BEGIN
 				IF current_setting('server_version_num')::int >= 160000 THEN
 					EXECUTE 'GRANT pg_create_subscription TO tf_probe_owner';
+					EXECUTE format('GRANT CREATE ON DATABASE %I TO tf_probe_owner', current_database());
 				ELSE
 					EXECUTE 'ALTER ROLE tf_probe_owner SUPERUSER';
 				END IF;
 			END $$`,
+			"CREATE SUBSCRIPTION tf_probe_owned CONNECTION 'host=192.0.2.1 dbname=postgres user=tf_probe password=tf_probe' PUBLICATION tf_probe_publication WITH (connect = false)",
+			"ALTER SUBSCRIPTION tf_probe_owned OWNER TO tf_probe_owner",
 		)
 		s.preCheck()()
 		config := getTestConfig(t)
