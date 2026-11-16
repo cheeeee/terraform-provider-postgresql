@@ -795,9 +795,17 @@ func TestAccPostgresqlGrantRole_GrantorClause(t *testing.T) {
 	if !superuser {
 		dbExecute(t, dsn, "REVOKE grc_other FROM "+pq.QuoteIdentifier(currentUser))
 	}
+	// The role is named when the connected user can act as it: a superuser can, a user of a
+	// managed service cannot after the REVOKE, except on Azure Database for PostgreSQL, where
+	// the administrator can become any role which is not a superuser.
 	otherClause := ""
-	if superuser {
-		otherClause = ` GRANTED BY "grc_other"`
+	if txn, err := db.Begin(); err != nil {
+		t.Fatal(err)
+	} else {
+		if _, err := txn.Exec("SET LOCAL ROLE grc_other"); err == nil {
+			otherClause = ` GRANTED BY "grc_other"`
+		}
+		_ = txn.Rollback()
 	}
 
 	state := func(grantor string) *terraform.InstanceState {

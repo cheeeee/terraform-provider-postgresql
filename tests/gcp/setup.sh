@@ -78,8 +78,10 @@ role() {
             --description="$2" --permissions="$3" > /dev/null
     fi
 }
-role "$ROLE" "Create, connect to and delete the Cloud SQL instances of the tests" \
-    cloudsql.instances.create,cloudsql.instances.get,cloudsql.instances.delete,cloudsql.instances.connect
+# (update: the networks which are allowed to connect change after the creation, for the
+# instance itself, which subscribes to itself in the tests, and for a runner whose address changes)
+role "$ROLE" "Create, update, connect to and delete the Cloud SQL instances of the tests" \
+    cloudsql.instances.create,cloudsql.instances.get,cloudsql.instances.update,cloudsql.instances.delete,cloudsql.instances.connect
 role "$USERS_ROLE" "Manage the users of the Cloud SQL instances of the tests" \
     cloudsql.users.create,cloudsql.users.list,cloudsql.users.delete
 
