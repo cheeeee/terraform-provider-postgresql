@@ -23,11 +23,6 @@ const (
 	testRolePassword = "testpwd"
 )
 
-// testDriverName is the driver of the connections opened by the tests themselves: the one of the
-// provider, which opens another connection when one is closed by the other side while it is
-// being opened (it happens with a remote server such as an AWS RDS instance).
-const testDriverName = proxyDriverName
-
 // The CLI which runs the acceptance tests: Terraform or OpenTofu, and its version.
 var testCLI struct {
 	once    sync.Once
@@ -255,7 +250,7 @@ func skipIfNotSuperuser(t *testing.T) {
 
 // dbExecute is a test helper to create a pool, execute one query then close the pool
 func dbExecute(t *testing.T, dsn, query string, args ...any) {
-	db, err := sql.Open(testDriverName, dsn)
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		t.Fatalf("could to create connection pool: %v", err)
 	}
@@ -325,7 +320,7 @@ func createTestTables(t *testing.T, dbSuffix string, tables []string, owner stri
 	dbName, _ := getTestDBNames(dbSuffix)
 	adminUser := config.getDatabaseUsername()
 
-	db, err := sql.Open(testDriverName, config.connStr(dbName))
+	db, err := sql.Open("postgres", config.connStr(dbName))
 	if err != nil {
 		t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
 	}
@@ -360,7 +355,7 @@ func createTestTables(t *testing.T, dbSuffix string, tables []string, owner stri
 
 	// In this case we need to drop table after each test.
 	return func() {
-		db, err := sql.Open(testDriverName, config.connStr(dbName))
+		db, err := sql.Open("postgres", config.connStr(dbName))
 		if err != nil {
 			t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
 		}
@@ -391,7 +386,7 @@ func createTestSchemas(t *testing.T, dbSuffix string, schemas []string, owner st
 	dbName, _ := getTestDBNames(dbSuffix)
 	adminUser := config.getDatabaseUsername()
 
-	db, err := sql.Open(testDriverName, config.connStr(dbName))
+	db, err := sql.Open("postgres", config.connStr(dbName))
 	if err != nil {
 		t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
 	}
@@ -426,7 +421,7 @@ func createTestSchemas(t *testing.T, dbSuffix string, schemas []string, owner st
 
 	// In this case we need to drop schema after each test.
 	return func() {
-		db, err := sql.Open(testDriverName, config.connStr(dbName))
+		db, err := sql.Open("postgres", config.connStr(dbName))
 		if err != nil {
 			t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
 		}
@@ -456,7 +451,7 @@ func createTestSequences(t *testing.T, dbSuffix string, sequences []string, owne
 	dbName, _ := getTestDBNames(dbSuffix)
 	adminUser := config.getDatabaseUsername()
 
-	db, err := sql.Open(testDriverName, config.connStr(dbName))
+	db, err := sql.Open("postgres", config.connStr(dbName))
 	if err != nil {
 		t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
 	}
@@ -490,7 +485,7 @@ func createTestSequences(t *testing.T, dbSuffix string, sequences []string, owne
 	}
 
 	return func() {
-		db, err := sql.Open(testDriverName, config.connStr(dbName))
+		db, err := sql.Open("postgres", config.connStr(dbName))
 		if err != nil {
 			t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
 		}
@@ -540,7 +535,7 @@ func connectAsTestRole(t *testing.T, role, dbName string) *sql.DB {
 	config.Username = role
 	config.Password = testRolePassword
 
-	db, err := sql.Open(testDriverName, config.connStr(dbName))
+	db, err := sql.Open("postgres", config.connStr(dbName))
 	if err != nil {
 		t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
 	}

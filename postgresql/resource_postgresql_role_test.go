@@ -316,7 +316,7 @@ func testAccCheckRoleCanLogin(t *testing.T, role, password string) resource.Test
 		config := getTestConfig(t)
 		config.Username = role
 		config.Password = password
-		db, err := sql.Open(testDriverName, config.connStr("postgres"))
+		db, err := sql.Open("postgres", config.connStr("postgres"))
 		if err != nil {
 			return fmt.Errorf("could not open SQL connection: %v", err)
 		}
@@ -1388,7 +1388,7 @@ func testAccCheckRoleCannotLogin(t *testing.T, role, password string) resource.T
 		config := getTestConfig(t)
 		config.Username = role
 		config.Password = password
-		db, err := sql.Open(testDriverName, config.connStr("postgres"))
+		db, err := sql.Open("postgres", config.connStr("postgres"))
 		if err != nil {
 			return fmt.Errorf("could not open SQL connection: %v", err)
 		}
