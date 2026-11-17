@@ -183,6 +183,8 @@ jobs:
     permissions:
       contents: write
       actions: read
+      # (the jobs of a run are listed as the check runs of its check suite)
+      checks: read
 
     steps:
       - name: Checkout

@@ -100,7 +100,9 @@ RDS_CLIS = ("terraform", "opentofu")
 RDS_SHARDS = tuple(rds_matrix.SHARDS) + (rds_matrix.REST,)
 
 API = "https://api.github.com"
-JOBS_PER_PAGE = 20
+CHECK_RUNS_PER_PAGE = 100
+# A connection which stops answering is an error after this many seconds, not an endless wait
+TIMEOUT = 60
 
 
 def sh(*cmd):
@@ -124,33 +126,32 @@ def api(path, raw=False):
     request = urllib.request.Request(
         API + path, headers={"Authorization": "Bearer " + token(), "Accept": "application/vnd.github+json"})
     try:
-        with urllib.request.build_opener(NoRedirect).open(request) as response:
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=TIMEOUT) as response:
             data = response.read()
     except urllib.error.HTTPError as error:
         if error.code not in (301, 302, 307) or not error.headers.get("Location"):
             raise
-        with urllib.request.urlopen(error.headers["Location"]) as response:
+        with urllib.request.urlopen(error.headers["Location"], timeout=TIMEOUT) as response:
             data = response.read()
     return data.decode(errors="replace") if raw else json.loads(data)
 
 
 def run_jobs(repo, run):
-    """The jobs of the last attempt of a run.
+    """The jobs of the last attempt of a run (the answer of the API for the run): their id, their
+    name and their conclusion.
 
-    The API of GitHub is slow to list the jobs of a run of which a job was run again: 0.17 s for
-    each job of a page, where another run takes 0.05 s, and it gives up after 10 s. A page of 100
-    jobs of such a run (85 jobs, one of them run again) was always answered by an error 502, and a
-    page of 50 took up to 9 s. The pages are of 20 jobs, 3.4 s at most, and the jobs of every
-    attempt are listed (the list of the last attempt only is not faster), the last attempt of
-    each job being kept."""
-    last, page = {}, 1
+    They are read from the check runs of the check suite of the run: a job is a check run, with
+    the same id, and one request lists a hundred of them in a second. The list of the jobs of
+    the Actions API is not used: for a run of which a job was run again it takes 0.2 s for each
+    job of a page, more when GitHub is busy, and the API gives up after 10 s with an error 502.
+    It happened with pages of 100 jobs, of 50, and of 20 while the 240 jobs of a release ran."""
+    jobs, page = [], 1
     while True:
-        found = api(f"/repos/{repo}/actions/runs/{run}/jobs?filter=all&per_page={JOBS_PER_PAGE}&page={page}")["jobs"]
-        for job in found:
-            if job["name"] not in last or job["run_attempt"] > last[job["name"]]["run_attempt"]:
-                last[job["name"]] = job
-        if len(found) < JOBS_PER_PAGE:
-            return list(last.values())
+        found = api(f"/repos/{repo}/check-suites/{run['check_suite_id']}/check-runs"
+                    f"?filter=latest&per_page={CHECK_RUNS_PER_PAGE}&page={page}")["check_runs"]
+        jobs += [{"id": check["id"], "name": check["name"], "conclusion": check["conclusion"]} for check in found]
+        if len(found) < CHECK_RUNS_PER_PAGE:
+            return jobs
         page += 1
 
 
@@ -304,7 +305,7 @@ def cloud_evidence(repo, head, cloud):
     runs = api(f"/repos/{repo}/actions/workflows/{cloud['workflow']}/runs?status=completed&per_page=40")["workflow_runs"]
     for run in sorted(runs, key=lambda r: r["created_at"], reverse=True):
         passed = collections.defaultdict(dict)
-        for job in run_jobs(repo, run["id"]):
+        for job in run_jobs(repo, run):
             m = re.match(cloud["job"] + r" \((\d+), (\w+), (\w+)\)$", job["name"])
             if m and job["conclusion"] == "success":
                 passed[m.group(1)][(m.group(2), m.group(3))] = job
@@ -342,7 +343,7 @@ def main():
         head = run["head_sha"]
         source = ("Updated by the `matrix` job of the [test workflow](.github/workflows/test.yml), from the logs of "
                   "the jobs of its own run, when it changes")
-        for job in run_jobs(args.repo, args.run):
+        for job in run_jobs(args.repo, run):
             m = re.match(r"test \((\w+), (\w+)\)", job["name"])
             if m:
                 if job["conclusion"] not in ("success", "failure"):
