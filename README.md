@@ -62,24 +62,24 @@ Updated by the `matrix` job of the [test workflow](.github/workflows/test.yml), 
 
 The same tests in the different environments:
 
-| Environment | Superuser | Not superuser | AWS RDS |
-|---|:---:|:---:|:---:|
-| Roles | ✅ | ✅ | ✅ |
-| Databases | ✅ | ✅ | ✅ |
-| Role and database parameters | ✅ | ✅ | ✅ |
-| Schemas | ✅ | ✅ | ✅ |
-| Grants | ✅ | ✅ | ✅ |
-| Default privileges | ✅ | ✅ | ✅ |
-| Extensions | ✅ | ✅ (13+) | ✅ |
-| Functions | ✅ | ✅ | ✅ |
-| Event triggers | ✅ | n/a [1] | ✅ |
-| Publications | ✅ | ✅ | ✅ |
-| Subscriptions | ✅ | ✅ (16+) | ✅ |
-| Replication slots | ✅ | ✅ | ✅ |
-| Foreign servers and user mappings | ✅ | n/a [2] | ✅ |
-| Security labels | ✅ | ✅ | n/a [3] |
-| Data sources | ✅ | ✅ | ✅ |
-| End-to-end plan checks | ✅ | n/a [4] | ✅ |
+| Environment | Superuser | Not superuser | AWS RDS | Google Cloud SQL | Azure Database for PostgreSQL |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Roles | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Databases | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Role and database parameters | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Schemas | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Grants | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Default privileges | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Extensions | ✅ | ✅ (13+) | ✅ | ✅ | ✅ |
+| Functions | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Event triggers | ✅ | n/a [1] | ✅ | ✅ | ✅ |
+| Publications | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Subscriptions | ✅ | ✅ (16+) | ✅ | ✅ | ✅ |
+| Replication slots | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Foreign servers and user mappings | ✅ | n/a [2] | ✅ | ✅ | ✅ |
+| Security labels | ✅ | ✅ | n/a [3] | n/a [4] | n/a [5] |
+| Data sources | ✅ | ✅ | ✅ | ✅ | ✅ |
+| End-to-end plan checks | ✅ | n/a [6] | ✅ | — | — |
 
 - ✅: all the tests of the area which ran passed, and at least one ran. With a version: the tests only run from this version of PostgreSQL.
 - ❌: at least one test failed.
@@ -89,9 +89,11 @@ The same tests in the different environments:
 - [1] creating an event trigger needs a superuser.
 - [2] creating the extension of a foreign data wrapper needs a superuser.
 - [3] AWS RDS has no security label provider.
-- [4] the end-to-end test needs privileges of the master user of a managed service (extensions, pgaudit), it is run without superuser on AWS RDS.
+- [4] Google Cloud SQL has no security label provider.
+- [5] Azure Database for PostgreSQL has no security label provider.
+- [6] the end-to-end test needs privileges of the master user of a managed service (extensions, pgaudit), it is run without superuser on AWS RDS.
 
-AWS RDS: for each version of PostgreSQL, the last run of the [rds-test workflow](.github/workflows/rds-test.yml) where the whole test suite, the end-to-end checks, a password from AWS Secrets Manager and the IAM authentication of the provider passed on temporary instances, with Terraform and OpenTofu. A version which has no such run on the commit of this matrix, or before it, is not listed.
+AWS RDS: for each version of PostgreSQL, the last run of the [rds-test workflow](.github/workflows/rds-test.yml) where the whole test suite, the end-to-end checks, a password from AWS Secrets Manager and the IAM authentication of the provider passed on temporary instances, with Terraform and OpenTofu. A version which has no such run on the commit of this matrix, or before it, is not listed. A run on the last commit of a pull request is listed with the commit its squash made on the main branch, which has the same files.
 
 | AWS RDS PostgreSQL | Date | Commit | Run |
 |---|:---:|:---:|:---:|
@@ -103,9 +105,29 @@ AWS RDS: for each version of PostgreSQL, the last run of the [rds-test workflow]
 | 17.11 | 2026-11-15 | `1910acc` | [12](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43662286289) |
 | 18.6 | 2026-11-15 | `1910acc` | [12](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43662286289) |
 
-Google Cloud SQL: no run of the [gcp-test workflow](.github/workflows/gcp-test.yml) passed with the whole test suite on the commit of this matrix, or before it.
+Google Cloud SQL: for each version of PostgreSQL, the last run of the [gcp-test workflow](.github/workflows/gcp-test.yml) where the whole test suite and the connection of the provider through the Cloud SQL connector, with a password and with the IAM authentication of an impersonated service account passed on temporary instances, with Terraform and OpenTofu. A version which has no such run on the commit of this matrix, or before it, is not listed. A run on the last commit of a pull request is listed with the commit its squash made on the main branch, which has the same files.
 
-Azure Database for PostgreSQL: no run of the [azure-test workflow](.github/workflows/azure-test.yml) passed with the whole test suite on the commit of this matrix, or before it.
+| Google Cloud SQL PostgreSQL | Date | Commit | Run |
+|---|:---:|:---:|:---:|
+| 12.22 | 2026-11-15 | `202f4c0` | [7](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529388) |
+| 13.23 | 2026-11-15 | `202f4c0` | [7](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529388) |
+| 14.24 | 2026-11-15 | `202f4c0` | [7](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529388) |
+| 15.19 | 2026-11-15 | `202f4c0` | [7](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529388) |
+| 16.15 | 2026-11-15 | `202f4c0` | [7](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529388) |
+| 17.11 | 2026-11-15 | `202f4c0` | [7](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529388) |
+| 18.6 | 2026-11-15 | `202f4c0` | [7](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529388) |
+
+Azure Database for PostgreSQL: for each version of PostgreSQL, the last run of the [azure-test workflow](.github/workflows/azure-test.yml) where the whole test suite and the login of the provider with a token of Microsoft Entra passed on temporary instances, with Terraform and OpenTofu. A version which has no such run on the commit of this matrix, or before it, is not listed. A run on the last commit of a pull request is listed with the commit its squash made on the main branch, which has the same files.
+
+| Azure Database for PostgreSQL | Date | Commit | Run |
+|---|:---:|:---:|:---:|
+| 12.22 | 2026-11-15 | `202f4c0` | [4](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529430) |
+| 13.23 | 2026-11-15 | `202f4c0` | [4](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529430) |
+| 14.24 | 2026-11-15 | `202f4c0` | [4](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529430) |
+| 15.19 | 2026-11-15 | `202f4c0` | [4](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529430) |
+| 16.15 | 2026-11-15 | `202f4c0` | [4](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529430) |
+| 17.11 | 2026-11-15 | `202f4c0` | [4](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529430) |
+| 18.6 | 2026-11-15 | `202f4c0` | [4](https://github.com/cheeeee/terraform-provider-postgresql/actions/runs/43765529430) |
 <!-- test-matrix:end -->
 
 How the provider logs in to the managed services is tested without any cloud account on every change:
