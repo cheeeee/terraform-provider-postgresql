@@ -14,6 +14,32 @@ Use the navigation to the left to read about the available resources.
 
 The provider can be used with Terraform and with OpenTofu, it is tested with both of them.
 
+## A fork of cyrilgdn/postgresql
+
+`cheeeee/postgresql` is a fork of [`cyrilgdn/postgresql`](https://registry.terraform.io/providers/cyrilgdn/postgresql/latest).
+Every resource, data source and argument of `cyrilgdn/postgresql` 1.27.0 exists here under the same name:
+a configuration which is written for it only needs another `source`.
+
+What this provider adds:
+
+- The configuration parameters of a role and of a database (`parameters`, and `database_parameters` for a role
+  in a database), for example to turn `pgaudit` on for one role on AWS RDS.
+- The `postgresql_event_trigger` resource.
+- The clauses of PostgreSQL which the resources did not cover: the options of a subscription and of a
+  publication (tables with columns and row filters, schemas), the locale of a database, the options of a
+  function, the options of a role membership, and privileges on more types of objects.
+- Changes in place where PostgreSQL allows them: a subscription and a function are altered, not created again.
+- Passwords hashed with SCRAM-SHA-256 by the provider before they are sent (`password_authentication`).
+
+It is tested with PostgreSQL 12 to 18 and the release candidate of 19, with every release line of Terraform
+(0.12 to 1.17) and of OpenTofu (1.6 to 1.13), as a superuser and as a role which is not one, and on real
+AWS RDS, Google Cloud SQL and Azure Database for PostgreSQL instances. The
+[README](https://github.com/cheeeee/terraform-provider-postgresql#readme) shows the result of each of them.
+
+Some behaviours differ from `cyrilgdn/postgresql` with the same configuration: read the
+[notes of version 1.28.1](https://github.com/cheeeee/terraform-provider-postgresql/releases/tag/v1.28.1)
+before moving a state to this provider.
+
 ## Usage
 
 ```hcl
